@@ -53,6 +53,7 @@ mod credits;
 mod crop;
 mod drag_pointer;
 mod export_ui;
+pub mod identity;
 mod js_ui;
 mod marks_ui;
 mod measure_ui;
@@ -2910,7 +2911,7 @@ impl eframe::App for PdfCraftApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string("pdfcraft", self.persist());
+        storage.set_string(identity::STORAGE_KEY, self.persist());
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -3087,7 +3088,7 @@ impl eframe::App for PdfCraftApp {
             .active
             .and_then(|i| crate::canvas::tab_label(self, i))
             .or_else(|| self.combine_showing().then(|| tl!("Combine files").to_owned()))
-            .map_or_else(|| "PdfCraft".to_owned(), |name| format!("{name} — PdfCraft"));
+            .map_or_else(|| identity::APP_NAME.to_owned(), |name| format!("{name} — {}", identity::APP_NAME));
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;

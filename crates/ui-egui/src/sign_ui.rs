@@ -185,8 +185,8 @@ pub(crate) fn page_input(ui: &egui::Ui, resp: &egui::Response, xf: &PageXform, p
     }
 }
 
-/// Where new digital IDs are saved: next to the recovery folder (`…/PdfCraft/Digital IDs`, or
-/// `PdfCraftData/Digital IDs` in portable mode).
+/// Where new digital IDs are saved: next to the recovery folder (`%LOCALAPPDATA%\SwiftPDF\Digital
+/// IDs` on Windows, or `Data/Digital IDs` in portable mode).
 fn id_dir() -> Option<PathBuf> {
     crate::recovery::RecoveryStore::default_dir().and_then(|d| d.parent().map(|p| p.join("Digital IDs")))
 }
