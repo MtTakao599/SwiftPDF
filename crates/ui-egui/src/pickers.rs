@@ -180,6 +180,10 @@ impl PdfCraftApp {
     /// `pick_override` answers instead of a native panel (tests and automation); the answer
     /// still arrives on a later frame, like a real pick.
     pub(crate) fn ask(&mut self, ask: Ask, target: Option<DocId>, then: impl FnOnce(&mut PdfCraftApp, Vec<PathBuf>) + Send + 'static) -> bool {
+        // A save panel is only ever asked for to write a file.
+        if matches!(ask, Ask::Save(_)) && self.refuse_output() {
+            return false;
+        }
         if self.pickers.showing.swap(true, Ordering::SeqCst) {
             self.notify_tr("Another file dialog is still open. Finish with it first.");
             return false;

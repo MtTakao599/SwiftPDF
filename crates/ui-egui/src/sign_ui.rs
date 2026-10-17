@@ -197,6 +197,7 @@ fn id_dir() -> Option<PathBuf> {
 /// read it: it holds the private key.
 fn save_new_id_file(dir: &std::path::Path, stem: &str, p12: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::{ErrorKind, Write};
+    crate::output_policy::check()?;
     for i in 1..=10_000u32 {
         let path = dir.join(if i == 1 { format!("{stem}.p12") } else { format!("{stem} {i}.p12") });
         let mut opts = std::fs::OpenOptions::new();
@@ -353,6 +354,7 @@ impl PdfCraftApp {
     /// Configure New Digital ID ▸ Create: a self-signed ID saved as a .p12 next to the app data
     /// (or in `export_dir_override`). Returns its list index.
     fn create_digital_id(&mut self) -> Result<usize, String> {
+        crate::output_policy::check().map_err(|e| e.to_string())?;
         let Some(d) = self.sign_draft.as_ref().map(|d| d.new_id.clone()) else { return Err("nothing to create".into()) };
         if d.name.trim().is_empty() {
             return Err("Enter a name.".into());

@@ -731,6 +731,9 @@ impl crate::PdfCraftApp {
 
     /// Copy Image: image `index` on `page`, at its own resolution, to the clipboard.
     pub(crate) fn copy_page_image(&mut self, page: usize, index: usize) -> bool {
+        if self.refuse_in_view_only() {
+            return false;
+        }
         let Some((_, id)) = self.active_ids() else { return false };
         if !self.may_copy(id) {
             return false;

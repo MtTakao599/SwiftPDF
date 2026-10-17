@@ -512,11 +512,15 @@ pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     let has_doc = app.active.is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
                         let tip = crate::commands::command_tip(ui.ctx(), tl!("Print ({key})"), "print.dialog");
-                        if icons::button(ui, "printer", 32.0, false, &tip).clicked() {
+                        if ui
+                            .add_enabled_ui(app.command_allowed("print.dialog"), |ui| icons::button(ui, "printer", 32.0, false, &tip))
+                            .inner
+                            .clicked()
+                        {
                             app.run_command("print.dialog");
                         }
                         let tip = crate::commands::command_tip(ui.ctx(), tl!("Save ({key})"), "file.save");
-                        if icons::button(ui, "save", 32.0, false, &tip).clicked() {
+                        if ui.add_enabled_ui(app.command_allowed("file.save"), |ui| icons::button(ui, "save", 32.0, false, &tip)).inner.clicked() {
                             app.run_command("file.save");
                         }
                         let tip = crate::commands::command_tip(ui.ctx(), tl!("Document properties ({key})"), "file.properties");

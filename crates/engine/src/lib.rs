@@ -37,6 +37,7 @@ pub mod signature_scan;
 pub mod text_fonts;
 mod text_preview;
 mod upright_image;
+mod view_only;
 pub mod word_count;
 pub mod xfa;
 
@@ -405,6 +406,8 @@ pub struct Document {
     /// What the last successful [`Session::apply`] wrote that its fonts can't draw: kept as typed,
     /// drawn with `?` in its place (see [`TextNotice`]). The interface shows it; tools return it.
     pub edit_notices: Vec<TextNotice>,
+    /// The session's view-only policy when the document was registered ([`Session::set_view_only`]).
+    view_only: bool,
 }
 
 /// Text an edit stored as typed but drew with `?` in place of `ch`, because the font it is drawn
@@ -661,7 +664,7 @@ impl Document {
     }
 
     pub fn editable(&self) -> bool {
-        self.editor.is_some()
+        self.editor.is_some() && !self.view_only
     }
 
     /// What the opening password allows; `None` when the document is not encrypted.
@@ -2870,6 +2873,8 @@ pub enum EditError {
     Signed,
     #[error("{0}")]
     Invalid(String),
+    #[error("this session is view-only: documents can't be changed, saved, printed or exported")]
+    ViewOnly,
 }
 
 impl From<pdfcraft_sign::SignError> for EditError {
@@ -2897,6 +2902,8 @@ pub struct Session {
     date_format: Option<String>,
     /// Preferences ▸ Date format ▸ Language, when not following the interface language.
     date_language: Option<String>,
+    /// Refuse every change to a document and every PDF it would write ([`Session::set_view_only`]).
+    view_only: bool,
 }
 
 /// Immutable session state needed while a document is prepared away from its owning thread.
@@ -3319,6 +3326,7 @@ impl Session {
         let id = DocId(self.next_id);
         let mut document = prepared.document;
         document.id = id;
+        document.view_only = self.view_only;
         self.docs.push(document);
         id
     }
@@ -3589,6 +3597,7 @@ impl Session {
             fonts_stale: false,
             xfa_warnings: Vec::new(),
             edit_notices: Vec::new(),
+            view_only: false,
         }
     }
 
@@ -3598,6 +3607,7 @@ impl Session {
 
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
+        self.check_not_view_only()?;
         let now = self.now();
         let today = self.today();
         let js_off = self.js_off;
@@ -3790,6 +3800,7 @@ impl Session {
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<Label, EditError> {
+        self.check_not_view_only()?;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToUndo)?;
@@ -3805,6 +3816,7 @@ impl Session {
     }
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {
+        self.check_not_view_only()?;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToRedo)?;
@@ -4050,6 +4062,7 @@ impl Session {
     /// The bytes to write for Save: an incremental update of the file as opened/last saved,
     /// with `/ModDate` stamped. Call `mark_saved` after writing them successfully.
     pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
         let on_saved = Arc::ptr_eq(editor.cos.bytes(), &editor.saved);
@@ -4077,6 +4090,7 @@ impl Session {
 
     /// A compact, garbage-collected rewrite (Save As ▸ "Optimized" / Reduce File Size groundwork).
     pub fn save_full_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         if doc.is_signed() {
             return Err(EditError::Signed);
@@ -4099,6 +4113,7 @@ impl Session {
     /// Record a successful save of `bytes` (to `path`, if any): rebase editing on the saved file
     /// so the next save appends only newer edits. Undo history is kept.
     pub fn mark_saved(&mut self, id: DocId, bytes: Arc<Vec<u8>>, path: Option<String>) -> Result<(), EditError> {
+        self.check_not_view_only()?;
         let doc = self.doc_mut(id)?;
         if let Some(editor) = doc.editor.as_mut() {
             // An encrypted file needs the password it is protected with now (the owner
@@ -4124,6 +4139,7 @@ impl Session {
     /// are unlocked as well, and saving keeps the rights. Unencrypted documents and documents
     /// opened by the owner need nothing.
     pub fn unlock(&mut self, id: DocId, password: &str) -> Result<(), EditError> {
+        self.check_not_view_only()?;
         let doc = self.doc_mut(id)?;
         let editor = doc.editor.as_mut().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
         if editor.cos.permissions().is_none_or(|p| p.owner) {
@@ -4154,6 +4170,7 @@ impl Session {
     /// File ▸ Revert: back to the last saved version (or the file as opened). Undo history is
     /// cleared, as in Acrobat.
     pub fn revert(&mut self, id: DocId) -> Result<(), EditError> {
+        self.check_not_view_only()?;
         let doc = self.doc_mut(id)?;
         let editor = doc.editor.as_mut().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
         let base = editor.saved.clone();
@@ -4282,6 +4299,7 @@ impl Session {
     /// Export comments and/or form data: XFDF and FDF carry either or both; XML, CSV and text
     /// are form data only.
     pub fn export_data(&self, id: DocId, format: DataFormat, comments: bool, fields: bool) -> Result<Vec<u8>, EditError> {
+        self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let cos = match doc.editor.as_ref() {
             Some(e) => e.cos.clone(),
@@ -4308,6 +4326,7 @@ impl Session {
 
     /// The print-ready PDF for `settings` (sheets laid out for the paper; see `pdfcraft-print`).
     pub fn print_pdf(&self, id: DocId, settings: &print::Settings) -> Result<Vec<u8>, EditError> {
+        self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         if !doc.allows_printing() {
             return Err(EditError::NotPermitted("printing"));
@@ -4642,6 +4661,7 @@ impl Session {
 
     /// Open freshly created bytes (combine / extract) as a new, unsaved document.
     pub fn open_new(&mut self, name: impl Into<String>, bytes: Arc<Vec<u8>>) -> Result<DocId, OpenError> {
+        self.check_not_view_only().map_err(|e| OpenError::Unsupported(e.to_string()))?;
         let id = self.open(name, None, bytes, None)?;
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
             d.dirty = true;
@@ -4668,6 +4688,7 @@ impl Session {
 
     /// [`Self::write_new`] without the check, for bytes nobody writes: measuring a part's size.
     fn write_unchecked(&self, doc: &pdfcraft_cos::Document) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
         write_full(doc, &opts).map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
@@ -4692,8 +4713,12 @@ impl Session {
     }
 
     /// Mark a document opened from a recovery file: it has unsaved changes and belongs at
-    /// `path` (where Save writes), as when the session ended.
+    /// `path` (where Save writes), as when the session ended. A view-only session leaves it as
+    /// opened: there is no save for it to belong to.
     pub fn mark_recovered(&mut self, id: DocId, path: Option<String>) {
+        if self.view_only {
+            return;
+        }
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
             d.path = path;
             d.dirty = true;
@@ -4806,6 +4831,7 @@ impl Session {
     /// the signed file; the caller saves it and then calls [`Session::mark_signed`]. An empty
     /// `opts.date` takes the session clock.
     pub fn sign(&self, doc: DocId, id: &pdfcraft_sign::DigitalId, mut opts: SignOptions) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         // Encrypted documents are signed under their permissions (the signer checks them).
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
@@ -4824,6 +4850,7 @@ impl Session {
         mut opts: SignOptions,
         tsa: &dyn pdfcraft_sign::TimestampAuthority,
     ) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
         if opts.date.is_empty() {
@@ -4838,6 +4865,7 @@ impl Session {
     /// Append a standalone document timestamp (RFC 3161, `/ETSI.RFC3161`) covering the file's
     /// current state. An empty `date` takes the session clock; the transport is the caller's.
     pub fn timestamp_document(&self, doc: DocId, tsa: &dyn pdfcraft_sign::TimestampAuthority, date: String) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
         let date = if date.is_empty() { self.signing_date() } else { date };
@@ -4849,6 +4877,7 @@ impl Session {
     /// Embed revocation evidence into the catalog's `/DSS` with `/VRI` entries per signature
     /// (PAdES B-LT): an incremental update that never rewrites signed bytes.
     pub fn embed_ltv(&self, doc: DocId, evidence: &pdfcraft_sign::dss::Evidence) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
         let embedded = Arc::new(pdfcraft_sign::dss::embed(&editor.cos, evidence)?);

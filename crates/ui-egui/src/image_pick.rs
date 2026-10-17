@@ -109,6 +109,7 @@ fn is_copied_image_name(name: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn write_clipboard_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
+    crate::output_policy::check().map_err(|e| e.to_string())?;
     if !is_copied_image_name(name) || name.contains(['/', '\\']) {
         return Err("the file name is not valid".into());
     }
@@ -173,6 +174,9 @@ impl PdfCraftApp {
     /// Copy Image in Original Format: image `index` on `page` as a file on the clipboard (JPEG
     /// as stored in the PDF, otherwise PNG).
     pub(crate) fn copy_page_image_file(&mut self, page: usize, index: usize) {
+        if self.refuse_output() {
+            return;
+        }
         let Some((_, id)) = self.active_ids() else { return };
         if !self.may_copy(id) {
             return;

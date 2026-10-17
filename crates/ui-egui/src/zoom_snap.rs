@@ -118,6 +118,9 @@ impl PdfCraftApp {
     /// Render `view_rect` (page view points) of `page` at the current zoom and copy it to the
     /// clipboard (and keep it in `last_snapshot`).
     pub fn snapshot(&mut self, index: usize, page: usize, view_rect: [f32; 4]) -> Result<(u32, u32), String> {
+        if self.session.view_only() {
+            return Err(crate::command_policy::REFUSED.to_string());
+        }
         let view = &self.views[index];
         let doc = self.session.get(view.id).ok_or("no document")?;
         let ppp = self.ctx.as_ref().map_or(2.0, |c| c.pixels_per_point());

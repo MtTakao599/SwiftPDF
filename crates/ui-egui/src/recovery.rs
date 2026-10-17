@@ -262,7 +262,14 @@ fn now_secs() -> u64 {
 
 impl PdfCraftApp {
     /// Turn on autosave into `store`, and look for documents a previous session left behind.
+    ///
+    /// A view-only session changes nothing to autosave or recover: the store is left alone (no
+    /// lock file, no listing, nothing offered or removed) and autosave stays off.
     pub fn enable_recovery(&mut self, store: RecoveryStore) {
+        if self.session.view_only() {
+            log::info!("view-only: crash recovery is off; {} is left as it is", store.dir().display());
+            return;
+        }
         store.claim();
         self.recoverable = store.list();
         if !self.recoverable.is_empty() {

@@ -593,6 +593,9 @@ impl PdfCraftApp {
     /// [`Self::save_view`], then `after` once the document is written: now, or on a later frame
     /// when the user had to choose where. `after` never runs when the save fails or is cancelled.
     pub(crate) fn save_then(&mut self, index: usize, target: SaveTarget, after: impl FnOnce(&mut Self) + Send + 'static) -> bool {
+        if self.refuse_output() {
+            return false;
+        }
         // What's typed in a field is part of what's saved (#166).
         if let Some(id) = self.views.get(index).map(|v| v.id)
             && !self.commit_typing_in(id)
@@ -982,8 +985,10 @@ pub(crate) fn is_mail_temp_copy(path: &str) -> bool {
 }
 
 /// Write via a temporary file in the same directory and rename over the target, so a crash or
-/// full disk never leaves a half-written PDF where the original was.
+/// full disk never leaves a half-written PDF where the original was. Refused, before anything is
+/// written, while [`crate::output_policy`] blocks outputs.
 pub fn write_atomically(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    crate::output_policy::check()?;
     write_atomically_with(path, bytes, staging_suffixes())
 }
 
@@ -1013,6 +1018,7 @@ fn short_name(path: &str) -> String {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     use wasm_bindgen::JsCast;
+    crate::output_policy::check().map_err(|e| e.to_string())?;
     let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let array = js_sys::Uint8Array::from(bytes);
     let parts = js_sys::Array::of1(&array);

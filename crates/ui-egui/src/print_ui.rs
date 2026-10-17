@@ -291,6 +291,9 @@ fn default_printer(printers: &[spool::Printer]) -> Option<String> {
 
 impl PdfCraftApp {
     pub fn open_print(&mut self) {
+        if self.refuse_output() {
+            return;
+        }
         let Some((i, _)) = self.active_ids() else { return };
         let (printers, printers_loading) = match self.printer_source.clone() {
             // The list from the last time the dialog opened, until the fresh one arrives.
@@ -484,6 +487,9 @@ impl PdfCraftApp {
     /// a preset path returns `true` once the save picker is showing; the file is written on a
     /// later frame, when the user has chosen where.
     pub fn print_now(&mut self) -> bool {
+        if self.refuse_output() {
+            return false;
+        }
         // What's typed in a form field is part of what's printed (#166).
         if !self.commit_form_typing() {
             return false;

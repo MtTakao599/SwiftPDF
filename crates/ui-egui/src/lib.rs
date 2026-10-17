@@ -41,6 +41,7 @@ mod combine_ui;
 pub mod docking;
 pub use combine_ui::{Columns as CombineColumns, CombineView, Lock as CombineLock, SortKey};
 mod camera_ui;
+pub mod command_policy;
 mod commands;
 mod comment_props;
 pub mod comments;
@@ -59,6 +60,7 @@ mod marks_ui;
 mod measure_ui;
 mod ocr_ui;
 mod optimize_ui;
+pub mod output_policy;
 mod search_ui;
 mod sign_ui;
 mod stamps_ui;
@@ -2059,6 +2061,11 @@ impl PdfCraftApp {
 
     /// Run a catalogue command. Commands that aren't implemented yet say which milestone ships them.
     pub fn run_command(&mut self, command: &str) {
+        // Before asking for a file to run a tool on, or naming the milestone that ships it.
+        if !self.command_allowed(command) {
+            self.notify(crate::command_policy::REFUSED);
+            return;
+        }
         if let Some(spec) = pdfcraft_engine::commands::command(command) {
             use pdfcraft_engine::commands::Needs;
             // A tool that needs a document, chosen with none open, asks for the file and then
@@ -2451,6 +2458,9 @@ impl PdfCraftApp {
     ///
     /// This is the seed of the UI control channel (M3.9): the same verbs become `ui.set` calls.
     pub fn set_option(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if self.session.view_only() && !command_policy::option_allowed_in_view_only(key, value) {
+            return Err(format!("{key} {value}: {}", command_policy::REFUSED));
+        }
         let view = self.active.and_then(|i| self.views.get_mut(i));
         match (key, view) {
             ("language", _) => {

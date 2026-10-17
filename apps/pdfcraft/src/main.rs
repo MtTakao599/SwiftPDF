@@ -17,6 +17,7 @@
 //! loopback port and writes `{"port", "token", "pid"}` to `<file>` (owner-only permissions). The
 //! app doesn't start if it can't.
 //! Agents then drive it with `pdfcraft-cli ui --control <file> <method> …`.
+//! SwiftPDF v0.1.0 is view-only and refuses `--control`: the app logs why and doesn't start.
 
 // Release builds on Windows are GUI-subsystem programs, so launching the app doesn't open a console
 // window next to it (#57). `--version` and diagnostics then go nowhere when started from a terminal
@@ -201,6 +202,13 @@ fn main() -> eframe::Result {
             Err(e) => log::warn!("no log file: {e}"),
         }
     }
+    // SwiftPDF v0.1.0 is view-only: no script or agent drives the window, so `--control` stops the
+    // launch before it opens a window, a port or a file, or hands anything to a running instance.
+    if let Some(file) = &control_file {
+        let message = control_refused(file);
+        log::error!("{message}");
+        return Err(eframe::Error::AppCreation(message.into()));
+    }
     // Windows, Linux and the BSDs: a launch that only names files (an Outlook attachment, an
     // Explorer double-click, a file manager or `xdg-open`) hands them to the PdfCraft already
     // running and exits (#282, #317, #1726). Any option means the caller wants this launch's own
@@ -343,6 +351,9 @@ fn app_creator<'a>(
     Box::new(move |cc| {
         started.set(true);
         let mut app = PdfCraftApp::new();
+        // SwiftPDF v0.1.0 is view-only in every mode, and writes no file a user asks for;
+        // nothing turns this off.
+        app.set_view_only(true);
         // First start (or settings from before Units existed): the region's unit.
         app.units = pdfcraft_ui_egui::units::Unit::system();
         #[cfg(target_os = "linux")]
@@ -433,6 +444,11 @@ fn notify_software_renderer(app: &mut PdfCraftApp, device_type: eframe::wgpu::De
     if device_type == eframe::wgpu::DeviceType::Cpu {
         app.notify_tr("PdfCraft is drawing without a graphics processor, so it may be slow. Updating the graphics driver may help.");
     }
+}
+
+/// Why `--control <file>` doesn't start the app: SwiftPDF v0.1.0 is view-only.
+fn control_refused(file: &str) -> String {
+    format!("--control {file}: the UI control channel is turned off in this view-only version of SwiftPDF")
 }
 
 /// Publish a started control channel in `file`.

@@ -59,6 +59,7 @@ impl Session {
     /// Capture what optimizing document `id` with `settings` and the Remove Hidden Information
     /// `discard` categories needs. A full rewrite: signed documents are refused.
     pub fn optimize_job(&self, id: DocId, settings: &optimize::Settings, discard: &[Hidden]) -> Result<OptimizeJob, EditError> {
+        self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         if doc.is_signed() {
             return Err(EditError::Signed);
