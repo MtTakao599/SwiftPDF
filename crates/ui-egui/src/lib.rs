@@ -65,6 +65,7 @@ mod search_ui;
 mod sign_ui;
 mod stamps_ui;
 mod standards_ui;
+mod zoom_menu;
 mod zoom_snap;
 /// Header & footer / watermark / background dialog types (tests and automation).
 pub mod marks {
@@ -105,6 +106,7 @@ mod pickers;
 pub mod prepare;
 mod print_ui;
 mod signature_drag;
+mod simple_home;
 pub mod units;
 mod web_print;
 mod word_count_ui;
@@ -156,6 +158,7 @@ pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
 use theme::{ThemeKind, ThemePreference};
+pub use zoom_menu::{INVALID as ZOOM_ENTRY_INVALID, PRESETS as ZOOM_PRESETS};
 
 /// Top-level workspace modes (Acrobat's mode bar).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -177,6 +180,46 @@ impl Mode {
             "edit" => Some(Self::Edit),
             "convert" => Some(Self::Convert),
             "sign" => Some(Self::Sign),
+            _ => None,
+        }
+    }
+
+    /// Workspaces a view-only session still offers. Edit, Convert and E-Sign change a document, so
+    /// they stay in the enum for when editing returns and are not shown until then.
+    pub(crate) fn offered_in_view_only(self) -> bool {
+        matches!(self, Self::AllTools | Self::Read)
+    }
+
+    /// `self` while view-only: an editing workspace becomes Read. The stored value is left alone
+    /// when the session can edit.
+    pub(crate) fn in_view_only(self, view_only: bool) -> Self {
+        if view_only && !self.offered_in_view_only() { Self::Read } else { self }
+    }
+}
+
+/// SwiftPDF's interface level, chosen with the switch at the right of the tab strip: the simple
+/// screens or the full workspace. Separate from [`Mode`], and never a way out of view-only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiMode {
+    Simple,
+    /// The library's default, so embedding the app and its tests behave as PdfCraft does.
+    #[default]
+    Detailed,
+}
+
+impl UiMode {
+    /// The value the settings store under `ui_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Detailed => "detailed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "simple" => Some(Self::Simple),
+            "detailed" => Some(Self::Detailed),
             _ => None,
         }
     }
@@ -475,6 +518,9 @@ impl UnlockPrompt {
     }
 }
 
+/// How many recent files are kept and listed.
+pub const RECENT_MAX: usize = 10;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecentFile {
     pub name: String,
@@ -505,6 +551,14 @@ pub struct PdfCraftApp {
     pub date_format_draft: Option<String>,
     /// Explicit CLI/control mode lasts for this session and is never persisted.
     mode_override: Option<Mode>,
+    /// Changed only through [`PdfCraftApp::set_ui_mode`]; remembered across restarts.
+    ui_mode: UiMode,
+    /// The document shown last, which switching from the simple Home to the detailed interface
+    /// brings back. By id, so moving tabs doesn't change it; a closed one is simply not found.
+    last_doc: Option<DocId>,
+    /// A recent file being found again from Home: (the old path, the file chosen for it). The
+    /// old entry is replaced only once the chosen file has opened.
+    pending_relocation: Option<(String, String)>,
     pub left: LeftPanel,
     pub left_open: bool,
     pub right: Option<RightPanel>,
@@ -897,6 +951,9 @@ impl PdfCraftApp {
             units: Default::default(),
             date_format_draft: None,
             mode_override: None,
+            ui_mode: UiMode::default(),
+            last_doc: None,
+            pending_relocation: None,
             left: LeftPanel::AllTools,
             docking: docking::Workspace::default(),
             pending_panel_reveals: Vec::new(),
@@ -1361,9 +1418,10 @@ impl PdfCraftApp {
             self.left_open = left_open;
         }
         if let Some(p) = path {
+            self.finish_relocation(&p);
             self.recent.retain(|r| r.path != p);
             self.recent.insert(0, RecentFile { name: name.to_string(), path: p, pages, size });
-            self.recent.truncate(12);
+            self.recent.truncate(RECENT_MAX);
         }
         // What the form's scripts said while it opened (messages, errors) shows now, not with
         // the next edit.
@@ -2126,6 +2184,51 @@ impl PdfCraftApp {
         self.pending_panel_reveals.push(docking::Panel::Tools);
     }
 
+    pub fn ui_mode(&self) -> UiMode {
+        self.ui_mode
+    }
+
+    /// Switch between the simple and detailed interface. Tabs, documents, their views and
+    /// view-only stay as they are; leaving the simple Home for the detailed interface shows the
+    /// document shown last again, if it is still open.
+    pub fn set_ui_mode(&mut self, mode: UiMode) {
+        if self.ui_mode == UiMode::Simple && mode == UiMode::Detailed && self.active.is_none() && !self.combine_showing() {
+            self.active = self.last_doc.and_then(|id| self.views.iter().position(|v| v.id == id));
+        }
+        // The two interfaces draw the document in different places, each with its own scroll
+        // state: every view carries on from where it was last shown.
+        if mode != self.ui_mode {
+            for view in &mut self.views {
+                view.sync_scroll = Some(view.last_scroll);
+            }
+        }
+        self.ui_mode = mode;
+    }
+
+    /// The document area is drawn directly, with the rail's panes beside it: Read mode, and the
+    /// simple interface whatever the workspace mode.
+    pub(crate) fn reads_directly(&self) -> bool {
+        self.mode == Mode::Read || self.ui_mode == UiMode::Simple
+    }
+
+    /// Note the document shown now, for [`Self::set_ui_mode`].
+    fn note_last_doc(&mut self) {
+        if let Some((_, id)) = self.active_ids() {
+            self.last_doc = Some(id);
+        }
+    }
+
+    /// A file opened from `path`: if it is the file chosen for a recent entry that went missing,
+    /// that entry goes (the opened file takes its place at the top). A choice that failed to open
+    /// is forgotten at the next open, so it never replaces an entry later.
+    fn finish_relocation(&mut self, path: &str) {
+        if let Some((old, new)) = self.pending_relocation.take()
+            && same_file(&new, path)
+        {
+            self.recent.retain(|r| r.path != old);
+        }
+    }
+
     /// Enter a tool from the catalogue, Home, palette or control channel. Organize is a
     /// workspace, so opening its panel also opens the page grid (without toggling it off).
     pub(crate) fn select_tool(&mut self, id: &'static str) {
@@ -2144,6 +2247,7 @@ impl PdfCraftApp {
     /// Edit text & images at once, as Acrobat does: every paragraph and image on the page gets its
     /// box and is editable with one click. Leaving Edit puts the editing tools down again.
     pub(crate) fn select_mode(&mut self, mode: Mode) {
+        let mode = mode.in_view_only(self.session.view_only());
         self.mode = mode;
         self.reveal_tools();
         if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
@@ -2178,6 +2282,7 @@ impl PdfCraftApp {
     /// mode closes the right panel, as Acrobat's Read mode hides its panes, and leaving it reopens
     /// that panel. The rail stays in Read mode, and its buttons open panels there too (#932).
     pub(crate) fn switch_mode(&mut self, mode: Mode, select_tools: bool) {
+        let mode = mode.in_view_only(self.session.view_only());
         let was_read = self.mode == Mode::Read;
         if select_tools {
             self.select_mode(mode);
@@ -2287,6 +2392,7 @@ impl PdfCraftApp {
         v["redact_prefs"] = self.redact_defaults.to_json();
         // Set outside json! above, which is at serde_json's macro recursion limit.
         v["hide_empty_highlight_hover"] = serde_json::Value::Bool(self.comment_prefs.hide_empty_highlight_hover);
+        v["ui_mode"] = serde_json::Value::String(self.ui_mode.as_str().into());
         v.to_string()
     }
 
@@ -2309,10 +2415,10 @@ impl PdfCraftApp {
         if let Some(zoom) = v["combine_zoom"].as_f64() {
             self.set_combine_zoom(zoom as f32);
         }
-        if let Ok(r) = serde_json::from_value::<Vec<RecentFile>>(v["recent"].clone()) {
-            // Only keep entries whose files still exist.
-            #[cfg(not(target_arch = "wasm32"))]
-            let r: Vec<RecentFile> = r.into_iter().filter(|f| std::path::Path::new(&f.path).exists()).collect();
+        if let Ok(mut r) = serde_json::from_value::<Vec<RecentFile>>(v["recent"].clone()) {
+            // Files that moved or were deleted stay listed (Home offers to find or remove them);
+            // the list is newest first, so a longer one from an earlier version keeps its newest.
+            r.truncate(RECENT_MAX);
             self.recent = r;
         }
         if let Some(on) = v["reopen_last_session"].as_bool() {
@@ -2336,7 +2442,16 @@ impl PdfCraftApp {
             self.animation_effects = effects;
         }
         if let Ok(mode) = serde_json::from_value::<Mode>(v["default_mode"].clone()) {
-            self.default_mode = mode;
+            self.default_mode = mode.in_view_only(self.session.view_only());
+        }
+        // A session already in an editing workspace (a launch option, then these settings) reads.
+        self.mode = self.mode.in_view_only(self.session.view_only());
+        if let Some(mode) = self.mode_override {
+            self.mode_override = Some(mode.in_view_only(self.session.view_only()));
+        }
+        // Missing (settings from before the switch) or unknown: keep the mode the app started in.
+        if let Some(mode) = v["ui_mode"].as_str().and_then(UiMode::parse) {
+            self.ui_mode = mode;
         }
         if let Some((layout, continuous)) = v["default_layout"].as_str().and_then(canvas::parse_display_token) {
             (self.view_defaults.layout, self.view_defaults.continuous) = (layout, continuous);
@@ -2503,12 +2618,13 @@ impl PdfCraftApp {
                 }
             }
             ("mode", _) => {
-                let mode = Mode::parse(value).unwrap_or(Mode::AllTools);
+                let mode = Mode::parse(value).unwrap_or(Mode::AllTools).in_view_only(self.session.view_only());
                 self.mode_override = Some(mode);
                 self.mode = mode;
             }
             ("default-mode", _) => {
-                self.default_mode = Mode::parse(value).ok_or("default-mode must be all, read, edit, convert or sign")?;
+                let mode = Mode::parse(value).ok_or("default-mode must be all, read, edit, convert or sign")?;
+                self.default_mode = mode.in_view_only(self.session.view_only());
             }
             ("date-format", _) => self.session.set_date_format(value)?,
             ("date-language", _) => self.session.set_date_language(Some(value).filter(|v| *v != "auto"))?,
@@ -3085,6 +3201,10 @@ impl eframe::App for PdfCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         i18n::set_current(i18n::Lang::from_pref(&self.language));
+        // An editing workspace can be left over from before view-only: Read is what is shown.
+        if self.session.view_only() && !self.mode.offered_in_view_only() {
+            self.switch_mode(Mode::Read, true);
+        }
         // Fonts registered via set_fonts only take effect next frame; named families would panic now.
         if !self.fonts_ready {
             ctx.request_repaint();
@@ -3093,6 +3213,7 @@ impl eframe::App for PdfCraftApp {
         for view in &mut self.views {
             view.begin_render_frame();
         }
+        self.note_last_doc();
         // The window shows the active document's name (or title, if it asks for that).
         let title = self
             .active
@@ -3129,13 +3250,18 @@ impl eframe::App for PdfCraftApp {
             window_controls::resize_edges(&ctx);
         }
         chrome::tab_strip(self, ui);
-        chrome::mode_bar(self, ui);
+        let simple = self.ui_mode == UiMode::Simple;
+        if simple {
+            simple_home::viewer_bar(self, ui);
+        } else {
+            chrome::mode_bar(self, ui);
+        }
         if self.active.is_some() {
             chrome::right_rail(self, ui);
             // Read mode hides the tools, not the navigation panes: the rail stays visible
             // there, so its buttons (Bookmarks, Page thumbnails, ...) must open their panels.
             // Outside Read mode the docking workspace draws the inspector.
-            if self.mode == Mode::Read && self.right.is_some() {
+            if self.reads_directly() && self.right.is_some() {
                 egui::Panel::right("read_right_panel")
                     .resizable(true)
                     .default_size(330.0)
@@ -3146,9 +3272,10 @@ impl eframe::App for PdfCraftApp {
         }
         let t = theme::Tokens::get(&ctx);
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| {
-            if self.mode == Mode::Read {
+            if self.reads_directly() {
                 match self.active {
                     None if self.combine_showing() => combine_ui::page(self, ui),
+                    None if simple => simple_home::show(self, ui),
                     None => home::show(self, ui),
                     Some(index) => match compare_ui::side_by_side(self, index) {
                         Some((old, new)) => compare_ui::compare_area(self, old, new, ui),

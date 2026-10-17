@@ -4,7 +4,7 @@ use egui::{Align, Align2, Color32, CornerRadius, Layout, Rect, Sense, Stroke, ve
 
 use crate::canvas::{DocView, Fit, PageLayout};
 use crate::theme::{self, ThemePreference, Tokens};
-use crate::{Dialog, Mode, PdfCraftApp, PropsTab, RightPanel, icons, widgets, window_controls};
+use crate::{Dialog, Mode, PdfCraftApp, PropsTab, RightPanel, UiMode, icons, widgets, window_controls};
 
 /// Height of the tab strip when it doubles as the macOS title bar (#789). AppKit draws the traffic
 /// lights itself, centred in the standard 28 pt title-bar band at the top of the window, and moving
@@ -66,14 +66,22 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     app.active = None;
                     app.combine_tab.focused = false;
                 }
-                // Keep the two icon buttons, Discord's text/padding and three gaps outside the scrolling tabs.
-                let controls_width = ui.fonts_mut(|f| f.layout_no_wrap("Discord".into(), theme::medium(13.0), t.text).size().x)
-                    + 2.0 * button
-                    + 50.0
-                    + window_controls::width(&controls.right);
+                // Keep the two icon buttons, Discord's text/padding, three gaps and the mode switch's
+                // gap outside the scrolling tabs (the switch itself is measured below).
+                let discord_text = ui.fonts_mut(|f| f.layout_no_wrap("Discord".into(), theme::medium(13.0), t.text).size().x);
+                // The ghost button around that text: its icon and padding.
+                let discord_width = discord_text + 38.0;
+                let controls_width = discord_text + 2.0 * button + 50.0 + window_controls::width(&controls.right) + UI_MODE_GAP;
                 // Open stays in sight after the tabs: its icon, text and padding, and the gaps around it.
                 let open_width = ui.fonts_mut(|f| f.layout_no_wrap(tl!("Open").into(), theme::medium(13.0), t.text).size().x) + 38.0 + 12.0;
-                let mut tabs_width = (ui.available_width() - controls_width - open_width).max(0.0);
+                let room = ui.available_width() - controls_width - open_width;
+                // Short of room for one tab between the scroll arrows, the mode switch shortens its
+                // labels and Discord shows only its icon, which together take no more room than
+                // Discord's label did.
+                let gap = ui.spacing().item_spacing.x;
+                let compact = room - ui_mode_switch_width(ui, false) < TAB_MIN_WIDTH + 2.0 * (TAB_ARROW + gap);
+                let discord_saved = if compact { discord_width - button } else { 0.0 };
+                let mut tabs_width = (room + discord_saved - ui_mode_switch_width(ui, compact)).max(0.0);
                 // Tabs shrink to share the strip (names end in "…") and scroll only once they reach
                 // their narrowest; then arrows either side say so and step through them.
                 let mut natural: Vec<f32> = Vec::with_capacity(app.views.len() + 1);
@@ -85,7 +93,6 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 if app.combine_tab.open {
                     natural.push(tab_natural_width(ui, &t, tl!("Combine files")));
                 }
-                let gap = ui.spacing().item_spacing.x;
                 let overflow = tabs_overflow(&natural, tabs_width, gap, TAB_MIN_WIDTH);
                 if overflow {
                     tabs_width = (tabs_width - 2.0 * (TAB_ARROW + gap)).max(0.0);
@@ -280,6 +287,8 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         });
                         ui.add_space(window_controls::SIDE_GAP - 4.0);
                     }
+                    ui_mode_switch(app, ui, tab_h, compact);
+                    ui.add_space(UI_MODE_GAP - 4.0);
                     let (icon, label) = match app.theme_preference {
                         ThemePreference::System => ("monitor", tl!("Use system setting")),
                         ThemePreference::Light => ("sun", tl!("Light gray")),
@@ -300,12 +309,100 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         app.dialog = Some(Dialog::Shortcuts);
                     }
                     // One click to the community, from anywhere in the app.
-                    if widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD).clicked() {
+                    let discord = if compact {
+                        // Its tooltip says "Discord".
+                        icons::button(ui, "messages-square", button, false, "Discord")
+                    } else {
+                        widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD)
+                    };
+                    if discord.clicked() {
                         app.execute("help.discord");
                     }
                 });
             });
         });
+}
+
+/// The space between the 簡単／詳細 switch and the app buttons beside it.
+const UI_MODE_GAP: f32 = 8.0;
+/// The track around the switch's segments.
+const UI_MODE_TRACK: f32 = 2.0;
+
+fn ui_mode_font() -> egui::FontId {
+    theme::medium(12.5)
+}
+
+/// One segment of the 簡単／詳細 switch.
+struct UiModeSegment {
+    mode: UiMode,
+    /// The whole label, also the tooltip of a compact switch.
+    label: &'static str,
+    /// The label when the tab strip is short of room.
+    short: &'static str,
+    /// What screen readers and tests call it in every case.
+    name: &'static str,
+}
+
+impl UiModeSegment {
+    fn text(&self, compact: bool) -> &'static str {
+        if compact { self.short } else { self.label }
+    }
+}
+
+/// The switch's segments. The labels are Japanese in every interface language; a build that
+/// can't draw them (no Japanese face) shows English instead of boxes.
+fn ui_mode_segments(ui: &egui::Ui) -> [UiModeSegment; 2] {
+    let japanese = ui.fonts_mut(|f| f.has_glyphs(&ui_mode_font(), "簡単詳細"));
+    let (simple, simple_short, detailed, detailed_short) =
+        if japanese { ("簡単", "簡", "詳細", "詳") } else { ("Simple", "S", "Detailed", "D") };
+    [
+        UiModeSegment { mode: UiMode::Simple, label: simple, short: simple_short, name: "簡単" },
+        UiModeSegment { mode: UiMode::Detailed, label: detailed, short: detailed_short, name: "詳細" },
+    ]
+}
+
+/// Inner padding either side of a segment's label.
+fn ui_mode_pad(compact: bool) -> f32 {
+    if compact { 6.0 } else { 10.0 }
+}
+
+fn ui_mode_segment_widths(ui: &egui::Ui, compact: bool) -> [f32; 2] {
+    ui_mode_segments(ui)
+        .map(|s| ui.fonts_mut(|f| f.layout_no_wrap(s.text(compact).to_owned(), ui_mode_font(), Color32::WHITE).size().x) + 2.0 * ui_mode_pad(compact))
+}
+
+fn ui_mode_switch_width(ui: &egui::Ui, compact: bool) -> f32 {
+    ui_mode_segment_widths(ui, compact).iter().sum::<f32>() + 2.0 * UI_MODE_TRACK
+}
+
+/// SwiftPDF's 簡単／詳細 switch: two segments in a track, the current one raised; `compact` gives
+/// each a one-character label. A click changes only [`PdfCraftApp::set_ui_mode`]'s mode.
+fn ui_mode_switch(app: &mut PdfCraftApp, ui: &mut egui::Ui, height: f32, compact: bool) {
+    let t = Tokens::get(ui.ctx());
+    let widths = ui_mode_segment_widths(ui, compact);
+    let height = (height - 4.0).max(16.0);
+    let (track, _) = ui.allocate_exact_size(vec2(ui_mode_switch_width(ui, compact), height), Sense::hover());
+    ui.painter().rect(track, CornerRadius::same(7), t.field, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    let mut left = track.left() + UI_MODE_TRACK;
+    for (segment, width) in ui_mode_segments(ui).into_iter().zip(widths) {
+        let rect = Rect::from_min_size(egui::pos2(left, track.top() + UI_MODE_TRACK), vec2(width, height - 2.0 * UI_MODE_TRACK));
+        left += width;
+        let selected = app.ui_mode() == segment.mode;
+        let response = ui.interact(rect, ui.id().with(("ui_mode", segment.mode.as_str())), Sense::click());
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, segment.name));
+        let press = theme::Press::track(ui, &response);
+        if selected {
+            ui.painter().rect(rect, CornerRadius::same(5), t.card, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+        } else {
+            press.wash(ui, rect, 5, false);
+        }
+        let (font, color) = if selected { (theme::semibold(12.5), t.text) } else { (ui_mode_font(), t.text_muted) };
+        ui.painter().text(rect.translate(press.offset()).center(), Align2::CENTER_CENTER, segment.text(compact), font, color);
+        let response = if compact { response.on_hover_text(segment.label) } else { response };
+        if theme::hand(response).clicked() && !selected {
+            app.set_ui_mode(segment.mode);
+        }
+    }
 }
 
 /// Both theme entry points use the same choices and command path.
@@ -503,6 +600,10 @@ pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 for (mode, label) in
                     [(Mode::AllTools, "All tools"), (Mode::Read, "Read"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")]
                 {
+                    // Edit, Convert and E-Sign stay in the bar for a session that can edit.
+                    if app.session.view_only() && !mode.offered_in_view_only() {
+                        continue;
+                    }
                     if widgets::mode_tab(ui, tl!(label), app.mode == mode).clicked() {
                         app.switch_mode(mode, true);
                     }
@@ -644,7 +745,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let mut rail_button = |ui: &mut egui::Ui, panel: RightPanel, icon: &str, tip: &str, has: bool| {
-                let selected = app.right == Some(panel) && (app.mode == Mode::Read || app.docking.exposed(crate::docking::Panel::Inspector));
+                let selected = app.right == Some(panel) && (app.reads_directly() || app.docking.exposed(crate::docking::Panel::Inspector));
                 let r = icons::button(ui, icon, 34.0, selected, tl!(tip));
                 if has && !selected {
                     let c = r.rect.right_top() + vec2(-8.0, 8.0);
@@ -669,6 +770,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             // Page navigation cluster at the bottom (as in Acrobat's rail).
             let view = &mut app.views[index];
             let mut page_display = None;
+            let mut bad_zoom = None;
             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 let tip = crate::commands::key_tip(ui.ctx(), tl!("Zoom out ({key})"), crate::commands::ZOOM_OUT);
@@ -698,10 +800,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     view.fit = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
                     view.goto = Some((view.current, 0.0));
                 }
-                let zoom = format!("{:.0}%", view.zoom * 100.0);
-                ui.allocate_ui_with_layout(vec2(40.0, 16.0), Layout::top_down(Align::Center), |ui| {
-                    ui.label(egui::RichText::new(zoom).font(theme::medium(11.0)).color(t.text_muted));
-                });
+                bad_zoom = crate::zoom_menu::button(ui, view);
                 ui.add_space(6.0);
                 if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
                     view.step_page(true);
@@ -757,6 +856,9 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             });
             if let Some(id) = page_display {
                 app.execute(id);
+            }
+            if let Some(msg) = bad_zoom {
+                app.notify(msg);
             }
         });
 }

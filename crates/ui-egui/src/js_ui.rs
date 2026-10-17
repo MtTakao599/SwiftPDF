@@ -335,6 +335,9 @@ pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tok
             (crate::Mode::Convert, "Convert"),
             (crate::Mode::Sign, "E-Sign"),
         ] {
+            if app.session.view_only() && !mode.offered_in_view_only() {
+                continue;
+            }
             widgets::radio_value(ui, &mut app.default_mode, mode, tl!(label));
         }
     });

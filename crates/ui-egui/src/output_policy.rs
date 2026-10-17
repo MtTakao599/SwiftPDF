@@ -39,6 +39,13 @@ impl PdfCraftApp {
     pub fn set_view_only(&mut self, on: bool) {
         self.session.set_view_only(on);
         set_blocked(on);
+        if on {
+            self.default_mode = self.default_mode.in_view_only(true);
+            self.mode = self.mode.in_view_only(true);
+            if let Some(mode) = self.mode_override {
+                self.mode_override = Some(mode.in_view_only(true));
+            }
+        }
     }
 
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so

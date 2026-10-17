@@ -15,6 +15,10 @@ fn hue(g: &ToolGroup) -> Color32 {
 }
 
 pub fn left_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    // View-only hides the tool catalogue (the dock drops the pane too). The code stays.
+    if app.session.view_only() {
+        return;
+    }
     let t = Tokens::get(ui.ctx());
     // Organize closed another way (the grid's Close, or a page opened from it) closes the tool too,
     // as its panel's Close does, back to the workspace's own panel.

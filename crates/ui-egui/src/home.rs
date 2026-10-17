@@ -29,26 +29,31 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     .font(theme::regular(14.0)),
             );
             ui.add_space(14.0);
-            egui::Frame::NONE
-                .fill(t.card)
-                .stroke(Stroke::new(1.0, t.border))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        widgets::artcraft_mark(ui, 28.0);
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(tl!("Join the ArtCraft community")).font(theme::semibold(15.0)));
-                            ui.label(egui::RichText::new(tl!("Get help, share feedback and follow development on Discord.")).color(t.text_muted));
+            // A view-only app has nothing to promote and no editing tools to recommend. Both come
+            // back with editing; Open file, folders and the recent list stay.
+            let view_only = app.session.view_only();
+            if !view_only {
+                egui::Frame::NONE
+                    .fill(t.card)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            widgets::artcraft_mark(ui, 28.0);
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(tl!("Join the ArtCraft community")).font(theme::semibold(15.0)));
+                                ui.label(egui::RichText::new(tl!("Get help, share feedback and follow development on Discord.")).color(t.text_muted));
+                            });
                         });
+                        ui.add_space(8.0);
+                        if let Some(cmd) = widgets::community_links(ui) {
+                            app.execute(cmd);
+                        }
                     });
-                    ui.add_space(8.0);
-                    if let Some(cmd) = widgets::community_links(ui) {
-                        app.execute(cmd);
-                    }
-                });
-            ui.add_space(22.0);
+                ui.add_space(22.0);
+            }
 
             egui::Frame::NONE
                 .fill(t.card)
@@ -57,48 +62,56 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::same(18))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(egui::RichText::new(tl!("Recommended tools")).font(theme::semibold(15.0)));
-                    ui.add_space(10.0);
+                    if !view_only {
+                        ui.label(egui::RichText::new(tl!("Recommended tools")).font(theme::semibold(15.0)));
+                        ui.add_space(10.0);
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(14.0, 14.0);
-                        for id in RECOMMENDED {
-                            let Some(g) = catalog::group(id) else { continue };
-                            let (rect, resp) = ui.allocate_exact_size(vec2(190.0, 104.0), Sense::click());
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!(g.label)));
-                            let press = theme::Press::track(ui, &resp);
-                            card_lift(ui, &t, rect, press);
-                            let fill = press.fill(t.card, t.hover, t.pressed);
-                            ui.painter().rect(rect, CornerRadius::same(10), fill, Stroke::new(1.0, t.divider), egui::StrokeKind::Inside);
-                            let body = rect.translate(press.offset());
-                            let color = egui::Color32::from_rgb(g.hue[0], g.hue[1], g.hue[2]);
-                            icons::paint(ui, Rect::from_min_size(body.min + vec2(14.0, 14.0), vec2(22.0, 22.0)), g.icon, 21.0, color);
-                            let mut title_job = egui::text::LayoutJob::simple_singleline(tl!(g.label).to_owned(), theme::semibold(13.5), t.text);
-                            title_job.wrap =
-                                egui::text::TextWrapping { max_width: body.width() - 58.0, max_rows: 1, break_anywhere: true, ..Default::default() };
-                            let title = ui.fonts_mut(|f| f.layout_job(title_job));
-                            let title_elided = title.elided;
-                            ui.painter().galley(body.min + vec2(44.0, 25.0 - title.size().y * 0.5), title, t.text);
-                            let blurb = g
-                                .sections
-                                .first()
-                                .map(|s| s.items.iter().take(3).map(|i| tl!(i.label)).collect::<Vec<_>>().join(" · "))
-                                .unwrap_or_default();
-                            // Fixed-height cards must leave room for their action in every language.
-                            let mut job = egui::text::LayoutJob::simple(blurb.clone(), theme::regular(11.5), t.text_muted, body.width() - 28.0);
-                            job.wrap.max_rows = 2;
-                            let galley = ui.fonts_mut(|f| f.layout_job(job));
-                            let blurb_elided = galley.elided;
-                            ui.painter().galley(body.min + vec2(14.0, 46.0), galley, t.text_muted);
-                            ui.painter().text(
-                                body.left_bottom() + vec2(14.0, -14.0),
-                                Align2::LEFT_CENTER,
-                                tl!("Use now"),
-                                theme::medium(12.0),
-                                t.accent_text,
-                            );
-                            let resp = if title_elided || blurb_elided { resp.on_hover_text(format!("{}\n{blurb}", tl!(g.label))) } else { resp };
-                            if theme::hand(resp).clicked() {
-                                app.select_tool(g.id);
+                        if !view_only {
+                            for id in RECOMMENDED {
+                                let Some(g) = catalog::group(id) else { continue };
+                                let (rect, resp) = ui.allocate_exact_size(vec2(190.0, 104.0), Sense::click());
+                                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!(g.label)));
+                                let press = theme::Press::track(ui, &resp);
+                                card_lift(ui, &t, rect, press);
+                                let fill = press.fill(t.card, t.hover, t.pressed);
+                                ui.painter().rect(rect, CornerRadius::same(10), fill, Stroke::new(1.0, t.divider), egui::StrokeKind::Inside);
+                                let body = rect.translate(press.offset());
+                                let color = egui::Color32::from_rgb(g.hue[0], g.hue[1], g.hue[2]);
+                                icons::paint(ui, Rect::from_min_size(body.min + vec2(14.0, 14.0), vec2(22.0, 22.0)), g.icon, 21.0, color);
+                                let mut title_job = egui::text::LayoutJob::simple_singleline(tl!(g.label).to_owned(), theme::semibold(13.5), t.text);
+                                title_job.wrap = egui::text::TextWrapping {
+                                    max_width: body.width() - 58.0,
+                                    max_rows: 1,
+                                    break_anywhere: true,
+                                    ..Default::default()
+                                };
+                                let title = ui.fonts_mut(|f| f.layout_job(title_job));
+                                let title_elided = title.elided;
+                                ui.painter().galley(body.min + vec2(44.0, 25.0 - title.size().y * 0.5), title, t.text);
+                                let blurb = g
+                                    .sections
+                                    .first()
+                                    .map(|s| s.items.iter().take(3).map(|i| tl!(i.label)).collect::<Vec<_>>().join(" · "))
+                                    .unwrap_or_default();
+                                // Fixed-height cards must leave room for their action in every language.
+                                let mut job = egui::text::LayoutJob::simple(blurb.clone(), theme::regular(11.5), t.text_muted, body.width() - 28.0);
+                                job.wrap.max_rows = 2;
+                                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                let blurb_elided = galley.elided;
+                                ui.painter().galley(body.min + vec2(14.0, 46.0), galley, t.text_muted);
+                                ui.painter().text(
+                                    body.left_bottom() + vec2(14.0, -14.0),
+                                    Align2::LEFT_CENTER,
+                                    tl!("Use now"),
+                                    theme::medium(12.0),
+                                    t.accent_text,
+                                );
+                                let resp = if title_elided || blurb_elided { resp.on_hover_text(format!("{}\n{blurb}", tl!(g.label))) } else { resp };
+                                if theme::hand(resp).clicked() {
+                                    app.select_tool(g.id);
+                                }
                             }
                         }
                         let (rect, resp) = ui.allocate_exact_size(vec2(170.0, 104.0), Sense::click());

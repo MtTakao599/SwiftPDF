@@ -360,6 +360,8 @@ fn app_creator<'a>(
         app.enable_desktop_theme();
         // The system's reopen-windows choice (macOS) starts the preference; a saved choice replaces it.
         app.reopen_last_session = reopen::system_default();
+        // SwiftPDF starts in the simple interface; a saved choice replaces it.
+        app.set_ui_mode(pdfcraft_ui_egui::UiMode::Simple);
         if let Some(json) = cc.storage.and_then(|s| s.get_string(pdfcraft_ui_egui::identity::STORAGE_KEY)) {
             app.restore(&json);
         }
