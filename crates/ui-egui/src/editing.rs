@@ -878,7 +878,7 @@ impl PdfCraftApp {
 
     /// Request a normal application exit, preserving every unsaved document until answered.
     /// Returns false while the existing save/discard/cancel prompt needs a decision.
-    pub(crate) fn request_quit(&mut self, ctx: &egui::Context) -> bool {
+    pub fn request_quit(&mut self, ctx: &egui::Context) -> bool {
         if self.first_dirty().is_some() {
             self.close_request = Some(CloseRequest::Quit);
             ctx.request_repaint();
@@ -1000,6 +1000,33 @@ impl PdfCraftApp {
         self.pending_save_copy = None;
     }
 
+    /// Turn added-text placement on or off. View-only stays on. A restricted PDF is refused.
+    pub fn begin_text_entry(&mut self) {
+        if !self.session.view_only() || !self.session.allows(pdfcraft_engine::Capability::EditText) {
+            self.notify(crate::identity::localized("文字入力は許可されていません。", "Adding text is not allowed."));
+            return;
+        }
+        let Some((_, id)) = self.active_ids() else {
+            self.notify(crate::identity::localized("文字を入れるPDFが開いていません。", "No PDF is open to add text to."));
+            return;
+        };
+        if !self.session.allows_added_text(id) {
+            self.notify(crate::identity::localized(
+                "このPDFは文字の変更が制限されているため、文字を追加できません。",
+                "This PDF does not allow text changes, so text was not added.",
+            ));
+            return;
+        }
+        if self.quick_tool == crate::QuickTool::AddText {
+            if let Some(i) = self.active {
+                self.views[i].content.draft = None;
+            }
+            self.quick_tool = crate::QuickTool::Select;
+            return;
+        }
+        self.quick_tool = crate::QuickTool::AddText;
+    }
+
     pub(crate) fn save_copy_permitted(&self) -> bool {
         self.session.view_only()
             && self.session.allows(pdfcraft_engine::Capability::SaveAs)
@@ -1020,20 +1047,32 @@ impl PdfCraftApp {
         let source_path = doc.path.clone().or(request.source_path.clone());
         let source_name = doc.name.clone();
         let original_before = source_path.as_deref().and_then(|path| std::fs::read(path).ok());
-        let bytes = match self.session.save_copy_bytes(request.id) {
-            Ok(bytes) => bytes,
-            Err(pdfcraft_engine::EditError::Invalid(_)) => {
-                self.notify(crate::identity::localized(
-                    "開いたときの内容だけを保存できます。変更されたPDFは保存しません。",
-                    "Only the file as it was opened can be saved. This PDF has changes, so it was not saved.",
-                ));
-                return false;
+        let bytes = if self.session.differs_from_opened(request.id) {
+            match self.session.save_edited_copy_bytes(request.id) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+                    let en = format!("Couldn't save the edited PDF. The text you added is still here. {error}");
+                    self.notify(crate::identity::localized(&ja, &en));
+                    return false;
+                }
             }
-            Err(error) => {
-                let ja = format!("保存できませんでした。{error}");
-                let en = format!("Couldn't save the copy. {error}");
-                self.notify(crate::identity::localized(&ja, &en));
-                return false;
+        } else {
+            match self.session.save_copy_bytes(request.id) {
+                Ok(bytes) => bytes,
+                Err(pdfcraft_engine::EditError::Invalid(_)) => {
+                    self.notify(crate::identity::localized(
+                        "開いたときの内容だけを保存できます。変更されたPDFは保存しません。",
+                        "Only the file as it was opened can be saved. This PDF has changes, so it was not saved.",
+                    ));
+                    return false;
+                }
+                Err(error) => {
+                    let ja = format!("保存できませんでした。{error}");
+                    let en = format!("Couldn't save the copy. {error}");
+                    self.notify(crate::identity::localized(&ja, &en));
+                    return false;
+                }
             }
         };
         if let Err(error) = self.session.check_save(request.id, &bytes) {
@@ -1045,15 +1084,15 @@ impl PdfCraftApp {
         self.publish_new_pdf(request.id, &source_name, source_path.as_deref(), &request.dest, bytes.as_ref(), original_before.as_deref())
     }
 
-    /// Write `bytes` to a new path. Today `bytes` are the opened file from
-    /// [`Session::save_copy_bytes`](pdfcraft_engine::Session::save_copy_bytes). A later edited
-    /// revision would pass its own bytes into this function and nowhere else: the original path
-    /// and an existing destination stay protected here, independent of how the bytes were made.
+    /// Write `bytes` to a new path. `bytes` are the opened file, or the added-text revision from
+    /// [`Session::save_edited_copy_bytes`](pdfcraft_engine::Session::save_edited_copy_bytes).
+    /// The original path and an existing destination stay protected here, independent of how
+    /// the bytes were made.
     #[cfg(not(target_arch = "wasm32"))]
     fn publish_new_pdf(
         &mut self,
         id: pdfcraft_engine::DocId,
-        source_name: &str,
+        _source_name: &str,
         source_path: Option<&str>,
         dest_path: &str,
         bytes: &[u8],
@@ -1092,17 +1131,31 @@ impl PdfCraftApp {
             return false;
         }
         let original_after = source_path.and_then(|path| std::fs::read(path).ok());
-        let original_differs = original_before.is_some_and(|on_disk| on_disk != bytes)
-            || original_after.as_ref().is_some_and(|now| original_before.is_some_and(|earlier| earlier != now.as_slice()));
+        let opened = self.session.opened_bytes(id);
+        let changed_outside = match (original_before, opened.as_ref()) {
+            (Some(on_disk), Some(opened)) => on_disk != opened.as_ref().as_slice(),
+            _ => false,
+        } || match (original_after.as_deref(), original_before) {
+            (Some(now), Some(earlier)) => now != earlier,
+            _ => false,
+        };
         let dest_name = dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| dest_path.to_string());
-        if original_differs {
+        if changed_outside {
             let ja = format!("「{dest_name}」に保存しました。原本のファイルは開いたときと違う内容なので、そのままにしました。");
             let en = format!("Saved {dest_name}. The original file on disk is no longer the opened PDF, so it was left as it is.");
             self.notify(crate::identity::localized(&ja, &en));
         } else {
-            let ja = format!("「{dest_name}」に保存しました。原本「{source_name}」は変更していません。");
-            let en = format!("Saved {dest_name}. The original {source_name} was not changed.");
-            self.notify(crate::identity::localized(&ja, &en));
+            self.notify(crate::identity::localized(
+                "新しいPDFとして保存しました。原本は変更していません。",
+                "Saved as a new PDF. The original was not changed.",
+            ));
+        }
+        // The copy matches this tab. The original path stays; mark_saved is not used.
+        if self.session.note_saved_copy(id).is_err() {
+            self.notify(crate::identity::localized(
+                "保存したファイルは書き込めましたが、このタブの保存状態を記録できませんでした。",
+                "The file was written, but this tab could not record that it matches the copy.",
+            ));
         }
         // The open tab stays bound to the original. The copy opens beside it for reading.
         self.open_path(dest_path);

@@ -2296,6 +2296,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         }
         return;
     }
+    let place_text = app.session.allows_added_text(app.views[index].id);
     let Some(doc) = app.session.get(app.views[index].id) else { return };
     let info = &doc.info;
     if info.pages.is_empty() {
@@ -2652,6 +2653,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     let mut field_props = false;
     let mut field_placed = false;
     let can_modify = doc.allows_modification();
+    // Added text in a view-only session. Other tools still see `can_modify`, which stays false.
+    let can_place_text = can_modify || (place_text && tool == QuickTool::AddText);
     if preparing {
         crate::prepare::after_refresh(view, &form);
     } else {
@@ -3042,7 +3045,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 }
                 view.content.selected = None;
             }
-            let on_content = !on_objects && editing_content && can_modify && {
+            let on_content = !on_objects && editing_content && (can_modify || can_place_text) && {
                 source_blocked
                     || crate::content_ui::page_input(
                         ui,
@@ -3730,7 +3733,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some(e) = crate::fill_sign::type_box(ui.ctx(), view, info, &author) {
         view.pending_edit = Some(e);
     }
-    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added);
+    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added, place_text);
     if typed.is_some() {
         view.pending_edit = typed;
     }
@@ -3756,8 +3759,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if stamp_placed {
         tool = QuickTool::Select;
     }
-    // Text: each click on the page starts a box (#74); Done in the editor goes back to selecting.
-    if text_done && tool == QuickTool::AddText {
+    // The full editor's Done returns to Select (#74). SwiftPDF's text tool stays in AddText
+    // after 確定, so the next string can be placed and an existing one dragged. 文字入力を終了
+    // is what returns to Select.
+    if text_done && tool == QuickTool::AddText && !place_text {
         tool = QuickTool::Select;
     }
     // One field, then back to selecting (Acrobat's default without "Keep tools pinned").
@@ -4428,8 +4433,13 @@ fn notice_bar(ui: &mut egui::Ui, t: &Tokens, icon: &str, icon_color: Color32, te
 fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     // Commenting, drawing, filling and editing have nothing to do while the session is view-only.
-    // Select and Hand stay. The tools themselves are unchanged for a session that can edit.
-    if app.session.view_only() && !matches!(app.quick_tool, QuickTool::Select | QuickTool::Hand | QuickTool::MarqueeZoom | QuickTool::ColumnSelect) {
+    // Select and Hand stay. Added text stays only while that one capability is granted.
+    // The tools themselves are unchanged for a session that can edit.
+    let added_text = matches!(app.quick_tool, QuickTool::AddText) && app.active_ids().is_some_and(|(_, id)| app.session.allows_added_text(id));
+    if app.session.view_only()
+        && !added_text
+        && !matches!(app.quick_tool, QuickTool::Select | QuickTool::Hand | QuickTool::MarqueeZoom | QuickTool::ColumnSelect)
+    {
         app.quick_tool = QuickTool::Select;
     }
     let pos = area.left_top() + vec2(14.0, 14.0);

@@ -14,6 +14,9 @@
 //!   [`Capability::SaveAs`] is a separate grant. Without it, [`Session::save_copy_bytes`] is
 //!   refused too. With it, that method returns the opened bytes only; it still does not allow
 //!   [`Session::save_bytes`], a rewrite, or any other capability.
+//!   [`Capability::EditText`] is also separate. With it, only added text may be applied, undone
+//!   and redone ([`Session::allows_added_text`]). Forms, pages, comments, stamps and in-place
+//!   save stay refused. Edited bytes for a new file come from [`Session::save_edited_copy_bytes`].
 //!
 //! Reading stays as it is: opening (with a password too) and reloading, rendering, text, search,
 //! forms and signature validation as displayed, layers, hiding comments, reading colours, and
@@ -381,5 +384,352 @@ mod tests {
         assert_eq!(copied.as_slice(), signed.as_slice());
         assert!(s.get(id).unwrap().is_signed());
         assert_eq!(s.save_full_bytes(id), Err(EditError::ViewOnly));
+    }
+
+    /// A one-page PDF whose only content is an image, standing in for a scan.
+    fn scan_page() -> Vec<u8> {
+        let mut image =
+            b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n".to_vec();
+        image.push(0xff);
+        image.extend_from_slice(b"\nendstream");
+        let body = "q 180 0 0 180 40 80 cm /Im0 Do Q";
+        let content = format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()).into_bytes();
+        let objs = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            image,
+            content,
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            out.extend_from_slice(object);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let start = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n", objs.len() + 1).as_bytes());
+        out
+    }
+
+    #[test]
+    fn view_only_added_text_is_saved_as_a_new_pdf_and_other_edits_stay_refused() {
+        let original = scan_page();
+        let label = if pdfcraft_fonts::document_japanese_font().is_some() { "山田 太郎 1-2-3" } else { "Note 1-2-3" };
+        let mut s = Session::new().with_clock(|| 1_700_000_000).with_view_only(true);
+        s.grant(Capability::SaveAs);
+        s.grant(Capability::EditText);
+        let id = s.open("scan.pdf", Some("scan.pdf".into()), Arc::new(original.clone()), None).unwrap();
+        assert!(s.allows_added_text(id));
+        assert!(s.view_only());
+        assert!(!s.get(id).unwrap().allows_modification());
+        assert!(!s.get(id).unwrap().allows_form_filling());
+        assert!(!s.get(id).unwrap().allows_annotation());
+        assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![0] }), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::AddImage { page: 0, rect: None, name: "a.png".into(), bytes: Arc::new(vec![1]) }), Err(EditError::ViewOnly));
+        let settings = crate::print::Settings { pages: vec![0], ..Default::default() };
+        assert_eq!(s.print_pdf(id, &settings), Err(EditError::ViewOnly));
+        s.apply(
+            id,
+            Edit::AddText {
+                page: 0,
+                text: crate::AddedText {
+                    rect: [40.0, 280.0, 260.0, 340.0],
+                    text: label.into(),
+                    size: 16.0,
+                    color: [0.0, 0.0, 0.6],
+                    ..crate::AddedText::default()
+                },
+            },
+        )
+        .unwrap();
+        assert!(s.get(id).unwrap().dirty);
+        assert_eq!(s.undo(id).unwrap().as_str(), "Add text");
+        assert!(!s.get(id).unwrap().dirty);
+        assert_eq!(s.redo(id).unwrap().as_str(), "Add text");
+        let moved = {
+            let item = s.get(id).unwrap().added()[0].content.clone();
+            let crate::AddedContent::Text(text) = item else { panic!("added text") };
+            crate::AddedText { rect: [50.0, text.rect[1], 270.0, text.rect[3]], ..text }
+        };
+        s.apply(id, Edit::UpdateContent { page: 0, index: 0, content: crate::AddedContent::Text(moved) }).unwrap();
+        assert_eq!(s.save_copy_bytes(id), Err(EditError::Invalid("this copy can only save the file as it was opened".into())));
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        let saved = s.save_edited_copy_bytes(id).unwrap();
+        assert_ne!(saved.as_slice(), original.as_slice());
+        assert!(s.get(id).unwrap().dirty, "a failed or finished copy save must keep the added text");
+        s.check_save(id, &saved).unwrap();
+        let mut again = Session::new().with_view_only(true);
+        let copy = again.open("copy.pdf", None, saved, None).unwrap();
+        let shown = page_text(&again, copy, 0);
+        assert!(shown.contains(if label.starts_with('山') { "山田" } else { "Note" }), "{shown}");
+        assert!(shown.contains("1-2-3"), "{shown}");
+        assert_eq!(original, scan_page(), "the bytes this test opened from are unchanged");
+    }
+
+    #[test]
+    fn view_only_added_text_respects_a_pdf_that_forbids_changes() {
+        use crate::{Changes, Printing, Protection};
+        let mut author = Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        author
+            .apply(
+                id,
+                Edit::Protect(Protection {
+                    open_password: Some("reader".into()),
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::None,
+                    changes: Changes::None,
+                    copy: false,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.save_bytes(id).unwrap();
+        let mut s = Session::new().with_view_only(true);
+        s.grant(Capability::SaveAs);
+        s.grant(Capability::EditText);
+        let id = s.open("locked.pdf", None, locked, Some("reader")).unwrap();
+        assert!(!s.allows_added_text(id));
+        assert_eq!(
+            s.apply(
+                id,
+                Edit::AddText {
+                    page: 0,
+                    text: crate::AddedText { rect: [40.0, 40.0, 200.0, 80.0], text: "No".into(), ..crate::AddedText::default() }
+                }
+            ),
+            Err(EditError::NotPermitted("changes to the document"))
+        );
+        assert!(!s.get(id).unwrap().dirty);
+        assert_eq!(s.unlock(id, "owner"), Err(EditError::ViewOnly));
+    }
+
+    #[test]
+    fn a_saved_copy_matches_until_the_text_changes_again() {
+        let mut s = Session::new().with_clock(|| 1_700_000_000).with_view_only(true);
+        s.grant(Capability::SaveAs);
+        s.grant(Capability::EditText);
+        let original = Arc::new(fixture(1));
+        let id = s.open("opened.pdf", Some("opened.pdf".into()), original.clone(), None).unwrap();
+        s.apply(
+            id,
+            Edit::AddText {
+                page: 0,
+                text: crate::AddedText { rect: [40.0, 80.0, 200.0, 120.0], text: "Note".into(), ..crate::AddedText::default() },
+            },
+        )
+        .unwrap();
+        assert!(s.get(id).unwrap().dirty);
+        let saved = s.save_edited_copy_bytes(id).unwrap();
+        assert_ne!(saved.as_slice(), original.as_slice());
+        assert!(s.get(id).unwrap().dirty, "writing bytes does not itself record the copy");
+        s.note_saved_copy(id).unwrap();
+        assert!(!s.get(id).unwrap().dirty);
+        assert_eq!(s.get(id).unwrap().path.as_deref(), Some("opened.pdf"));
+        assert!(s.differs_from_opened(id));
+        assert_eq!(s.mark_saved(id, saved.clone(), Some("copy.pdf".into())), Err(EditError::ViewOnly));
+        assert_eq!(s.get(id).unwrap().path.as_deref(), Some("opened.pdf"));
+        let again = s.save_edited_copy_bytes(id).unwrap();
+        assert_ne!(again.as_slice(), original.as_slice());
+        s.apply(
+            id,
+            Edit::AddText {
+                page: 0,
+                text: crate::AddedText { rect: [40.0, 140.0, 200.0, 180.0], text: "More".into(), ..crate::AddedText::default() },
+            },
+        )
+        .unwrap();
+        assert!(s.get(id).unwrap().dirty);
+        assert_eq!(s.undo(id).unwrap().as_str(), "Add text");
+        assert!(!s.get(id).unwrap().dirty, "undo back to the saved copy is clean");
+        assert_eq!(s.undo(id).unwrap().as_str(), "Add text");
+        assert!(!s.get(id).unwrap().dirty, "undo back to the opened file is clean");
+        assert_eq!(s.redo(id).unwrap().as_str(), "Add text");
+        assert!(!s.get(id).unwrap().dirty, "redo back to the saved copy is clean");
+        assert_eq!(s.redo(id).unwrap().as_str(), "Add text");
+        assert!(s.get(id).unwrap().dirty, "redo past the saved copy is unsaved");
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn placed(doc: &crate::Document) -> Vec<crate::AddedText> {
+        doc.added()
+            .iter()
+            .filter(|item| item.page == 0)
+            .map(|item| match &item.content {
+                crate::AddedContent::Text(text) => text.clone(),
+                crate::AddedContent::Image(_) => panic!("added text"),
+            })
+            .collect()
+    }
+
+    fn render_pixels(bytes: &std::sync::Arc<Vec<u8>>, config: &pdfcraft_render::RenderConfig) -> pdfcraft_render::RenderedPage {
+        let mut renderer = pdfcraft_render::PageRenderer::new(bytes.clone(), config.clone());
+        let page =
+            renderer.render(pdfcraft_render::RenderRequest { page: 0, kind: pdfcraft_render::RequestKind::Pixels, scale: 2.0, ..Default::default() });
+        assert!(page.error.is_none(), "{:?}", page.error);
+        page
+    }
+
+    /// Pixels inside a user-space box. PDF y grows up; the raster's y grows down.
+    fn crop(page: &pdfcraft_render::RenderedPage, rect: [f64; 4], page_height: f64, scale: f64) -> Vec<u8> {
+        let x0 = (rect[0] * scale).floor().clamp(0.0, page.width as f64) as u32;
+        let x1 = (rect[2] * scale).ceil().clamp(0.0, page.width as f64) as u32;
+        let y0 = ((page_height - rect[3]) * scale).floor().clamp(0.0, page.height as f64) as u32;
+        let y1 = ((page_height - rect[1]) * scale).ceil().clamp(0.0, page.height as f64) as u32;
+        let mut out = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y as usize * page.width as usize + x as usize) * 4;
+                let Some(pixel) = page.rgba.get(i..i + 4) else { continue };
+                out.extend_from_slice(pixel);
+            }
+        }
+        out
+    }
+
+    fn ink_count(pixels: &[u8]) -> usize {
+        pixels
+            .chunks(4)
+            .filter(|pixel| {
+                pixel.first().is_some_and(|red| *red < 250)
+                    || pixel.get(1).is_some_and(|green| *green < 250)
+                    || pixel.get(2).is_some_and(|blue| *blue < 250)
+            })
+            .count()
+    }
+
+    #[test]
+    fn three_added_japanese_strings_stay_drawn_after_edits_undo_and_save() {
+        if pdfcraft_fonts::document_japanese_font().is_none() {
+            eprintln!("skipping three_added_japanese_strings_stay_drawn_after_edits_undo_and_save: built without craft-fonts");
+            return;
+        }
+        let original = fixture(1);
+        let dir = std::env::temp_dir().join(format!("pdfcraft-jp-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original_path = dir.join("original.pdf");
+        std::fs::write(&original_path, &original).unwrap();
+        let original_hash = sha256(&std::fs::read(&original_path).unwrap());
+
+        let mut session = Session::new().with_clock(|| 1_700_000_000).with_view_only(true);
+        session.grant(Capability::SaveAs);
+        session.grant(Capability::EditText);
+        let id = session.open("opened.pdf", Some(original_path.to_string_lossy().into_owned()), Arc::new(original.clone()), None).unwrap();
+        assert!(session.view_only());
+        let add = |session: &mut Session, text: &str, rect: [f64; 4], size: f64, color: [f64; 3]| {
+            session
+                .apply(id, Edit::AddText { page: 0, text: crate::AddedText { rect, text: text.into(), size, color, ..crate::AddedText::default() } })
+                .unwrap();
+        };
+        add(&mut session, "東京", [10.0, 220.0, 90.0, 280.0], 18.0, [1.0, 0.0, 0.0]);
+        let first = placed(session.get(id).unwrap()).remove(0);
+        let config = session.get(id).unwrap().config.clone();
+        let alone = render_pixels(&session.get(id).unwrap().bytes, &config);
+        let first_ink = crop(&alone, first.rect, 300.0, 2.0);
+        assert!(ink_count(&first_ink) > 8, "the first string did not paint");
+
+        add(&mut session, "大阪", [110.0, 220.0, 190.0, 280.0], 16.0, [0.0, 0.0, 1.0]);
+        add(&mut session, "名古屋 1-2-3", [10.0, 30.0, 150.0, 100.0], 12.0, [0.0, 0.5, 0.0]);
+        let three = placed(session.get(id).unwrap());
+        assert_eq!(three.len(), 3);
+        assert_ne!(three[0].color, three[1].color);
+        assert_ne!(three[1].size, three[2].size);
+        assert_eq!(three[0].rect, first.rect);
+        let drawn = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_eq!(crop(&drawn, three[0].rect, 300.0, 2.0), first_ink, "adding more strings repainted the first one");
+        for item in &three {
+            assert!(ink_count(&crop(&drawn, item.rect, 300.0, 2.0)) > 8, "{} did not paint", item.text);
+        }
+        let extracted = page_text(&session, id, 0);
+        for item in &three {
+            assert!(extracted.contains(&item.text), "{extracted}");
+        }
+
+        let mut moved = three[1].clone();
+        moved.rect = [moved.rect[0] + 8.0, moved.rect[1] - 20.0, moved.rect[2] + 8.0, moved.rect[3] - 20.0];
+        session.apply(id, Edit::UpdateContent { page: 0, index: 1, content: crate::AddedContent::Text(moved) }).unwrap();
+        let after_move = placed(session.get(id).unwrap());
+        assert_eq!(after_move[0], three[0]);
+        assert_eq!(after_move[2], three[2]);
+        assert_ne!(after_move[1].rect, three[1].rect);
+        let moved_page = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_eq!(crop(&moved_page, after_move[0].rect, 300.0, 2.0), first_ink, "moving the second string repainted the first");
+        assert!(ink_count(&crop(&moved_page, after_move[2].rect, 300.0, 2.0)) > 8, "the third string disappeared when the second moved");
+
+        let mut edited = after_move[0].clone();
+        edited.text = "京都".into();
+        session.apply(id, Edit::UpdateContent { page: 0, index: 0, content: crate::AddedContent::Text(edited) }).unwrap();
+        let after_edit = placed(session.get(id).unwrap());
+        assert_eq!(after_edit[0].text, "京都");
+        assert_eq!(after_edit[1], after_move[1]);
+        assert_eq!(after_edit[2], after_move[2]);
+        let edited_page = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_ne!(crop(&edited_page, after_edit[0].rect, 300.0, 2.0), first_ink, "retyping the first string left its old drawing");
+        assert!(ink_count(&crop(&edited_page, after_edit[1].rect, 300.0, 2.0)) > 8, "the second string disappeared when the first was retyped");
+        assert!(ink_count(&crop(&edited_page, after_edit[2].rect, 300.0, 2.0)) > 8, "the third string disappeared when the first was retyped");
+
+        assert_eq!(session.undo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(placed(session.get(id).unwrap()), after_move);
+        assert_eq!(session.undo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(placed(session.get(id).unwrap()), three);
+        let restored = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_eq!(crop(&restored, three[0].rect, 300.0, 2.0), first_ink, "undo did not restore the first string's drawing");
+        assert_eq!(session.redo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(session.redo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(placed(session.get(id).unwrap()), after_edit);
+        assert_eq!(session.undo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(session.undo(id).unwrap().as_str(), "Edit content");
+        assert_eq!(placed(session.get(id).unwrap()), three);
+
+        session.apply(id, Edit::DeleteContent { page: 0, index: 1 }).unwrap();
+        let after_delete = placed(session.get(id).unwrap());
+        assert_eq!(after_delete, vec![three[0].clone(), three[2].clone()]);
+        let deleted_page = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_eq!(crop(&deleted_page, three[0].rect, 300.0, 2.0), first_ink, "deleting the second string repainted the first");
+        assert!(ink_count(&crop(&deleted_page, three[2].rect, 300.0, 2.0)) > 8, "deleting the second string removed the third");
+        assert_eq!(session.undo(id).unwrap().as_str(), "Delete content");
+        assert_eq!(placed(session.get(id).unwrap()), three);
+        let undeleted = render_pixels(&session.get(id).unwrap().bytes, &config);
+        assert_eq!(
+            crop(&undeleted, three[1].rect, 300.0, 2.0),
+            crop(&drawn, three[1].rect, 300.0, 2.0),
+            "undo did not restore the deleted string's drawing"
+        );
+
+        let saved = session.save_edited_copy_bytes(id).unwrap();
+        let copy_path = dir.join("copy.pdf");
+        std::fs::write(&copy_path, saved.as_ref()).unwrap();
+        assert_eq!(sha256(&std::fs::read(&original_path).unwrap()), original_hash);
+        assert_eq!(std::fs::read(&original_path).unwrap(), original);
+        assert!(session.view_only());
+        assert_eq!(session.save_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(session.get(id).unwrap().path.as_deref(), Some(original_path.to_string_lossy().as_ref()));
+
+        let mut again = Session::new().with_view_only(true);
+        let copy = again.open("copy.pdf", None, std::sync::Arc::clone(&saved), None).unwrap();
+        let reopened = placed(again.get(copy).unwrap());
+        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened[0].text, "東京");
+        assert_eq!(reopened[1].text, "大阪");
+        assert_eq!(reopened[2].text, "名古屋 1-2-3");
+        let shown = page_text(&again, copy, 0);
+        assert!(shown.contains("東京") && shown.contains("大阪") && shown.contains("名古屋") && shown.contains("1-2-3"), "{shown}");
+        let copy_page = render_pixels(&again.get(copy).unwrap().bytes, &again.get(copy).unwrap().config);
+        for item in &reopened {
+            assert!(ink_count(&crop(&copy_page, item.rect, 300.0, 2.0)) > 8, "{} did not paint in the saved PDF", item.text);
+        }
+        assert_eq!(crop(&copy_page, reopened[0].rect, 300.0, 2.0), first_ink, "the saved PDF redrew the first string");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

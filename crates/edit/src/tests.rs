@@ -938,6 +938,174 @@ fn without_craft_fonts(test: &str) -> bool {
 }
 
 #[test]
+fn added_japanese_text_uses_type3_outlines_and_keeps_halfwidth_latin() {
+    if without_craft_fonts("added_japanese_text_uses_type3_outlines_and_keeps_halfwidth_latin") {
+        return;
+    }
+    let mut doc = fixture();
+    let text = "山田 太郎\n東京都千代田区 1-2-3";
+    add_content(
+        &mut doc,
+        0,
+        &Content::Text(AddedText {
+            rect: [72.0, 500.0, 520.0, 620.0],
+            text: text.into(),
+            size: 14.0,
+            color: [0.1, 0.2, 0.8],
+            ..AddedText::default()
+        }),
+    )
+    .unwrap();
+    let doc = reopen(&doc);
+    let Content::Text(stored) = &list_added(&doc)[0].content else { panic!("added text") };
+    assert_eq!(stored.text, text);
+    let joined = text::text_lines(&doc, 0).unwrap().into_iter().map(|line| line.text).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("山田"), "{joined}");
+    assert!(joined.contains("1-2-3"), "{joined}");
+    let bytes = page_content_bytes(&doc, 0);
+    let content = String::from_utf8_lossy(&bytes);
+    assert!(content.contains("/PCJp"), "{content}");
+    assert!(content.contains("/PCFHelvetica") && content.contains("1-2-3"), "half-width digits stay in the standard font: {content}");
+    assert!(content.contains("0.1 0.2 0.8 rg"), "{content}");
+    let page = &pdfcraft_model::pages(&doc)[0];
+    let resources = doc.resolve(page.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(resources.as_dict().unwrap().get(b"Font").unwrap()).as_dict().unwrap().clone();
+    let font = fonts.iter().find(|(name, _)| name.starts_with(b"PCJp")).map(|(_, font)| doc.resolve(font).as_dict().unwrap().clone());
+    let font = font.expect("a Japanese Type 3 font");
+    assert_eq!(font.name(b"Subtype"), Some(&b"Type3"[..]));
+    let cmap = stream_bytes(&doc, font.get(b"ToUnicode").unwrap()).unwrap();
+    let mapped = String::from_utf8_lossy(&cmap);
+    for code in ["5C71", "7530", "90CE"] {
+        assert!(mapped.contains(&format!("<{code}>")), "{code} missing from {mapped}");
+    }
+}
+
+/// Resource names of Japanese Type 3 fonts a content stream paints with.
+fn japanese_font_names(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = content;
+    while let Some(at) = rest.find("/PCJp") {
+        let token = &rest[at + 1..];
+        let end = token.find(|c: char| c.is_ascii_whitespace() || c == '/').unwrap_or(token.len());
+        let name = token[..end].to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        rest = &token[end..];
+    }
+    names
+}
+
+fn added_stream(doc: &Document, obj: pdfcraft_cos::ObjRef) -> String {
+    let object = doc.get(obj);
+    let pdfcraft_cos::Object::Stream(stream) = &*object else { panic!("added item is not a stream") };
+    let decoded = stream.decoded().unwrap_or_default();
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn type3_cmap(doc: &Document, name: &str) -> String {
+    let page = pdfcraft_model::pages(doc).swap_remove(0);
+    let resources = doc.resolve(page.dict.get(b"Resources").expect("resources"));
+    let fonts = doc.resolve(resources.as_dict().expect("resources").get(b"Font").expect("fonts"));
+    let font = doc.resolve(fonts.as_dict().expect("fonts").get(name.as_bytes()).unwrap_or_else(|| panic!("missing /{name}")));
+    let cmap = stream_bytes(doc, font.as_dict().expect("font").get(b"ToUnicode").expect("ToUnicode")).unwrap_or_default();
+    String::from_utf8_lossy(&cmap).into_owned()
+}
+
+fn cmap_has(cmap: &str, text: &str) -> bool {
+    text.chars().filter(|ch| !ch.is_ascii()).all(|ch| cmap.contains(&format!("<{:04X}>", u32::from(ch))))
+}
+
+#[test]
+fn three_added_japanese_strings_keep_separate_type3_fonts() {
+    if without_craft_fonts("three_added_japanese_strings_keep_separate_type3_fonts") {
+        return;
+    }
+    let samples = [
+        ("東京", [72.0, 640.0, 220.0, 700.0], 18.0, [1.0, 0.0, 0.0]),
+        ("大阪", [300.0, 640.0, 460.0, 700.0], 14.0, [0.0, 0.0, 1.0]),
+        ("名古屋", [72.0, 500.0, 280.0, 580.0], 11.0, [0.0, 0.5, 0.0]),
+    ];
+    let mut doc = fixture();
+    for (text, rect, size, color) in samples {
+        add_content(&mut doc, 0, &Content::Text(AddedText { rect, text: text.into(), size, color, ..AddedText::default() })).unwrap();
+    }
+    let placed = |doc: &Document| -> Vec<AddedText> {
+        list_added(doc)
+            .into_iter()
+            .filter(|item| item.page == 0)
+            .map(|item| match item.content {
+                Content::Text(text) => text,
+                Content::Image(_) => panic!("text item"),
+            })
+            .collect()
+    };
+    let assert_independent = |doc: &Document, expected: &[AddedText]| {
+        let stored = placed(doc);
+        assert_eq!(stored.len(), expected.len());
+        let mut used = Vec::new();
+        let added = list_added(doc);
+        let on_page: Vec<_> = added.iter().filter(|item| item.page == 0).collect();
+        for (item, want) in on_page.iter().zip(expected) {
+            let Content::Text(got) = &item.content else { panic!("text item") };
+            assert_eq!(got.text, want.text);
+            assert_eq!(got.rect, want.rect);
+            assert_eq!(got.size, want.size);
+            assert_eq!(got.color, want.color);
+            let stream = added_stream(doc, item.obj);
+            let names = japanese_font_names(&stream);
+            assert_eq!(names.len(), 1, "one Japanese font in {stream}");
+            assert!(!used.contains(&names[0]), "font {} is shared: {stream}", names[0]);
+            let cmap = type3_cmap(doc, &names[0]);
+            assert!(cmap_has(&cmap, &want.text), "{} missing from {cmap}", want.text);
+            for other in expected {
+                if other.text == want.text {
+                    continue;
+                }
+                for ch in other.text.chars() {
+                    if want.text.contains(ch) {
+                        continue;
+                    }
+                    assert!(!cmap.contains(&format!("<{:04X}>", u32::from(ch))), "{} font also maps {}", want.text, other.text);
+                }
+            }
+            used.push(names[0].clone());
+        }
+        let joined = text::text_lines(doc, 0).unwrap().into_iter().map(|line| line.text).collect::<Vec<_>>().join("\n");
+        for want in expected {
+            assert!(joined.contains(&want.text), "{} missing from extracted {joined}", want.text);
+        }
+    };
+    let mut before = placed(&doc);
+    assert_eq!(before.len(), 3);
+    assert_ne!(before[0].color, before[1].color);
+    assert_ne!(before[1].size, before[2].size);
+    assert_independent(&doc, &before);
+    let mut moved = before[1].clone();
+    moved.rect = [moved.rect[0] + 40.0, moved.rect[1] - 30.0, moved.rect[2] + 40.0, moved.rect[3] - 30.0];
+    update_content(&mut doc, 0, 1, &Content::Text(moved.clone())).unwrap();
+    let after_move = placed(&doc);
+    assert_eq!(after_move[0], before[0]);
+    assert_eq!(after_move[2], before[2]);
+    assert_ne!(after_move[1].rect, before[1].rect);
+    assert_eq!(after_move[1].text, before[1].text);
+    before[1] = after_move[1].clone();
+    assert_independent(&doc, &before);
+    let mut edited = before[0].clone();
+    edited.text = "京都".into();
+    update_content(&mut doc, 0, 0, &Content::Text(edited)).unwrap();
+    let after_edit = placed(&doc);
+    assert_eq!(after_edit[1], before[1]);
+    assert_eq!(after_edit[2], before[2]);
+    assert_eq!(after_edit[0].text, "京都");
+    assert_eq!(after_edit[0].rect, before[0].rect);
+    before[0] = after_edit[0].clone();
+    assert_independent(&doc, &before);
+    let saved = reopen(&doc);
+    assert_independent(&saved, &before);
+}
+
+#[test]
 fn japanese_line_uses_unicode_type3_fallback() {
     if without_craft_fonts("japanese_line_uses_unicode_type3_fallback") {
         return;

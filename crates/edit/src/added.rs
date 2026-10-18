@@ -256,7 +256,15 @@ fn wrapped(t: &AddedText) -> Vec<(String, bool)> {
         // sum of its words' and shaping stays linear in the paragraph's length. The space is the
         // paragraph's; a space between Latin words is drawn in the item's font, a few hundredths
         // of an em apart.
-        let measure = |s: &str| if rtl_script || thai { shaped_width(t, s, rtl) } else { t.family.width(s, t.size, t.bold, t.italic) };
+        let measure = |s: &str| {
+            if !rtl_script && !thai && s.chars().any(needs_japanese_glyph) {
+                s.chars().map(|c| glyph_width(t, c)).sum()
+            } else if rtl_script || thai {
+                shaped_width(t, s, rtl)
+            } else {
+                t.family.width(s, t.size, t.bold, t.italic)
+            }
+        };
         let space = measure(" ");
         let (mut line, mut line_w) = (String::new(), 0.0);
         for word in para.split(' ') {
@@ -322,10 +330,27 @@ fn is_hebrew(c: char) -> bool {
     matches!(u32::from(c), 0x0591..=0x05F4 | 0xFB1D..=0xFB4F)
 }
 
+/// A character the standard fonts do not encode and the Arabic, Hebrew and Thai faces do not take.
+fn needs_japanese_glyph(c: char) -> bool {
+    c != '\n' && c != '\r' && c != '\t' && pdfcraft_fonts::win_ansi_byte(c).is_none() && !is_arabic(c) && !is_hebrew(c) && !is_thai(c)
+}
+
+/// Whether the Japanese Type 3 face that would draw `t` has an outline for `c`.
+fn japanese_glyph_available(t: &AddedText, c: char) -> bool {
+    pdfcraft_fonts::document_japanese_fonts_for_style(t.family == Family::Times, t.bold)
+        .iter()
+        .any(|face| pdfcraft_fonts::japanese_glyph_from(face, c).is_ok())
+}
+
+/// Width of one character: the standard font when it has the character, otherwise one em
+/// (the Japanese face's usual advance, used before the outline is read).
+fn glyph_width(t: &AddedText, c: char) -> f64 {
+    if c == '\t' || pdfcraft_fonts::win_ansi_byte(c).is_some() { t.family.width(&c.to_string(), t.size, t.bold, t.italic) } else { t.size }
+}
+
 /// The first character of `t` that would be drawn as `?`: outside WinAnsiEncoding and not drawn
-/// with the craft-fonts Arabic (#125) or Hebrew (#128) face, or Arabic or Hebrew that the face can't
-/// draw (or that has no face to draw it). Page-content tools refuse such text; the Add-text editor
-/// keeps it open.
+/// with the craft-fonts Arabic (#125), Hebrew (#128) or Japanese Type 3 face, or a character
+/// that face can't draw. Page-content tools refuse such text; the Add-text editor keeps it open.
 pub fn first_undrawable(t: &AddedText) -> Option<char> {
     if t.text.chars().any(is_thai) {
         if let Some(c) = t.text.chars().find(|c| is_thai(*c) && !pdfcraft_fonts::thai_has(*c)) {
@@ -340,10 +365,22 @@ pub fn first_undrawable(t: &AddedText) -> Option<char> {
     {
         return Some(c);
     }
+    if let Some(c) = t.text.chars().find(|c| needs_japanese_glyph(*c) && !japanese_glyph_available(t, *c)) {
+        return Some(c);
+    }
     if !shaped_by_a_face(t) {
-        // Drawn line by line in the item's standard font (`\n` splits lines). Without the face
-        // that is also how `draw` redraws an existing item, so it's checked that way.
-        return t.text.split('\n').find_map(pdfcraft_fonts::first_non_win_ansi);
+        // Japanese that the fallback face can draw is not left to the standard font. Anything
+        // else outside WinAnsi still cannot be written.
+        return t.text.split('\n').find_map(|line| {
+            line.chars().find(|c| {
+                pdfcraft_fonts::win_ansi_byte(*c).is_none()
+                    && *c != '\t'
+                    && !is_arabic(*c)
+                    && !is_hebrew(*c)
+                    && !is_thai(*c)
+                    && !japanese_glyph_available(t, *c)
+            })
+        });
     }
     // What `shaped_layout` leaves to the standard font, exactly as `draw_shaped` splits it.
     wrapped(t).into_iter().find_map(|(line, rtl)| {
@@ -741,6 +778,76 @@ fn type3_shaped(doc: &mut Document, clusters: &[&ShapedCluster], outlines: &Hash
 /// page's font names. `existing`: the item is being replaced, so a build without the Arabic or
 /// Hebrew face keeps drawing that text as `?`, as before it was supported, rather than refusing to
 /// move it.
+/// One run of a mixed line: standard-font text, or characters drawn from the Japanese Type 3 face.
+enum TextRun {
+    Standard(String),
+    Japanese(String),
+}
+
+fn text_runs(line: &str) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    for c in line.chars() {
+        let standard = c == '\t' || pdfcraft_fonts::win_ansi_byte(c).is_some();
+        match runs.last_mut() {
+            Some(TextRun::Standard(text)) if standard => text.push(c),
+            Some(TextRun::Japanese(text)) if !standard => text.push(c),
+            _ if standard => runs.push(TextRun::Standard(c.to_string())),
+            _ => runs.push(TextRun::Japanese(c.to_string())),
+        }
+    }
+    runs
+}
+
+/// Draw `t` with the standard font for WinAnsi characters and the Japanese Type 3 outlines
+/// for the rest. Half-width Latin stays in the item's own face.
+fn draw_japanese(doc: &mut Document, t: &AddedText, standard_font: &str, fonts: &mut Dict, out: &mut Vec<u8>, taken: &Dict) -> Result<(), EditError> {
+    let extra: String = t.text.chars().filter(|c| needs_japanese_glyph(*c)).collect();
+    // `taken` is the page's font dictionary. A new Type 3 font must not reuse a name already
+    // there: the page keeps one Font dictionary, and a repeated name would replace the earlier
+    // item's outlines while its stored text stayed.
+    let fallback = crate::text::embed_added_type3(doc, fonts, &extra, t.family, t.bold, taken)?;
+    let r = text_rect(t);
+    let [cr, cg, cb] = t.color.map(|v| v.clamp(0.0, 1.0));
+    out.extend(format!("BT {} {} {} rg\n", n(cr), n(cg), n(cb)).bytes());
+    for (i, line) in lines(t).iter().enumerate() {
+        let runs = text_runs(line);
+        let width: f64 = runs
+            .iter()
+            .map(|run| match run {
+                TextRun::Standard(text) => t.family.width(text, t.size, t.bold, t.italic),
+                TextRun::Japanese(text) => text.chars().map(|c| fallback.em(c).unwrap_or(1.0) * t.size).sum(),
+            })
+            .sum();
+        let x = match t.align {
+            Align::Left | Align::Justify => r[0],
+            Align::Center => r[0] + ((r[2] - r[0]) - width) / 2.0,
+            Align::Right => r[2] - width,
+        };
+        let y = r[3] - (i as f64 * 1.2 + 0.95) * t.size;
+        out.extend(format!("1 0 0 1 {} {} Tm\n", n(x), n(y)).bytes());
+        for run in &runs {
+            match run {
+                TextRun::Standard(text) => {
+                    out.extend(format!("/{standard_font} {} Tf ", n(t.size)).bytes());
+                    out.extend(literal(&win_ansi(text)));
+                    out.extend_from_slice(b" Tj\n");
+                }
+                TextRun::Japanese(text) => {
+                    let shown = crate::text::added_type3_show(&fallback, text)
+                        .ok_or_else(|| EditError::Invalid("the Japanese fallback font could not show part of the text".into()))?;
+                    for (font, bytes) in shown {
+                        out.extend(format!("/{font} {} Tf ", n(t.size)).bytes());
+                        out.extend(literal(&bytes));
+                        out.extend_from_slice(b" Tj\n");
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(b"ET\n");
+    Ok(())
+}
+
 fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict, existing: bool) -> Result<(Vec<u8>, Dict), EditError> {
     let mut res = Dict::new();
     let mut out = format!(
@@ -767,6 +874,12 @@ fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict, existing:
             let mut fonts = Dict::new();
             fonts.set(name.clone().into_bytes(), Object::Dict(font));
             let face_or_new = |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing);
+            if t.text.chars().any(needs_japanese_glyph) && !t.text.chars().any(|c| is_thai(c) || is_arabic(c) || is_hebrew(c)) {
+                draw_japanese(doc, t, &name, &mut fonts, &mut out, taken)?;
+                res.set(b"Font".to_vec(), Object::Dict(fonts));
+                out.extend_from_slice(b"Q\n");
+                return Ok((out, res));
+            }
             if t.text.chars().any(is_thai)
                 || face_or_new(is_arabic, pdfcraft_fonts::document_arabic_font().is_some())
                 || face_or_new(is_hebrew, pdfcraft_fonts::document_hebrew_font(false).is_some())
@@ -1128,12 +1241,17 @@ pub fn delete_content(doc: &mut Document, page: usize, index: usize) -> Result<(
     Ok(())
 }
 
-/// The Type 3 fonts an Arabic item's stream shows text with. Each item has its own (`draw_shaped`
-/// names them so), so they go when the item is replaced or deleted.
+/// The Type 3 fonts this item's stream shows text with. Each item names them so they don't collide
+/// (`PCAr` for Arabic, Hebrew and Thai; `PCJp` and `PCHe` for the added-text fallbacks), so they
+/// go when the item is replaced or deleted and a different item's font is left in place.
 fn own_fonts(doc: &Document, obj: ObjRef) -> Vec<Vec<u8>> {
     let Object::Stream(s) = &*doc.get(obj) else { return Vec::new() };
     let Ok(data) = s.decoded() else { return Vec::new() };
-    data.split(u8::is_ascii_whitespace).filter_map(|w| w.strip_prefix(b"/")).filter(|w| w.starts_with(b"PCAr")).map(<[u8]>::to_vec).collect()
+    data.split(u8::is_ascii_whitespace)
+        .filter_map(|w| w.strip_prefix(b"/"))
+        .filter(|w| w.starts_with(b"PCAr") || w.starts_with(b"PCJp") || w.starts_with(b"PCHe"))
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 fn drop_fonts(doc: &Document, res: &mut Dict, names: &[Vec<u8>]) {

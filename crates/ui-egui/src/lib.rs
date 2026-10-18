@@ -3279,6 +3279,7 @@ impl eframe::App for PdfCraftApp {
         } else {
             chrome::mode_bar(self, ui);
         }
+        content_ui::text_entry_strip(self, ui);
         if self.active.is_some() {
             chrome::right_rail(self, ui);
             // Read mode hides the tools, not the navigation panes: the rail stays visible

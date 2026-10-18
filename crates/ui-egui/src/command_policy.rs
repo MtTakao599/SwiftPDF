@@ -102,6 +102,10 @@ impl PdfCraftApp {
         if id == "file.save_as" && self.session.allows(pdfcraft_engine::Capability::SaveAs) {
             return true;
         }
+        // Adding text, and undoing that text. The engine still refuses every other edit.
+        if matches!(id, "edit.text" | "edit.undo" | "edit.redo") && self.session.allows(pdfcraft_engine::Capability::EditText) {
+            return true;
+        }
         allowed_in_view_only(id)
     }
 

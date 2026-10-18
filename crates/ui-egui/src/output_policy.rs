@@ -68,6 +68,11 @@ impl PdfCraftApp {
         set_save_as_allowed(true);
     }
 
+    /// Grant adding text onto the open PDF. View-only stays on, and no other edit is granted.
+    pub fn grant_edit_text(&mut self) {
+        self.session.grant(pdfcraft_engine::Capability::EditText);
+    }
+
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so
     /// nothing is prepared and no file dialog opens.
     pub(crate) fn refuse_output(&mut self) -> bool {

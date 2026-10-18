@@ -625,6 +625,12 @@ pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         {
                             app.run_command("print.dialog");
                         }
+                        if app.command_allowed("edit.text") {
+                            let label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
+                            if widgets::ghost_button(ui, "type", label).clicked() {
+                                app.execute("edit.text");
+                            }
+                        }
                         let tip = crate::commands::command_tip(ui.ctx(), tl!("Save ({key})"), "file.save");
                         if ui.add_enabled_ui(app.command_allowed("file.save"), |ui| icons::button(ui, "save", 32.0, false, &tip)).inner.clicked() {
                             app.run_command("file.save");

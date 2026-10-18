@@ -371,8 +371,12 @@ pub struct Document {
     pub renderer: RenderPool,
     /// The password the document was opened with (needed to read attachments, etc.).
     pub password: Option<String>,
-    /// `true` when there are edits that have not been saved.
+    /// `true` when the working file matches neither the opened file nor the last copy written
+    /// by [`Session::note_saved_copy`].
     pub dirty: bool,
+    /// Overlay identity of the working file last written to a new path. The original path and
+    /// [`Editor::saved`] stay on the opened file; [`Session::mark_saved`] is not involved.
+    saved_copy: Option<u64>,
     /// Bumped on every change to the working file (edit, undo, redo, save); autosave compares it.
     generation: u64,
     /// The generation last handed out by `autosave_snapshots`.
@@ -2086,6 +2090,23 @@ fn unrestricted(p: &pdfcraft_cos::Permissions) -> bool {
     p.owner || p.bits & ALL == ALL
 }
 
+/// Undo labels produced by adding, changing or removing added text.
+fn is_added_text_label(label: &str) -> bool {
+    matches!(label, "Add text" | "Edit content" | "Delete content")
+}
+
+/// `edit` places new text, changes added text, or deletes an added text item.
+fn added_text_edit(doc: &Document, edit: &Edit) -> bool {
+    match edit {
+        Edit::AddText { .. } => true,
+        Edit::UpdateContent { content: AddedContent::Text(_), .. } => true,
+        Edit::DeleteContent { page, index } => {
+            doc.added().iter().filter(|item| item.page == *page).nth(*index).is_some_and(|item| matches!(item.content, AddedContent::Text(_)))
+        }
+        _ => false,
+    }
+}
+
 /// Whether the opening password allows an edit (§7.6.4.2, Table 22).
 fn check_permission(edit: &Edit, p: &pdfcraft_cos::Permissions) -> Result<(), EditError> {
     match edit {
@@ -3226,6 +3247,11 @@ fn signatures_of(cos: &pdfcraft_cos::Document, bytes: &[u8], trust: &TrustStore,
     pdfcraft_sign::pdf::list_cached(cos, bytes, trust, cache)
 }
 
+/// The working graph is not the file this document was opened with.
+fn differs_from_opened(doc: &Document) -> bool {
+    doc.editor.as_ref().is_some_and(|editor| editor.cos.is_modified() || !Arc::ptr_eq(editor.cos.bytes(), &editor.saved))
+}
+
 impl Session {
     pub fn new() -> Self {
         Self::default()
@@ -3582,6 +3608,7 @@ impl Session {
             renderer,
             password: render_password,
             dirty: false,
+            saved_copy: None,
             generation: 0,
             snapshot_generation: 0,
             read_only_reason,
@@ -3608,9 +3635,46 @@ impl Session {
         self.docs.iter_mut().find(|d| d.id == id).ok_or(EditError::NoDocument)
     }
 
+    /// Whether added text may be placed on `id`: view-only stays on, [`Capability::EditText`] is
+    /// granted, and the PDF itself allows content changes.
+    pub fn allows_added_text(&self, id: DocId) -> bool {
+        if !self.view_only || !self.allows(Capability::EditText) {
+            return false;
+        }
+        let Some(doc) = self.get(id) else { return false };
+        doc.editor.is_some() && doc.read_only_reason.is_none() && doc.permissions().is_none_or(|p| p.modify())
+    }
+
+    /// View-only, with [`Capability::EditText`], and `edit` only places or changes added text.
+    fn view_only_text_edit(&self, id: DocId, edit: &Edit) -> bool {
+        self.view_only && self.allows(Capability::EditText) && self.get(id).is_some_and(|doc| added_text_edit(doc, edit))
+    }
+
+    /// View-only undo or redo whose step is added text.
+    fn view_only_text_step(&self, id: DocId, redo: bool) -> bool {
+        if !self.view_only || !self.allows(Capability::EditText) {
+            return false;
+        }
+        let Some(doc) = self.get(id) else { return false };
+        let label = if redo { doc.redo_label() } else { doc.undo_label() };
+        label.is_some_and(|label| is_added_text_label(label.as_str()))
+    }
+
+    /// The undo history is only added text, so the working bytes are that text and nothing else.
+    fn text_history_only(&self, doc: &Document) -> bool {
+        let Some(editor) = doc.editor.as_ref() else { return false };
+        !editor.undo.is_empty() && editor.undo.iter().chain(editor.redo.iter()).all(|(label, ..)| is_added_text_label(label.as_str()))
+    }
+
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
+    ///
+    /// A view-only session still refuses every edit, except added text when
+    /// [`Capability::EditText`] is granted: new text, a change to that text, or deleting it.
+    /// The document's own permission to modify content still applies.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
-        self.check_not_view_only()?;
+        if !self.view_only_text_edit(id, &edit) {
+            self.check_not_view_only()?;
+        }
         let now = self.now();
         let today = self.today();
         let js_off = self.js_off;
@@ -3778,7 +3842,7 @@ impl Session {
             }
             return Err(e);
         }
-        doc.dirty = true;
+        Self::sync_dirty(doc);
         doc.generation += 1;
         doc.edit_notices = notices;
         if !cx.xfa_removed.is_empty() {
@@ -3803,7 +3867,9 @@ impl Session {
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<Label, EditError> {
-        self.check_not_view_only()?;
+        if !self.view_only_text_step(id, false) {
+            self.check_not_view_only()?;
+        }
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToUndo)?;
@@ -3819,7 +3885,9 @@ impl Session {
     }
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {
-        self.check_not_view_only()?;
+        if !self.view_only_text_step(id, true) {
+            self.check_not_view_only()?;
+        }
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToRedo)?;
@@ -3834,11 +3902,12 @@ impl Session {
         Ok(label)
     }
 
-    /// Unsaved when the working graph is not the last opened or saved file. Undo back to that
-    /// file is clean; undo past a later save is not, because the restored snapshot's own base
-    /// is an earlier revision.
+    /// Unsaved when the working graph is neither the opened file nor the last copy written by
+    /// [`Self::note_saved_copy`]. Undo back to either of those is clean.
     fn sync_dirty(doc: &mut Document) {
-        doc.dirty = doc.editor.as_ref().is_some_and(|e| e.cos.is_modified() || !Arc::ptr_eq(e.cos.bytes(), &e.saved));
+        let fingerprint = doc.editor.as_ref().map(|editor| editor.cos.edit_fingerprint());
+        let matches_copy = doc.saved_copy.is_some_and(|saved| fingerprint == Some(saved));
+        doc.dirty = differs_from_opened(doc) && !matches_copy;
     }
 
     /// Use the current state's password for viewing (protection edits change it).
@@ -4067,6 +4136,50 @@ impl Session {
     pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
         self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        self.working_bytes(doc)
+    }
+
+    /// Bytes of a document changed by added text, for a new file.
+    ///
+    /// Requires [`Capability::SaveAs`] and [`Capability::EditText`]. It does not write, does not
+    /// change the open document's path, and does not mark it saved. [`Self::save_copy_bytes`]
+    /// stays the opened file only. [`Self::save_bytes`] stays refused while view-only.
+    /// A copy already recorded with [`Self::note_saved_copy`] is still returned: the working
+    /// file differs from the opened file, even when closing would not ask again.
+    pub fn save_edited_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        if !self.allows(Capability::SaveAs) || !self.allows(Capability::EditText) {
+            return Err(EditError::ViewOnly);
+        }
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        if !differs_from_opened(doc) || !self.text_history_only(doc) {
+            return Err(EditError::Invalid("there is no added text to save".into()));
+        }
+        self.working_bytes(doc)
+    }
+
+    /// The bytes the document was opened with (or last bound by [`Self::mark_saved`]).
+    pub fn opened_bytes(&self, id: DocId) -> Option<Arc<Vec<u8>>> {
+        self.get(id)?.editor.as_ref().map(|editor| editor.saved.clone())
+    }
+
+    /// The current added-text revision was written to a new file. The original path stays, and
+    /// this does not call [`Self::mark_saved`]. A later edit is unsaved again; undo or redo back
+    /// to this graph is not.
+    pub fn note_saved_copy(&mut self, id: DocId) -> Result<(), EditError> {
+        let doc = self.doc_mut(id)?;
+        doc.saved_copy = doc.editor.as_ref().map(|editor| editor.cos.edit_fingerprint());
+        Self::sync_dirty(doc);
+        Ok(())
+    }
+
+    /// Whether the working graph differs from the opened file. Independent of [`Document::dirty`],
+    /// which is also clear after [`Self::note_saved_copy`].
+    pub fn differs_from_opened(&self, id: DocId) -> bool {
+        self.get(id).is_some_and(differs_from_opened)
+    }
+
+    /// The incremental (or rewritten) bytes of `doc`'s working graph.
+    fn working_bytes(&self, doc: &Document) -> Result<Arc<Vec<u8>>, EditError> {
         let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
         let on_saved = Arc::ptr_eq(editor.cos.bytes(), &editor.saved);
         if !editor.cos.is_modified() && on_saved {

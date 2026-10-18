@@ -12,7 +12,7 @@ use egui_kittest::kittest::Queryable;
 use pdfcraft_engine::{Capability, Changes, Edit, Printing, Protection, Session};
 use pdfcraft_ui_egui::command_policy::REFUSED;
 use pdfcraft_ui_egui::output_policy;
-use pdfcraft_ui_egui::{Dialog, PdfCraftApp, SaveTarget, UiMode};
+use pdfcraft_ui_egui::{CloseRequest, Dialog, PdfCraftApp, SaveTarget, UiMode};
 use sha2::{Digest, Sha256};
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -510,4 +510,354 @@ fn the_granted_copy_panel_is_not_refused_as_view_only_output() {
     detailed.run_steps(4);
     assert_eq!(std::fs::read(&detailed_dest).unwrap(), bytes);
     assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+}
+
+#[test]
+fn added_text_keeps_the_original_and_refuses_an_existing_destination() {
+    let _serial = serial();
+    let dir = Dir::new("text");
+    let original = dir.join("opened.pdf");
+    let bytes = pdf();
+    std::fs::write(&original, &bytes).unwrap();
+    let hash = sha256(&bytes);
+    let sample = pdfcraft_engine::AddedText { text: "山田".into(), rect: [0.0, 0.0, 200.0, 40.0], ..pdfcraft_engine::AddedText::default() };
+    let label = if pdfcraft_engine::first_undrawable(&sample).is_none() { "山田 太郎 1-2-3" } else { "Note 1-2-3" };
+    let original_s = original.to_string_lossy().into_owned();
+    let dest = dir.join("noted.pdf");
+    let dest_s = dest.to_string_lossy().into_owned();
+    let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.grant_save_as();
+        app.grant_edit_text();
+        app.set_ui_mode(UiMode::Simple);
+        app.open_bytes("opened.pdf", Some(original_s), bytes).unwrap();
+        app
+    });
+    harness.run_steps(4);
+    assert!(harness.query_by_label("文字入力").is_some());
+    harness.get_by_label("文字入力").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText);
+    assert!(harness.state_mut().apply_edit(Edit::AddText {
+        page: 0,
+        text: pdfcraft_engine::AddedText {
+            rect: [40.0, 200.0, 260.0, 260.0],
+            text: label.into(),
+            size: 16.0,
+            ..pdfcraft_engine::AddedText::default()
+        },
+    }));
+    let id = harness.state().views[0].id;
+    assert!(harness.state().session.get(id).unwrap().dirty);
+    harness.state_mut().save_override = Some(dest_s.clone());
+    assert!(harness.state_mut().execute("file.save_as"));
+    harness.run_steps(2);
+    assert!(matches!(harness.state().dialog, Some(Dialog::SaveCopy)));
+    assert!(harness.state_mut().confirm_save_copy());
+    harness.run_steps(3);
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+    let saved = std::fs::read(&dest).unwrap();
+    assert_ne!(saved, std::fs::read(&original).unwrap());
+    assert_eq!(harness.state().session.get(id).unwrap().path.as_deref(), Some(original.to_string_lossy().as_ref()));
+    assert!(!harness.state().session.get(id).unwrap().dirty, "the saved copy matches this tab, so it is not unsaved");
+    assert!(toast(harness.state()).contains("Saved as a new PDF") || toast(harness.state()).contains("新しいPDFとして保存しました"));
+    harness.state_mut().toast = None;
+    harness.state_mut().save_override = Some(dest_s);
+    assert!(harness.state_mut().execute("file.save_as"));
+    harness.run_steps(2);
+    assert!(!harness.state_mut().confirm_save_copy(), "an existing destination is not overwritten");
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+    assert!(!harness.state().session.get(id).unwrap().dirty, "a failed retry keeps the saved copy");
+    // The button path closes the confirmation. This call writes directly, so close it before the shortcut.
+    harness.state_mut().dialog = None;
+    harness.state_mut().toast = None;
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::S);
+    harness.run_steps(3);
+    assert_eq!(harness.state().toast.as_ref().map(|(text, _)| text.as_str()), Some(REFUSED));
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+
+    let mut detailed = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.grant_save_as();
+        app.grant_edit_text();
+        app.set_ui_mode(UiMode::Detailed);
+        app.open_bytes("opened.pdf", None, pdf()).unwrap();
+        app
+    });
+    detailed.run_steps(4);
+    assert!(detailed.query_by_label("文字入力").is_some(), "detailed mode offers text entry");
+    detailed.get_by_label("文字入力").click();
+    detailed.run_steps(2);
+    assert_eq!(detailed.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText);
+}
+
+#[test]
+fn a_saved_copy_asks_again_only_after_another_edit() {
+    let _serial = serial();
+    let dir = Dir::new("snapshot");
+    let original = dir.join("opened.pdf");
+    let dest = dir.join("noted.pdf");
+    let blocked = dir.join("taken.pdf");
+    let bytes = pdf();
+    std::fs::write(&original, &bytes).unwrap();
+    let hash = sha256(&bytes);
+    std::fs::write(&blocked, b"KEEP").unwrap();
+    let sample = pdfcraft_engine::AddedText { text: "山田".into(), rect: [0.0, 0.0, 200.0, 40.0], ..pdfcraft_engine::AddedText::default() };
+    let label = if pdfcraft_engine::first_undrawable(&sample).is_none() { "山田 太郎" } else { "Note" };
+    let needle = if label.starts_with('山') { "山田" } else { "Note" };
+    let mut app = app(true);
+    app.grant_edit_text();
+    open_file(&mut app, &original, &bytes);
+    let id = app.views[0].id;
+    assert!(app.apply_edit(Edit::AddText {
+        page: 0,
+        text: pdfcraft_engine::AddedText {
+            rect: [40.0, 200.0, 240.0, 260.0],
+            text: label.into(),
+            size: 16.0,
+            ..pdfcraft_engine::AddedText::default()
+        },
+    }));
+    let ctx = egui::Context::default();
+    app.save_override = Some(s(&blocked));
+    assert!(app.execute("file.save_as"));
+    assert!(!app.confirm_save_copy(), "an existing destination is refused");
+    assert!(app.session.get(id).unwrap().dirty, "a failed save stays unsaved");
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"KEEP");
+    assert!(!app.request_quit(&ctx));
+    assert_eq!(app.close_request, Some(CloseRequest::Quit));
+    app.resolve_close(&ctx, None);
+    app.dialog = None;
+
+    app.save_override = Some(s(&dest));
+    assert!(app.execute("file.save_as"));
+    assert!(app.confirm_save_copy());
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+    assert_eq!(app.session.get(id).unwrap().path.as_deref(), Some(s(&original).as_str()));
+    assert!(!app.session.get(id).unwrap().dirty);
+    let notice = toast(&app);
+    assert!(notice.contains("Saved as a new PDF") || notice.contains("新しいPDFとして保存しました"), "{notice}");
+    assert!(!notice.contains("left as it is"), "{notice}");
+    let saved = std::fs::read(&dest).unwrap();
+    let mut again = Session::new();
+    let copy = again.open("noted.pdf", None, Arc::new(saved), None).unwrap();
+    let shown = again
+        .get(copy)
+        .unwrap()
+        .added()
+        .iter()
+        .filter_map(|item| match &item.content {
+            pdfcraft_engine::AddedContent::Text(text) => Some(text.text.as_str()),
+            pdfcraft_engine::AddedContent::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(shown.contains(needle), "{shown}");
+    assert!(app.request_quit(&ctx), "closing after the copy does not ask again");
+    assert!(app.close_request.is_none());
+
+    let index = app.views.iter().position(|view| view.id == id).expect("the original tab");
+    app.active = Some(index);
+    assert!(app.apply_edit(Edit::AddText {
+        page: 0,
+        text: pdfcraft_engine::AddedText {
+            rect: [40.0, 120.0, 240.0, 180.0],
+            text: "More".into(),
+            size: 14.0,
+            ..pdfcraft_engine::AddedText::default()
+        },
+    }));
+    assert!(app.session.get(id).unwrap().dirty);
+    assert!(!app.request_quit(&ctx));
+    assert_eq!(app.close_request, Some(CloseRequest::Quit));
+    app.resolve_close(&ctx, None);
+    app.request_close_tab(index);
+    assert_eq!(app.close_request, Some(CloseRequest::Tab(id)));
+    app.resolve_close(&ctx, None);
+    app.close_all();
+    assert_eq!(app.close_request, Some(CloseRequest::All));
+    app.resolve_close(&ctx, None);
+
+    assert_eq!(app.session.undo(id).unwrap().as_str(), "Add text");
+    assert!(!app.session.get(id).unwrap().dirty);
+    assert!(app.request_quit(&ctx), "undo back to the saved copy does not ask");
+    assert_eq!(app.session.redo(id).unwrap().as_str(), "Add text");
+    assert!(app.session.get(id).unwrap().dirty);
+    assert!(!app.request_quit(&ctx));
+    app.resolve_close(&ctx, None);
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+}
+
+#[test]
+fn the_text_bar_stays_short_in_simple_and_detailed_mode() {
+    let _serial = serial();
+    for mode in [UiMode::Simple, UiMode::Detailed] {
+        let mut harness = Harness::builder().with_size(egui::vec2(420.0, 700.0)).build_eframe(move |_cc| {
+            let mut app = PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            app.run_inline = true;
+            app.set_view_only(true);
+            app.grant_save_as();
+            app.grant_edit_text();
+            app.set_ui_mode(mode);
+            app.open_bytes("opened.pdf", None, pdf()).unwrap();
+            app
+        });
+        harness.run_steps(4);
+        harness.get_by_label("文字入力").click();
+        harness.run_steps(4);
+        let color = harness.get_by_label("文字色");
+        let rect = color.rect();
+        assert!(rect.bottom() < 220.0, "{mode:?} bar is too tall: {rect:?}");
+        assert!(rect.right() <= 430.0, "{mode:?} colour is outside the window: {rect:?}");
+        color.click();
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Red").is_some(), "{mode:?} colour popup");
+    }
+}
+
+#[test]
+fn text_entry_drags_a_confirmed_string_without_leaving_the_tool() {
+    let _serial = serial();
+    let dir = Dir::new("drag-text");
+    let original = dir.join("opened.pdf");
+    let bytes = pdf();
+    std::fs::write(&original, &bytes).unwrap();
+    let hash = sha256(&bytes);
+    let sample = pdfcraft_engine::AddedText { text: "東京".into(), rect: [0.0, 0.0, 80.0, 24.0], ..pdfcraft_engine::AddedText::default() };
+    let labels: [&str; 3] =
+        if pdfcraft_engine::first_undrawable(&sample).is_none() { ["東京", "大阪", "名古屋"] } else { ["One", "Two", "Three"] };
+    let original_s = original.to_string_lossy().into_owned();
+    let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.grant_save_as();
+        app.grant_edit_text();
+        app.set_ui_mode(UiMode::Simple);
+        app.open_bytes("opened.pdf", Some(original_s), bytes).unwrap();
+        app
+    });
+    let at = |harness: &Harness<'static, PdfCraftApp>, x: f32, y: f32| {
+        let page = harness.state().views[0].page_screen_rect(0).expect("page on screen");
+        let scale = page.width() / 300.0;
+        page.min + egui::vec2(x * scale, y * scale)
+    };
+    let click_page = |harness: &mut Harness<'static, PdfCraftApp>, p: egui::Pos2| {
+        harness.hover_at(p);
+        harness.run_steps(1);
+        harness.drag_at(p);
+        harness.run_steps(1);
+        harness.drop_at(p);
+        harness.run_steps(3);
+    };
+    let screen_box = |harness: &Harness<'static, PdfCraftApp>, rect: [f64; 4]| {
+        let state = harness.state();
+        let height = state.session.get(state.views[0].id).unwrap().info.pages[0].height;
+        let page = state.views[0].page_screen_rect(0).expect("page on screen");
+        let scale = page.width() / 300.0;
+        let point = |x: f64, y: f64| page.min + egui::vec2(x as f32 * scale, (height - y as f32) * scale);
+        egui::Rect::from_two_pos(point(rect[0], rect[1]), point(rect[2], rect[3]))
+    };
+    harness.run_steps(6);
+    harness.get_by_label("文字入力").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText);
+    // The page is fit to the window width, so only its top is on screen. Keep each click there.
+    for (index, (label, spot)) in labels.iter().zip([(40.0, 36.0), (40.0, 84.0), (40.0, 132.0)]).enumerate() {
+        let spot = at(&harness, spot.0, spot.1);
+        click_page(&mut harness, spot);
+        assert!(harness.state().views[0].content.draft.is_some(), "click did not open a text box for {label} at {spot:?}");
+        harness.event(egui::Event::Text((*label).into()));
+        harness.run_steps(2);
+        harness.get_by_label("Done").click();
+        harness.run_steps(4);
+        assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText, "confirming {label} stays in text entry");
+        assert!(harness.state().views[0].content.draft.is_none());
+        assert_eq!(index + 1, {
+            let state = harness.state();
+            state.session.get(state.views[0].id).unwrap().added().len()
+        });
+    }
+    let before: Vec<_> = {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().added().iter().map(|item| item.content.clone()).collect()
+    };
+    assert_eq!(before.len(), 3);
+    assert_ne!(harness.state().views[0].content.selected, Some((0, 0)), "the first string is not the selected one");
+    let pdfcraft_engine::AddedContent::Text(first) = &before[0] else { panic!("text") };
+    let from = screen_box(&harness, first.rect);
+    let grab = from.center();
+    let shift = egui::vec2(0.0, from.height() + 60.0);
+    assert!(!from.expand(2.0).contains(grab + shift), "the drag ends outside the original box");
+    harness.hover_at(grab);
+    harness.run_steps(1);
+    harness.drag_at(grab);
+    harness.run_steps(1);
+    harness.hover_at(grab + shift);
+    harness.run_steps(2);
+    assert_eq!(harness.state().views[0].content.selected, Some((0, 0)));
+    assert!(harness.state().views[0].content.draft.is_none(), "dragging an existing string does not start a new box");
+    harness.drop_at(grab + shift);
+    harness.run_steps(4);
+    let moved: Vec<_> = {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().added().iter().map(|item| item.content.clone()).collect()
+    };
+    assert_eq!(moved.len(), 3);
+    assert_eq!(moved[1], before[1]);
+    assert_eq!(moved[2], before[2]);
+    let pdfcraft_engine::AddedContent::Text(moved_first) = &moved[0] else { panic!("text") };
+    assert_eq!(moved_first.text, first.text);
+    assert_ne!(moved_first.rect, first.rect);
+    assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText);
+    assert!(harness.state_mut().execute("edit.undo"));
+    harness.run_steps(2);
+    let undone: Vec<_> = {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().added().iter().map(|item| item.content.clone()).collect()
+    };
+    assert_eq!(undone, before);
+    assert!(harness.state_mut().execute("edit.redo"));
+    harness.run_steps(2);
+    let redone: Vec<_> = {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().added().iter().map(|item| item.content.clone()).collect()
+    };
+    assert_eq!(redone[0], moved[0]);
+    assert_eq!(redone[1], before[1]);
+    assert_eq!(redone[2], before[2]);
+    harness.get_by_label("文字入力を終了").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::Select);
+    let blank = at(&harness, 200.0, 20.0);
+    click_page(&mut harness, blank);
+    assert!(harness.state().views[0].content.draft.is_none());
+    assert_eq!(
+        {
+            let state = harness.state();
+            state.session.get(state.views[0].id).unwrap().added().len()
+        },
+        3
+    );
+
+    let dest = dir.join("moved.pdf");
+    harness.state_mut().save_override = Some(dest.to_string_lossy().into_owned());
+    assert!(harness.state_mut().execute("file.save_as"));
+    harness.run_steps(2);
+    assert!(harness.state_mut().confirm_save_copy());
+    harness.run_steps(3);
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+    let saved = std::fs::read(&dest).unwrap();
+    let mut again = Session::new().with_view_only(true);
+    let copy = again.open("moved.pdf", None, Arc::new(saved), None).unwrap();
+    let stored: Vec<_> = again.get(copy).unwrap().added().iter().map(|item| item.content.clone()).collect();
+    assert_eq!(stored, redone);
 }

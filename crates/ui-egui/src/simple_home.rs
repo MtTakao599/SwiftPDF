@@ -250,6 +250,12 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 if app.command_allowed("file.save_as") && widgets::ghost_button(ui, "save", "名前を付けて保存").clicked() {
                     app.execute("file.save_as");
                 }
+                if app.command_allowed("edit.text") {
+                    let label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
+                    if widgets::ghost_button(ui, "type", label).clicked() {
+                        app.execute("edit.text");
+                    }
+                }
             });
         });
 }

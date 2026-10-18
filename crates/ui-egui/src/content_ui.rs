@@ -303,6 +303,33 @@ pub(crate) fn select_grabs(ui: &egui::Ui, xf: &PageXform, page: usize, info: &Do
     })
 }
 
+/// What the text tool does with one pointer event. The item is the one under the press, not
+/// under the pointer after it has moved: a drag that leaves a short box still moves that box,
+/// and only a click that started on empty page starts a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextToolStep {
+    /// Press began on an existing item and became a drag.
+    Move,
+    /// Press began on an existing item and was released as a click.
+    Edit,
+    /// Click began on empty page.
+    NewBox,
+    /// Button is down, or a drag that did not start on an item.
+    Wait,
+}
+
+fn adding_text_step(drag_started: bool, clicked: bool, pressed_on_item: bool) -> TextToolStep {
+    if drag_started && pressed_on_item {
+        TextToolStep::Move
+    } else if clicked && pressed_on_item {
+        TextToolStep::Edit
+    } else if clicked {
+        TextToolStep::NewBox
+    } else {
+        TextToolStep::Wait
+    }
+}
+
 /// Pointer input on one page in Edit mode (`adding_text` with the Text tool). `true` when it
 /// used the input.
 #[allow(clippy::too_many_arguments)]
@@ -350,58 +377,77 @@ pub(crate) fn page_input(
     }
     let Some(p) = pointer.filter(|p| xf.rect.contains(*p)) else { return consumed };
     let items = on_page(added, page);
-    let hit = items.iter().rev().find(|(_, a)| screen_rect(xf, info, page, a.content.rect()).expand(2.0).contains(p)).map(|(i, a)| (*i, *a));
+    let covers = |at: Pos2, item: &Added| screen_rect(xf, info, page, item.content.rect()).expand(2.0).contains(at);
+    let hit = items.iter().rev().find(|(_, a)| covers(p, a)).map(|(i, a)| (*i, *a));
+    // Where the button went down. A later hover can already be outside a short text box.
+    let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
+    let at_press = items.iter().rev().find(|(_, a)| covers(origin, a)).map(|(i, a)| (*i, *a));
     let selected_rect = cv
         .selected
         .filter(|s| s.0 == page)
         .and_then(|(_, si)| items.iter().find(|(i, _)| *i == si))
         .map(|(_, a)| screen_rect(xf, info, page, a.content.rect()));
     let corner = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(p) <= 6.0));
-    if adding_text && hit.is_none() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-        if resp.clicked() {
-            // Text that can't be drawn stays where it is being typed (#125).
-            if cv.hold_blocked() {
+    let corner_at_press = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(origin) <= 6.0));
+    if resp.drag_started()
+        && let Some((_, left, top)) = corner_at_press
+    {
+        cv.grab = Some((page, Grab::Corner(left, top), origin));
+        return true;
+    }
+    if adding_text {
+        match adding_text_step(resp.drag_started(), resp.clicked(), at_press.is_some()) {
+            TextToolStep::Move => {
+                if let Some((i, _)) = at_press {
+                    cv.selected = Some((page, i));
+                    cv.grab = Some((page, Grab::Move, origin));
+                    return true;
+                }
+            }
+            TextToolStep::NewBox => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                // Text that can't be drawn stays where it is being typed (#125).
+                if cv.hold_blocked() {
+                    return true;
+                }
+                // A click elsewhere keeps the text being typed and starts a new box (#74). The click
+                // can reach the page before the editor sees it lose focus, so finish it here.
+                let typed = cv.draft.take().and_then(|d| finish(cv, d, added));
+                // The Format panel styles the new text, not the box just kept.
+                (cv.selected, cv.select_added) = (None, None);
+                let at = to_display(xf, info, page, origin);
+                let mut style = style.clone();
+                style.text.clear();
+                let page_width = info.pages.get(page).map_or(f64::INFINITY, |p| p.width as f64);
+                let rect = [at[0], at[1] - style.size * 1.2, (at[0] + 200.0).min(page_width), at[1]];
+                style.rect = rect;
+                cv.draft = Some(TextDraft { page, index: None, rect, text: String::new(), style, focus: true });
+                if let Some(edit) = typed {
+                    view.pending_edit = Some(edit);
+                }
                 return true;
             }
-            // A click elsewhere keeps the text being typed and starts a new box (#74). The click
-            // can reach the page before the editor sees it lose focus, so finish it here.
-            let typed = cv.draft.take().and_then(|d| finish(cv, d, added));
-            // The Format panel styles the new text, not the box just kept.
-            (cv.selected, cv.select_added) = (None, None);
-            let at = to_display(xf, info, page, p);
-            let mut style = style.clone();
-            style.text.clear();
-            let page_width = info.pages.get(page).map_or(f64::INFINITY, |p| p.width as f64);
-            let rect = [at[0], at[1] - style.size * 1.2, (at[0] + 200.0).min(page_width), at[1]];
-            style.rect = rect;
-            cv.draft = Some(TextDraft { page, index: None, rect, text: String::new(), style, focus: true });
-            consumed = true;
-            if typed.is_some() {
-                view.pending_edit = typed;
+            TextToolStep::Wait if at_press.is_none() => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                return false;
             }
+            TextToolStep::Edit | TextToolStep::Wait => {}
         }
-        return consumed;
+    } else if resp.drag_started()
+        && let Some((i, _)) = at_press
+    {
+        cv.selected = Some((page, i));
+        cv.grab = Some((page, Grab::Move, origin));
+        return true;
     }
     if let Some((_, left, top)) = corner {
         ui.ctx().set_cursor_icon(if left == top { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw });
-    } else if hit.is_some() {
+    } else if hit.is_some() || at_press.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
     }
-    if resp.drag_started() {
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
-        if let Some((_, left, top)) = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(origin) <= 6.0)) {
-            cv.grab = Some((page, Grab::Corner(left, top), origin));
-            consumed = true;
-        } else if let Some((i, _)) = items.iter().rev().find(|(_, a)| screen_rect(xf, info, page, a.content.rect()).expand(2.0).contains(origin)) {
-            cv.selected = Some((page, *i));
-            cv.grab = Some((page, Grab::Move, origin));
-            consumed = true;
-        }
-        return consumed;
-    }
+    let clicked_item = if adding_text { at_press } else { hit };
     if (resp.double_clicked() || edit_on_click && resp.clicked() && corner.is_none())
-        && let Some((i, a)) = hit
+        && let Some((i, a)) = clicked_item
         && let AddedContent::Text(t) = &a.content
     {
         if cv.hold_blocked() {
@@ -485,10 +531,22 @@ pub(crate) fn after_refresh(view: &mut DocView, added: &[Added]) {
     }
 }
 
+/// Whether the text-entry operation finishes this frame.
+///
+/// The Done button finishes it. Clicking away finishes it. Enter does not: while a Japanese
+/// IME is converting, Enter confirms the conversion, and in the editor it only breaks a line.
+/// A non-empty IME preedit also holds the operation open.
+pub(crate) fn confirms_text_entry(done_clicked: bool, lost_focus: bool, pointer_on_buttons: bool, ime_composing: bool) -> bool {
+    if ime_composing {
+        return false;
+    }
+    done_clicked || lost_focus && !pointer_on_buttons
+}
+
 /// The in-place text editor, with Done and Discard beside it. Returns the edit once the text is
 /// committed (a click away, or Done), and whether Done finished adding text. Discard or Escape
-/// throws the draft away.
-pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, added: &[Added]) -> (Option<Edit>, bool) {
+/// throws the draft away. `labelled` shows 確定 and キャンセル for the view-only text tool.
+pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, added: &[Added], labelled: bool) -> (Option<Edit>, bool) {
     let Some(page) = view.content.draft.as_ref().map(|d| d.page) else { return (None, false) };
     let Some(xf) = view.page_xform(page) else { return (None, false) };
     let zoom = xf.rect.width() / xf.pw.max(1.0);
@@ -556,21 +614,37 @@ pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, ad
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                     ui.horizontal(|ui| {
-                        done = crate::icons::button(ui, "check", 24.0, false, tl!("Done adding text")).clicked();
-                        cancel = crate::icons::button(ui, "x", 24.0, false, tl!("Discard this text (Esc)")).clicked();
+                        if labelled {
+                            done = ui.button(crate::identity::localized("確定", "Done")).clicked();
+                            cancel = ui.button(crate::identity::localized("キャンセル", "Cancel")).clicked();
+                        } else {
+                            done = crate::icons::button(ui, "check", 24.0, false, tl!("Done adding text")).clicked();
+                            cancel = crate::icons::button(ui, "x", 24.0, false, tl!("Discard this text (Esc)")).clicked();
+                        }
                     });
                 })
                 .response
                 .rect;
             // Pressing a button takes the focus from the text: that is not a click away.
             let on_buttons = ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| buttons.contains(p));
+            let ime_composing = ui
+                .input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())));
+            // Enter confirms an IME conversion or inserts a line. It is not a way to finish.
             cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
-            commit = done || resp.lost_focus() && !on_buttons && !view.objects.hold_editor;
+            commit = confirms_text_entry(done, resp.lost_focus() && !view.objects.hold_editor, on_buttons, ime_composing);
         });
         // Page text is drawn with the standard fonts; anything else would be saved as `?` (#125).
         undrawable = self::undrawable(t, memo);
         if let Some(c) = undrawable {
-            ui.label(egui::RichText::new(undrawable_message(c)).small().color(UNDRAWABLE));
+            let message = if matches!(u32::from(c), 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
+                crate::identity::localized(
+                    "このビルドの日本語フォントでは、この文字をPDFに書き込めません。",
+                    "This build's Japanese font cannot write this character into the PDF.",
+                )
+            } else {
+                undrawable_message(c)
+            };
+            ui.label(egui::RichText::new(message).small().color(UNDRAWABLE));
         }
     });
     if cancel {
@@ -648,6 +722,107 @@ pub(crate) fn format_panel(ui: &mut egui::Ui, t: &Tokens, style: &AddedText) -> 
     }
     ui.label(egui::RichText::new(tl!("Thai and Arabic use regular fallback fonts when available.")).small().color(t.text_faint));
     (s != *style).then_some(s)
+}
+
+/// One compact row of typeface, size, style and colour. Colour opens a popup, so the bar does
+/// not grow a swatch grid over the page. Items wrap onto another short row when the window is
+/// narrow, instead of being clipped.
+fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>, f32) {
+    let mut s = style.clone();
+    let response = ui.horizontal_wrapped(|ui| {
+        ui.set_min_height(28.0);
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        let title = ui.label(egui::RichText::new(crate::identity::localized("文字入力", "Add text")).strong());
+        title.on_hover_text(crate::identity::localized(
+            "ページをクリックして入力します。変換中のEnterでは確定しません。確定後は文字をドラッグして移動できます。",
+            "Click the page and type. Enter during IME conversion does not finish the text. After Done, drag the text to move it.",
+        ));
+        egui::ComboBox::from_id_salt("entry-font-family").selected_text(s.family.label()).width(110.0).show_ui(ui, |ui| {
+            for family in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
+                ui.selectable_value(&mut s.family, family, family.label());
+            }
+        });
+        egui::ComboBox::from_id_salt("entry-font-size").selected_text(format!("{} pt", s.size)).width(72.0).show_ui(ui, |ui| {
+            for size in [8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
+                ui.selectable_value(&mut s.size, size, format!("{size} pt"));
+            }
+        });
+        if ui.selectable_label(s.bold, egui::RichText::new("B").strong()).on_hover_text(tl!("Bold")).clicked() {
+            s.bold = !s.bold;
+        }
+        if ui.selectable_label(s.italic, egui::RichText::new("I").italics()).on_hover_text(tl!("Italic")).clicked() {
+            s.italic = !s.italic;
+        }
+        for (align, icon, tip) in [
+            (TextAlign::Left, "align-left", tl!("Align left")),
+            (TextAlign::Center, "align-center", tl!("Centre")),
+            (TextAlign::Right, "align-right", tl!("Align right")),
+            (TextAlign::Justify, "align-justify", tl!("Justify")),
+        ] {
+            if crate::icons::button(ui, icon, 26.0, s.align == align, tip).clicked() {
+                s.align = align;
+            }
+        }
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "文字色"));
+        ui.painter().circle_filled(rect.center(), 8.0, crate::comments::color32(s.color));
+        ui.painter().circle_stroke(rect.center(), 8.0, Stroke::new(1.0, Color32::from_black_alpha(50)));
+        let resp = resp.on_hover_text(crate::identity::localized("文字色", "Text colour"));
+        let picked = egui::Popup::menu(&resp).show(|ui| crate::comments::swatch_grid(ui, Some(s.color)));
+        if let Some(color) = picked.and_then(|response| response.inner) {
+            s.color = color;
+        }
+    });
+    ((s != *style).then_some(s), response.response.rect.height())
+}
+
+/// The view-only text tool: where to click, the preview's size and colour, and that Enter
+/// during IME conversion does not finish the text. The bar stays short so the page stays visible.
+pub(crate) fn text_entry_strip(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui) {
+    if app.quick_tool != crate::QuickTool::AddText {
+        return;
+    }
+    let Some((_, id)) = app.active_ids() else { return };
+    if !app.session.allows_added_text(id) {
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    let height_id = egui::Id::new("text_entry_bar_height");
+    let height = ui.data(|data| data.get_temp::<f32>(height_id)).unwrap_or(40.0).clamp(36.0, 96.0);
+    egui::Panel::top("text_entry_bar")
+        .exact_size(height)
+        .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(12, 4)).stroke(egui::Stroke::new(1.0, t.divider)))
+        .show(ui, |ui| {
+            let draft =
+                app.active.and_then(|index| app.views.get(index)).and_then(|view| view.content.draft.as_ref().map(|draft| draft.style.clone()));
+            let selected = app.active_ids().and_then(|(index, doc_id)| {
+                let (page, item) = app.views.get(index)?.content.selected?;
+                let doc = app.session.get(doc_id)?;
+                let added = doc.added().iter().filter(|added| added.page == page).nth(item)?;
+                match &added.content {
+                    AddedContent::Text(text) => Some((page, item, text.clone())),
+                    AddedContent::Image(_) => None,
+                }
+            });
+            let style = draft.clone().or_else(|| selected.as_ref().map(|(_, _, text)| text.clone())).unwrap_or_else(|| app.text_style.clone());
+            let (row, used) = entry_format_row(ui, &style);
+            let next = (used + 8.0).clamp(36.0, 96.0);
+            if (next - height).abs() > 1.0 {
+                ui.data_mut(|data| data.insert_temp(height_id, next));
+                ui.ctx().request_repaint();
+            }
+            if let Some(next) = row {
+                if draft.is_some()
+                    && let Some(index) = app.active
+                    && let Some(draft) = app.views.get_mut(index).and_then(|view| view.content.draft.as_mut())
+                {
+                    draft.style = AddedText { text: draft.text.clone(), rect: draft.rect, ..next.clone() };
+                } else if let Some((page, item, _)) = selected {
+                    app.apply_edit(Edit::UpdateContent { page, index: item, content: AddedContent::Text(next.clone()) });
+                }
+                app.text_style = AddedText { text: String::new(), rect: [0.0; 4], ..next };
+            }
+        });
 }
 
 /// How to use the tools, under the Add content list.
@@ -955,5 +1130,25 @@ mod tests {
         assert!(i.flip_h && !i.flip_v, "Flip horizontal mirrors left and right");
         let i = flipped("Flip vertical");
         assert!(i.flip_v && !i.flip_h, "Flip vertical mirrors top and bottom");
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_box_moves_it_and_a_click_on_empty_page_starts_a_new_one() {
+        assert_eq!(super::adding_text_step(true, false, true), super::TextToolStep::Move);
+        assert_eq!(super::adding_text_step(true, true, true), super::TextToolStep::Move, "a drag is not also a new box");
+        assert_eq!(super::adding_text_step(false, true, true), super::TextToolStep::Edit);
+        assert_eq!(super::adding_text_step(false, true, false), super::TextToolStep::NewBox);
+        assert_eq!(super::adding_text_step(true, false, false), super::TextToolStep::Wait, "a drag from empty page adds nothing");
+        assert_eq!(super::adding_text_step(false, false, true), super::TextToolStep::Wait);
+    }
+
+    #[test]
+    fn enter_and_ime_preedit_do_not_finish_text_entry() {
+        assert!(!super::confirms_text_entry(false, false, false, false), "Enter is not a finish signal");
+        assert!(!super::confirms_text_entry(false, true, false, true), "a conversion in progress stays open");
+        assert!(!super::confirms_text_entry(true, false, false, true), "Done during conversion does not finish the operation");
+        assert!(super::confirms_text_entry(true, false, false, false), "Done finishes once conversion has ended");
+        assert!(super::confirms_text_entry(false, true, false, false), "clicking away finishes");
+        assert!(!super::confirms_text_entry(false, true, true, false), "the confirm buttons are not a click away");
     }
 }

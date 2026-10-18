@@ -1337,7 +1337,7 @@ const MAX_TYPE3_GLYPHS: usize = 240;
 /// The generated fonts for one replacement: one per run of at most `max_glyphs` unique characters,
 /// in order of first appearance.
 #[derive(Clone)]
-struct Type3Fallback {
+pub(crate) struct Type3Fallback {
     /// The family its glyphs come from ("Shippori Mincho").
     family: &'static str,
     /// The fonts' resource names in order; the first is `PCJp` (`PCHe` for Hebrew text).
@@ -1477,6 +1477,7 @@ fn type3_font(
     family: crate::added::Family,
     bold: bool,
     max_glyphs: usize,
+    reserved: &Dict,
 ) -> Result<Type3Fallback, EditError> {
     let (faces, hebrew) = type3_faces(text, family, bold)?;
     // Each unique character once, in order of first appearance.
@@ -1520,15 +1521,41 @@ fn type3_font(
             codes.insert(glyph.ch, (names.len(), glyph.code));
             widths.push((glyph.ch, glyph.width));
         }
-        names.push(add_type3_font(doc, fonts_res, face, hebrew, group));
+        names.push(add_type3_font(doc, fonts_res, face, hebrew, group, reserved));
     }
     Ok(Type3Fallback { family: face.family, names, widths, codes })
 }
 
+impl Type3Fallback {
+    /// The glyph's advance in em, when this fallback drew `ch`.
+    pub(crate) fn em(&self, ch: char) -> Option<f64> {
+        self.widths.iter().find(|(c, _)| *c == ch).map(|(_, width)| *width)
+    }
+}
+
+/// Build the Type 3 fonts for added text that the standard fonts cannot encode.
+/// `text` is only those characters. The fonts are added to `fonts`.
+pub(crate) fn embed_added_type3(
+    doc: &mut Document,
+    fonts: &mut Dict,
+    text: &str,
+    family: crate::added::Family,
+    bold: bool,
+    reserved: &Dict,
+) -> Result<Type3Fallback, EditError> {
+    type3_font(doc, fonts, text, family, bold, MAX_TYPE3_GLYPHS, reserved)
+}
+
+/// Show `text` with a font from [`embed_added_type3`]. `None` when a character was not embedded.
+pub(crate) fn added_type3_show(fallback: &Type3Fallback, text: &str) -> Option<Vec<(String, Vec<u8>)>> {
+    type3_encode(fallback, text)
+}
+
 /// Adds one generated font whose codes 1 to `glyphs.len()` show `glyphs`, and returns its resource
-/// name (`PCJp`, then `PCJp1`, ...; `PCHe`, ... for Hebrew text). Nothing here can fail: the
-/// outlines were read already.
-fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, hebrew: bool, glyphs: Vec<Type3Glyph>) -> String {
+/// name (`PCJp`, then `PCJp1`, ...; `PCHe`, ... for Hebrew text). Names already in `fonts_res` or
+/// `reserved` (the page's other fonts) are skipped, so a later item cannot replace an earlier
+/// item's font. Nothing here can fail: the outlines were read already.
+fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, hebrew: bool, glyphs: Vec<Type3Glyph>, reserved: &Dict) -> String {
     let last_char = glyphs.len();
     let mut charprocs = Dict::new();
     let mut widths = Vec::with_capacity(last_char);
@@ -1580,7 +1607,7 @@ fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, he
     let prefix = if hebrew { "PCHe" } else { "PCJp" };
     let mut name = String::from(prefix);
     let mut suffix = 0usize;
-    while fonts_res.contains(name.as_bytes()) {
+    while fonts_res.contains(name.as_bytes()) || reserved.contains(name.as_bytes()) {
         suffix = suffix.saturating_add(1);
         name = format!("{prefix}{suffix}");
     }
@@ -1735,7 +1762,7 @@ pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usi
         None => {
             let fallback_shown = crate::bidi::to_visual(&text);
             if needs_type3(&text) {
-                let fallback = type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold, max_glyphs)?;
+                let fallback = type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold, max_glyphs, &Dict::new())?;
                 let runs = type3_encode(&fallback, &fallback_shown)
                     .ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown by the {} fallback", fallback.family)))?;
                 let size = font_size_before(&ops, first).unwrap_or(target.size);
@@ -2128,7 +2155,8 @@ fn rewrite_block_from(
     } else {
         None
     };
-    let type3 = if !reuse && needs_type3(&flat) { Some(type3_font(doc, &mut fonts_res, &flat, family, bold, max_glyphs)?) } else { None };
+    let type3 =
+        if !reuse && needs_type3(&flat) { Some(type3_font(doc, &mut fonts_res, &flat, family, bold, max_glyphs, &Dict::new())?) } else { None };
     let advance = |s: &str| -> f64 {
         let t = match (&metrics, reuse) {
             (Some(m), true) => {
@@ -2606,9 +2634,9 @@ mod tests {
         let mut doc = Document::new_empty();
         let mut fonts = Dict::new();
         // A replacement split across two Hebrew fonts, then one Japanese font.
-        let he = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'א')]);
-        let he1 = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'ב')]);
-        let jp = add_type3_font(&mut doc, &mut fonts, &face, false, vec![glyph(1, 'あ')]);
+        let he = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'א')], &Dict::new());
+        let he1 = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'ב')], &Dict::new());
+        let jp = add_type3_font(&mut doc, &mut fonts, &face, false, vec![glyph(1, 'あ')], &Dict::new());
         assert_eq!([he.as_str(), he1.as_str(), jp.as_str()], ["PCHe", "PCHe1", "PCJp"]);
         for name in [&he, &he1, &jp] {
             let font = fonts.get(name.as_bytes()).and_then(Object::as_dict).cloned().unwrap_or_default();

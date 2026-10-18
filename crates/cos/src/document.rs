@@ -856,6 +856,28 @@ impl Document {
         !self.overlay.is_empty()
     }
 
+    /// Identity of the unsaved overlay. The same overlay value keeps it across undo and redo;
+    /// a new object gets a new identity. It is not a hash of the saved file.
+    pub fn edit_fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        let mix = |hash: &mut u64, value: u64| {
+            *hash ^= value;
+            *hash = hash.wrapping_mul(0x100000001b3);
+        };
+        mix(&mut hash, self.overlay.len() as u64);
+        for (num, slot) in &self.overlay {
+            mix(&mut hash, u64::from(*num));
+            match slot {
+                Slot::Freed(generation) => mix(&mut hash, u64::from(*generation) << 1),
+                Slot::Set(generation, object) => {
+                    mix(&mut hash, (u64::from(*generation) << 1) | 1);
+                    mix(&mut hash, Arc::as_ptr(object) as u64);
+                }
+            }
+        }
+        hash
+    }
+
     /// Object numbers changed since the document was opened (or last saved).
     pub fn modified_objects(&self) -> Vec<u32> {
         self.overlay.keys().copied().collect()

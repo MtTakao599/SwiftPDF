@@ -83,6 +83,11 @@ impl PdfCraftApp {
         if !self.command_allowed(spec.id) {
             return false;
         }
+        // Added text is granted on its own. The command's usual "document can be modified" check
+        // stays false while view-only, so it must not hide this one action.
+        if spec.id == "edit.text" && self.active_ids().is_some_and(|(_, id)| self.session.allows_added_text(id)) {
+            return true;
+        }
         // Undo and Redo act on the Combine files list while its tab shows.
         if self.combine_showing() && matches!(spec.needs, commands::Needs::Undo | commands::Needs::Redo) {
             return self.combine_can_undo(spec.needs == commands::Needs::Undo);
@@ -440,9 +445,13 @@ impl PdfCraftApp {
             "a11y.reading_options" => self.dialog = Some(Dialog::Properties(crate::PropsTab::Advanced)),
             "export.all_images" => self.dialog = Some(Dialog::Export(crate::export_ui::ExportKind::AllImages)),
             "edit.text" => {
-                self.quick_tool = crate::QuickTool::AddText;
-                self.left = crate::LeftPanel::Tool("edit");
-                self.reveal_tools();
+                if self.session.view_only() {
+                    self.begin_text_entry();
+                } else {
+                    self.quick_tool = crate::QuickTool::AddText;
+                    self.left = crate::LeftPanel::Tool("edit");
+                    self.reveal_tools();
+                }
             }
             "edit.image" => self.add_image_dialog(),
             "edit.link" => {
