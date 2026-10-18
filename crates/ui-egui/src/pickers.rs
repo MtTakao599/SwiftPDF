@@ -50,8 +50,13 @@ pub(crate) enum Ask {
     Files(rfd::AsyncFileDialog),
     /// Choose a folder.
     Folder(rfd::AsyncFileDialog),
-    /// Choose where to save a file.
+    /// Choose where to save a file. Refused while file output is blocked.
     Save(rfd::AsyncFileDialog),
+    /// Choose a new path for a copy of the opened PDF. This is the only save panel allowed
+    /// while output stays blocked, and only when saving a copy is permitted. Desktop only:
+    /// the web build has no copy picker.
+    #[cfg(not(target_arch = "wasm32"))]
+    SaveCopy(rfd::AsyncFileDialog),
 }
 
 /// What to do with the chosen paths, on a later frame.
@@ -180,8 +185,16 @@ impl PdfCraftApp {
     /// `pick_override` answers instead of a native panel (tests and automation); the answer
     /// still arrives on a later frame, like a real pick.
     pub(crate) fn ask(&mut self, ask: Ask, target: Option<DocId>, then: impl FnOnce(&mut PdfCraftApp, Vec<PathBuf>) + Send + 'static) -> bool {
-        // A save panel is only ever asked for to write a file.
+        // An ordinary save panel writes a file, so it stays refused while output is blocked.
+        // A copy panel is the one exception: it may open while that block is still on, and only
+        // when the session is allowed to publish a new file. In-place save, print and export
+        // keep using [`Ask::Save`] and still stop here.
         if matches!(ask, Ask::Save(_)) && self.refuse_output() {
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(ask, Ask::SaveCopy(_)) && !self.save_copy_permitted() {
+            self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
             return false;
         }
         if self.pickers.showing.swap(true, Ordering::SeqCst) {
@@ -207,6 +220,11 @@ impl PdfCraftApp {
                 self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
             }
             Ask::Save(d) => {
+                let pick = d.save_file();
+                self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Ask::SaveCopy(d) => {
                 let pick = d.save_file();
                 self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
             }

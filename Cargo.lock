@@ -4248,6 +4248,7 @@ dependencies = [
  "async-channel",
  "futures-lite",
  "rustix 1.1.5",
+ "same-file",
  "zbus",
 ]
 
@@ -4378,6 +4379,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "skrifa 0.44.0",
  "sys-locale",
  "toml",

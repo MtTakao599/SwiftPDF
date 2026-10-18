@@ -177,6 +177,9 @@ impl PdfCraftApp {
             "file.save" => {
                 self.save_active(SaveTarget::InPlace);
             }
+            "file.save_as" if self.session.view_only() => {
+                self.begin_save_copy();
+            }
             "file.save_as" => {
                 self.save_active(SaveTarget::As);
             }

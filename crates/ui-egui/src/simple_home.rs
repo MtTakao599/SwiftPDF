@@ -247,6 +247,9 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 if widgets::ghost_button(ui, "search", "検索").on_hover_text(tip).clicked() {
                     app.execute("edit.find");
                 }
+                if app.command_allowed("file.save_as") && widgets::ghost_button(ui, "save", "名前を付けて保存").clicked() {
+                    app.execute("file.save_as");
+                }
             });
         });
 }

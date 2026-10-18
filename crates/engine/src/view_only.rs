@@ -11,12 +11,43 @@
 //! - every file it would produce: Save, Save As, Optimize, signing and timestamps, new files
 //!   (Combine, Extract, Split, Create, comment summaries and compare reports), the print-ready
 //!   PDF (paper and Save as PDF) and form or comment data ([`Session::export_data`]).
+//!   [`Capability::SaveAs`] is a separate grant. Without it, [`Session::save_copy_bytes`] is
+//!   refused too. With it, that method returns the opened bytes only; it still does not allow
+//!   [`Session::save_bytes`], a rewrite, or any other capability.
 //!
 //! Reading stays as it is: opening (with a password too) and reloading, rendering, text, search,
 //! forms and signature validation as displayed, layers, hiding comments, reading colours, and
 //! copying text as far as the document's security allows. Turning it off restores it all.
 
 use crate::{Document, EditError, Session};
+
+/// One action a view-only session may be granted on its own. Nothing is granted until
+/// [`Session::grant`]. Viewing is the session itself, not one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+    /// Write the opened bytes to a different new file.
+    SaveAs,
+    /// Change text or form values.
+    EditText,
+    /// Print.
+    Print,
+    /// Place a stamp.
+    Stamp,
+    /// Combine, split or extract pages.
+    Organize,
+}
+
+impl Capability {
+    fn bit(self) -> u8 {
+        match self {
+            Self::SaveAs => 1 << 0,
+            Self::EditText => 1 << 1,
+            Self::Print => 1 << 2,
+            Self::Stamp => 1 << 3,
+            Self::Organize => 1 << 4,
+        }
+    }
+}
 
 impl Session {
     /// Turn the view-only policy on or off, for this session and every document open in it.
@@ -42,6 +73,21 @@ impl Session {
     pub(crate) fn check_not_view_only(&self) -> Result<(), EditError> {
         if self.view_only { Err(EditError::ViewOnly) } else { Ok(()) }
     }
+
+    /// Allow `capability` in addition to viewing. It does not turn view-only off.
+    pub fn grant(&mut self, capability: Capability) {
+        self.capabilities |= capability.bit();
+    }
+
+    /// Withdraw a grant from [`Session::grant`].
+    pub fn revoke(&mut self, capability: Capability) {
+        self.capabilities &= !capability.bit();
+    }
+
+    /// Whether [`Session::grant`] was called for `capability` and not withdrawn.
+    pub fn allows(&self, capability: Capability) -> bool {
+        self.capabilities & capability.bit() != 0
+    }
 }
 
 impl Document {
@@ -56,7 +102,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::tests::fixture;
-    use crate::{DocId, Edit, EditError, Session, SignOptions, SummarySort};
+    use crate::{Capability, DocId, Edit, EditError, Session, SignOptions, SummarySort};
 
     fn view_only_session(pages: usize) -> (Session, DocId) {
         let mut s = Session::new().with_clock(|| 1_700_000_000).with_view_only(true);
@@ -245,5 +291,95 @@ mod tests {
         assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![0] }), Err(EditError::ViewOnly));
         let later = s.open("later.pdf", None, Arc::new(fixture(1)), None).unwrap();
         assert!(s.get(later).unwrap().view_only());
+    }
+
+    #[test]
+    fn view_only_save_as_is_refused_until_granted_and_grants_nothing_else() {
+        let (s, id) = view_only_session(2);
+        assert!(!s.allows(Capability::SaveAs));
+        assert_eq!(s.save_copy_bytes(id), Err(EditError::ViewOnly));
+        let mut s = s;
+        s.grant(Capability::SaveAs);
+        assert!(s.view_only());
+        assert!(s.allows(Capability::SaveAs));
+        for other in [Capability::EditText, Capability::Print, Capability::Stamp, Capability::Organize] {
+            assert!(!s.allows(other));
+        }
+        let opened = s.get(id).unwrap().bytes.clone();
+        let copied = s.save_copy_bytes(id).unwrap();
+        assert!(Arc::ptr_eq(&copied, &opened) || copied.as_slice() == opened.as_slice());
+        s.check_save(id, &copied).unwrap();
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(s.save_full_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(s.mark_saved(id, copied, Some("copy.pdf".into())), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![1] }), Err(EditError::ViewOnly));
+        let settings = crate::print::Settings { pages: vec![0], ..Default::default() };
+        assert_eq!(s.print_pdf(id, &settings), Err(EditError::ViewOnly));
+        assert_eq!(s.extract(id, &[0]), Err(EditError::ViewOnly));
+        assert_eq!(s.get(id).unwrap().info.pages.len(), 2);
+        assert!(!s.get(id).unwrap().dirty);
+    }
+
+    #[test]
+    fn view_only_changed_document_cannot_be_copied() {
+        let mut s = Session::new().with_clock(|| 1_700_000_000);
+        let id = s.open("fixture.pdf", None, Arc::new(fixture(3)), None).unwrap();
+        s.apply(id, Edit::DeletePages { pages: vec![1] }).unwrap();
+        s.set_view_only(true);
+        s.grant(Capability::SaveAs);
+        assert!(matches!(s.save_copy_bytes(id), Err(EditError::Invalid(_))));
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(s.get(id).unwrap().info.pages.len(), 2);
+    }
+
+    #[test]
+    fn view_only_restricted_pdf_is_copied_without_lifting_its_restrictions() {
+        use crate::{Changes, Printing, Protection};
+        let mut author = Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        author
+            .apply(
+                id,
+                Edit::Protect(Protection {
+                    open_password: Some("reader".into()),
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::None,
+                    changes: Changes::None,
+                    copy: false,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.save_bytes(id).unwrap();
+
+        let mut s = Session::new().with_view_only(true);
+        s.grant(Capability::SaveAs);
+        let id = s.open("locked.pdf", None, locked.clone(), Some("reader")).unwrap();
+        let copied = s.save_copy_bytes(id).unwrap();
+        assert_eq!(copied.as_slice(), locked.as_slice());
+        s.check_save(id, &copied).unwrap();
+        assert_eq!(s.unlock(id, "owner"), Err(EditError::ViewOnly));
+
+        let mut again = Session::new().with_view_only(true);
+        let id2 = again.open("copy.pdf", None, copied, Some("reader")).unwrap();
+        let doc = again.get(id2).unwrap();
+        assert!(!doc.allows_copying());
+        assert!(!doc.allows_printing());
+        assert!(!doc.allows_modification());
+        assert_eq!(again.unlock(id2, "owner"), Err(EditError::ViewOnly));
+    }
+
+    #[test]
+    fn view_only_signed_pdf_is_copied_as_the_bytes_that_were_opened() {
+        let mut signer = Session::new().with_clock(|| 1_800_000_000);
+        let id = signer.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let signed = signer.sign(id, &digital_id(), SignOptions { rect: None, ..SignOptions::default() }).unwrap();
+        let mut s = Session::new().with_view_only(true);
+        s.grant(Capability::SaveAs);
+        let id = s.open("signed.pdf", None, signed.clone(), None).unwrap();
+        let copied = s.save_copy_bytes(id).unwrap();
+        assert_eq!(copied.as_slice(), signed.as_slice());
+        assert!(s.get(id).unwrap().is_signed());
+        assert_eq!(s.save_full_bytes(id), Err(EditError::ViewOnly));
     }
 }

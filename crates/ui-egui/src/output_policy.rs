@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::PdfCraftApp;
 
 static BLOCKED: AtomicBool = AtomicBool::new(false);
+/// A copy of an opened PDF to a new path. This does not turn [`BLOCKED`] off, so print, export
+/// and in-place save stay refused.
+static SAVE_AS: AtomicBool = AtomicBool::new(false);
 
 /// What the user is told when an output is refused.
 pub const REFUSED: &str = "This app is view-only: it doesn't save, print or export files.";
@@ -33,6 +36,16 @@ pub(crate) fn check() -> std::io::Result<()> {
     if blocked() { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, REFUSED)) } else { Ok(()) }
 }
 
+/// Allow the view-only copy writer. It does not clear [`set_blocked`].
+pub fn set_save_as_allowed(on: bool) {
+    SAVE_AS.store(on, Ordering::SeqCst);
+}
+
+/// Whether the view-only copy writer may run. Print, export and in-place save do not read this.
+pub fn save_as_allowed() -> bool {
+    SAVE_AS.load(Ordering::SeqCst)
+}
+
 impl PdfCraftApp {
     /// View-only in every mode: the session refuses edits and the files it would produce, and
     /// the app refuses every file the user asks for. `false` restores both.
@@ -46,6 +59,13 @@ impl PdfCraftApp {
                 self.mode_override = Some(mode.in_view_only(true));
             }
         }
+    }
+
+    /// Grant saving the opened bytes to a new file. View-only stays on, and [`set_blocked`] stays
+    /// on, so this does not allow in-place save, print or export.
+    pub fn grant_save_as(&mut self) {
+        self.session.grant(pdfcraft_engine::Capability::SaveAs);
+        set_save_as_allowed(true);
     }
 
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so

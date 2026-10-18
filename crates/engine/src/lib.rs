@@ -38,6 +38,7 @@ pub mod text_fonts;
 mod text_preview;
 mod upright_image;
 mod view_only;
+pub use view_only::Capability;
 pub mod word_count;
 pub mod xfa;
 
@@ -2904,6 +2905,8 @@ pub struct Session {
     date_language: Option<String>,
     /// Refuse every change to a document and every PDF it would write ([`Session::set_view_only`]).
     view_only: bool,
+    /// Grants beyond view-only. Empty until [`Session::grant`]. Each one is independent.
+    capabilities: u8,
 }
 
 /// Immutable session state needed while a document is prepared away from its owning thread.
@@ -4086,6 +4089,30 @@ impl Session {
         .map_err(EditError::Write)?
         .map(Arc::new)
         .map_err(|e| EditError::Write(e.to_string()))
+    }
+
+    /// The opened file's bytes, for a copy to a different new path.
+    ///
+    /// Requires [`Capability::SaveAs`]. It does not write, does not change this document's path,
+    /// and does not produce a rewrite: a view-only session still refuses [`Self::save_bytes`] and
+    /// [`Self::save_full_bytes`]. A document that has changes since it was opened is refused,
+    /// because this copy is only the file as it was opened. A later edited revision would be
+    /// produced by another method and written by the same new-file publisher; it must not go
+    /// through this one.
+    pub fn save_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        if !self.allows(Capability::SaveAs) {
+            return Err(EditError::ViewOnly);
+        }
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        if doc.dirty {
+            return Err(EditError::Invalid("this copy can only save the file as it was opened".into()));
+        }
+        let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
+        let on_saved = Arc::ptr_eq(editor.cos.bytes(), &editor.saved);
+        if editor.cos.is_modified() || !on_saved {
+            return Err(EditError::Invalid("this copy can only save the file as it was opened".into()));
+        }
+        Ok(editor.saved.clone())
     }
 
     /// A compact, garbage-collected rewrite (Save As ▸ "Optimized" / Reduce File Size groundwork).

@@ -28,6 +28,16 @@ pub struct PendingOverwrite {
     after: Box<dyn FnOnce(&mut PdfCraftApp) + Send>,
 }
 
+/// A copy the user has chosen and not yet confirmed. Nothing is written while this is waiting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveCopyRequest {
+    pub id: pdfcraft_engine::DocId,
+    pub source_name: String,
+    /// The opened file, when it has a path. Empty when the document was opened from bytes.
+    pub source_path: Option<String>,
+    pub dest: String,
+}
+
 /// Where Save writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveTarget {
@@ -914,6 +924,216 @@ impl PdfCraftApp {
         } else {
             // A clean quit: nothing is left to recover.
             self.shutdown_recovery();
+        }
+    }
+
+    /// File ▸ Save as, while view-only: choose a new path, then confirm before anything is written.
+    pub fn begin_save_copy(&mut self) {
+        if !self.save_copy_permitted() {
+            self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
+            return;
+        }
+        let Some((_, id)) = self.active_ids() else {
+            self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
+            return;
+        };
+        let Some(doc) = self.session.get(id) else {
+            self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
+            return;
+        };
+        let name = doc.name.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(dest) = self.save_override.clone() {
+                self.offer_save_copy(id, dest);
+                return;
+            }
+            let file_name = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
+            let dialog = rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(file_name);
+            // [`Ask::SaveCopy`], not [`Ask::Save`]: the output block stays on, and an ordinary
+            // save panel is refused with the view-only notice before the dialog can open.
+            self.ask_one(crate::pickers::Ask::SaveCopy(dialog), None, move |app, dest| {
+                app.offer_save_copy(id, dest.to_string_lossy().into_owned());
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (id, name);
+            self.notify(crate::identity::localized(
+                "この版では、名前を付けて保存はデスクトップ版だけです。",
+                "Saving a copy is only available in the desktop app.",
+            ));
+        }
+    }
+
+    /// The destination has been chosen. Show the original and the destination; do not write yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn offer_save_copy(&mut self, id: pdfcraft_engine::DocId, dest: String) {
+        let Some(doc) = self.session.get(id) else {
+            self.notify(crate::identity::localized("保存する前にPDFが閉じられました。", "The PDF was closed before it could be saved."));
+            return;
+        };
+        self.pending_save_copy = Some(SaveCopyRequest { id, source_name: doc.name.clone(), source_path: doc.path.clone(), dest });
+        self.dialog = Some(crate::Dialog::SaveCopy);
+    }
+
+    /// The confirmation's Save. Returns whether the new file was written.
+    pub fn confirm_save_copy(&mut self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.pending_save_copy = None;
+            self.notify(crate::identity::localized(
+                "この版では、名前を付けて保存はデスクトップ版だけです。",
+                "Saving a copy is only available in the desktop app.",
+            ));
+            false
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(request) = self.pending_save_copy.take() else { return false };
+            self.write_save_copy(request)
+        }
+    }
+
+    /// The confirmation's Cancel, or the dialog being dismissed.
+    pub fn cancel_save_copy(&mut self) {
+        self.pending_save_copy = None;
+    }
+
+    pub(crate) fn save_copy_permitted(&self) -> bool {
+        self.session.view_only()
+            && self.session.allows(pdfcraft_engine::Capability::SaveAs)
+            && crate::output_policy::save_as_allowed()
+            && crate::output_policy::blocked()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_save_copy(&mut self, request: SaveCopyRequest) -> bool {
+        if !self.save_copy_permitted() {
+            self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
+            return false;
+        }
+        let Some(doc) = self.session.get(request.id) else {
+            self.notify(crate::identity::localized("保存する前にPDFが閉じられました。", "The PDF was closed before it could be saved."));
+            return false;
+        };
+        let source_path = doc.path.clone().or(request.source_path.clone());
+        let source_name = doc.name.clone();
+        let original_before = source_path.as_deref().and_then(|path| std::fs::read(path).ok());
+        let bytes = match self.session.save_copy_bytes(request.id) {
+            Ok(bytes) => bytes,
+            Err(pdfcraft_engine::EditError::Invalid(_)) => {
+                self.notify(crate::identity::localized(
+                    "開いたときの内容だけを保存できます。変更されたPDFは保存しません。",
+                    "Only the file as it was opened can be saved. This PDF has changes, so it was not saved.",
+                ));
+                return false;
+            }
+            Err(error) => {
+                let ja = format!("保存できませんでした。{error}");
+                let en = format!("Couldn't save the copy. {error}");
+                self.notify(crate::identity::localized(&ja, &en));
+                return false;
+            }
+        };
+        if let Err(error) = self.session.check_save(request.id, &bytes) {
+            let ja = format!("保存した内容を開き直せなかったため、書き込みませんでした。{error}");
+            let en = format!("The copy could not be opened, so nothing was written. {error}");
+            self.notify(crate::identity::localized(&ja, &en));
+            return false;
+        }
+        self.publish_new_pdf(request.id, &source_name, source_path.as_deref(), &request.dest, bytes.as_ref(), original_before.as_deref())
+    }
+
+    /// Write `bytes` to a new path. Today `bytes` are the opened file from
+    /// [`Session::save_copy_bytes`](pdfcraft_engine::Session::save_copy_bytes). A later edited
+    /// revision would pass its own bytes into this function and nowhere else: the original path
+    /// and an existing destination stay protected here, independent of how the bytes were made.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_new_pdf(
+        &mut self,
+        id: pdfcraft_engine::DocId,
+        source_name: &str,
+        source_path: Option<&str>,
+        dest_path: &str,
+        bytes: &[u8],
+        original_before: Option<&[u8]>,
+    ) -> bool {
+        let dest = std::path::PathBuf::from(dest_path);
+        let original = source_path.map(std::path::Path::new);
+        if let Err(error) = pdfcraft_platform::save_path::write_new_file(original, &dest, bytes) {
+            self.notify(save_copy_message(&error));
+            return false;
+        }
+        let on_disk = match std::fs::read(&dest) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = std::fs::remove_file(&dest);
+                let ja = format!("保存したファイルを読み戻せなかったため、保存先を取り消しました。{error}");
+                let en = format!("The saved file could not be read back, so it was removed. {error}");
+                self.notify(crate::identity::localized(&ja, &en));
+                return false;
+            }
+        };
+        if on_disk.as_slice() != bytes {
+            let _ = std::fs::remove_file(&dest);
+            self.notify(crate::identity::localized(
+                "保存したファイルの内容が一致しなかったため、保存先を取り消しました。",
+                "The saved file did not match what was written, so it was removed.",
+            ));
+            return false;
+        }
+        let written = std::sync::Arc::new(on_disk);
+        if let Err(error) = self.session.check_save(id, &written) {
+            let _ = std::fs::remove_file(&dest);
+            let ja = format!("保存したPDFを開き直せなかったため、保存先を取り消しました。{error}");
+            let en = format!("The saved PDF could not be opened, so it was removed. {error}");
+            self.notify(crate::identity::localized(&ja, &en));
+            return false;
+        }
+        let original_after = source_path.and_then(|path| std::fs::read(path).ok());
+        let original_differs = original_before.is_some_and(|on_disk| on_disk != bytes)
+            || original_after.as_ref().is_some_and(|now| original_before.is_some_and(|earlier| earlier != now.as_slice()));
+        let dest_name = dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| dest_path.to_string());
+        if original_differs {
+            let ja = format!("「{dest_name}」に保存しました。原本のファイルは開いたときと違う内容なので、そのままにしました。");
+            let en = format!("Saved {dest_name}. The original file on disk is no longer the opened PDF, so it was left as it is.");
+            self.notify(crate::identity::localized(&ja, &en));
+        } else {
+            let ja = format!("「{dest_name}」に保存しました。原本「{source_name}」は変更していません。");
+            let en = format!("Saved {dest_name}. The original {source_name} was not changed.");
+            self.notify(crate::identity::localized(&ja, &en));
+        }
+        // The open tab stays bound to the original. The copy opens beside it for reading.
+        self.open_path(dest_path);
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_copy_message(error: &pdfcraft_platform::save_path::NewFileError) -> String {
+    match error {
+        pdfcraft_platform::save_path::NewFileError::SameAsOriginal => crate::identity::localized(
+            "保存先が原本と同じファイルです。原本は変更しません。",
+            "That destination is the original file. It was not changed.",
+        ),
+        pdfcraft_platform::save_path::NewFileError::DestinationExists => crate::identity::localized(
+            "保存先にファイルが既にあるため、上書きしませんでした。",
+            "A file is already at that destination, so it was not overwritten.",
+        ),
+        pdfcraft_platform::save_path::NewFileError::LinkUnavailable(_) => crate::identity::localized(
+            "この保存先では、既存のファイルを置き換えずに新しいファイルを作れないため、何も書き込みませんでした。",
+            "This folder cannot create a new file without replacing an existing one, so nothing was written.",
+        ),
+        pdfcraft_platform::save_path::NewFileError::Unresolved(message) => {
+            let ja = format!("保存先を確認できなかったため、何も書き込みませんでした。{message}");
+            let en = format!("The destination could not be confirmed, so nothing was written. {message}");
+            crate::identity::localized(&ja, &en)
+        }
+        pdfcraft_platform::save_path::NewFileError::Io(io) => {
+            let ja = format!("保存できませんでした。{io}");
+            let en = format!("Couldn't save the copy. {io}");
+            crate::identity::localized(&ja, &en)
         }
     }
 }

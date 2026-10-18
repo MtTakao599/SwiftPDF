@@ -397,6 +397,8 @@ pub enum Dialog {
     AuditSpace,
     /// Signatures ▸ Show certificate.
     CertificateViewer,
+    /// Confirm a copy of the opened PDF to a new file. The original is not the destination.
+    SaveCopy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -679,6 +681,8 @@ pub struct PdfCraftApp {
     /// A save waiting behind [`Dialog::OverwriteChanged`] (the web build has no files to check).
     #[cfg(not(target_arch = "wasm32"))]
     pub pending_overwrite: Option<editing::PendingOverwrite>,
+    /// A copy waiting behind [`Dialog::SaveCopy`]. Writing happens only after the user confirms.
+    pub pending_save_copy: Option<editing::SaveCopyRequest>,
     /// Save to this path instead of asking (tests and automation).
     pub save_override: Option<String>,
     /// Document Properties ▸ Description fields being edited: (document, Title/Author/Subject/Keywords).
@@ -1024,6 +1028,7 @@ impl PdfCraftApp {
             close_request: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_overwrite: None,
+            pending_save_copy: None,
             save_override: None,
             props_draft: None,
             view_draft: None,

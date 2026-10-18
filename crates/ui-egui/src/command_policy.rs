@@ -93,8 +93,16 @@ pub fn option_allowed_in_view_only(key: &str, value: &str) -> bool {
 
 impl PdfCraftApp {
     /// Whether the command `id` may run in this session: any command, unless it is view-only.
+    /// `file.save_as` is not on the reading list. It runs only when [`pdfcraft_engine::Capability::SaveAs`]
+    /// was granted, and the copy writer still refuses every other output.
     pub fn command_allowed(&self, id: &str) -> bool {
-        !self.session.view_only() || allowed_in_view_only(id)
+        if !self.session.view_only() {
+            return true;
+        }
+        if id == "file.save_as" && self.session.allows(pdfcraft_engine::Capability::SaveAs) {
+            return true;
+        }
+        allowed_in_view_only(id)
     }
 
     /// Tell the user and return `true` when this session is view-only, for actions that don't

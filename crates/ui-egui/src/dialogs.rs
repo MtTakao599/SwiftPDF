@@ -64,6 +64,7 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let mut print_go = false;
     let mut revert_now = false;
     let mut overwrite_now = false;
+    let mut save_copy_now = false;
     let mut overwrite_elsewhere = false;
     let mut summarize_now = false;
     let mut optimize_now = false;
@@ -831,6 +832,53 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                 });
                 return;
             }
+            Dialog::SaveCopy => {
+                let pending = app.pending_save_copy.clone();
+                let title = crate::identity::localized("名前を付けて保存", "Save a copy");
+                ui.label(egui::RichText::new(title).font(theme::semibold(18.0)));
+                ui.add_space(8.0);
+                let Some(pending) = pending else {
+                    ui.label(crate::identity::localized("保存先が選ばれていません。", "No destination was chosen."));
+                    ui.add_space(12.0);
+                    if widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
+                        close = true;
+                    }
+                    return;
+                };
+                let dest_name = std::path::Path::new(&pending.dest)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| pending.dest.clone());
+                let source = pending.source_path.clone().unwrap_or_else(|| pending.source_name.clone());
+                ui.label(crate::identity::localized(
+                    "原本はこのファイルのままです。保存先が同じファイルのときは書き込みません。",
+                    "The original stays as it is. Nothing is written when the destination is that same file.",
+                ));
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(crate::identity::localized("原本", "Original")).strong());
+                ui.label(pending.source_name);
+                ui.label(source);
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(crate::identity::localized("保存先", "Destination")).strong());
+                ui.label(dest_name);
+                ui.label(&pending.dest);
+                ui.add_space(8.0);
+                ui.label(crate::identity::localized(
+                    "保存先にファイルがある場合は上書きしません。",
+                    "An existing file at the destination is not overwritten.",
+                ));
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::pill_button(ui, tl!("Save"), true).clicked() {
+                        save_copy_now = true;
+                        close = true;
+                    }
+                    if widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
+                        close = true;
+                    }
+                });
+                return;
+            }
             Dialog::Print => {
                 let Some((i, id)) = app.active_ids() else {
                     close = true;
@@ -1269,6 +1317,12 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         if overwrite_elsewhere {
             app.save_changed_file_elsewhere();
         }
+    }
+    if save_copy_now {
+        let _ = app.confirm_save_copy();
+    }
+    if dialog == Dialog::SaveCopy && (modal.should_close() || close) {
+        app.cancel_save_copy();
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (overwrite_now, overwrite_elsewhere);
