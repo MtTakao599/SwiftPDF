@@ -442,39 +442,24 @@ The summary is in **[ROADMAP.md](ROADMAP.md)**; the full assessment by dimension
 
 | Build | Installer | Portable |
 |---|---|---|
-| x64 (64-bit Intel/AMD) | `pdfcraft-<ver>-windows-x64.msi` | `pdfcraft-<ver>-windows-x64-portable.zip` |
-| arm64 (Snapdragon and other ARM PCs) | `pdfcraft-<ver>-windows-arm64.msi` | `pdfcraft-<ver>-windows-arm64-portable.zip` |
-| x86 (32-bit) | `pdfcraft-<ver>-windows-x86.msi` | `pdfcraft-<ver>-windows-x86-portable.zip` |
+| x64 (64-bit Intel/AMD, Windows 11) | `SwiftPDF-<ver>-windows-x64.msi` | `SwiftPDF-<ver>-windows-x64-portable.zip` |
 
-Installers and executables are code-signed.
+Installers and executables are code-signed. The Windows packages contain `SwiftPDF.exe` and do not contain `pdfcraft-cli.exe`.
 
-The portable zip runs from any folder, a USB stick included. Its `portable.txt` keeps the settings,
-logs and crash recovery in a `PdfCraftData` folder next to `pdfcraft.exe`, so nothing is written to
-`%APPDATA%`; delete that file to use the normal per-user folders.
+The portable zip runs from any folder, a USB stick included, without writing the registry or file associations. Its `portable.txt` keeps the settings, logs and crash recovery in a `Data` folder next to `SwiftPDF.exe`, so nothing is written to `%LOCALAPPDATA%`. Copy the whole folder, including `Data`, to move it. Delete `portable.txt` to use the normal per-user folder (`%LOCALAPPDATA%\SwiftPDF`).
 
-The MSI installs for all users and requires administrator privileges. It adds "Edit with PdfCraft"
-to the right-click menu of PDF files and "Create PDF with PdfCraft…" to the right-click menu of
-images (.png .jpg .jpeg .tif .tiff .gif .bmp .jp2 .j2k .jpx) in File Explorer (on Windows 11, under
-"Show more options"), without changing which app opens them by default. For unattended deployment
-without a desktop shortcut, run from an elevated terminal:
+The MSI installs SwiftPDF for all users into `Program Files\SwiftPDF` and requires administrator privileges. It registers SwiftPDF under "Open with" and can add "Open with SwiftPDF" to the right-click menu of PDF files (on Windows 11, under "Show more options"), without changing which app opens them by default and without registering PdfCraft's keys. For unattended deployment without a desktop shortcut, run from an elevated terminal:
 
 ```powershell
-msiexec /i "pdfcraft-<ver>-windows-x64.msi" /qn /norestart INSTALLDESKTOPSHORTCUT=0
+msiexec /i "SwiftPDF-<ver>-windows-x64.msi" /qn /norestart INSTALLDESKTOPSHORTCUT=0
 ```
 
 | Property | `=0` leaves out |
 |---|---|
 | `INSTALLDESKTOPSHORTCUT` | the all-users desktop shortcut |
-| `INSTALLPDFCONTEXTMENU` | "Edit with PdfCraft" on PDF files |
-| `INSTALLIMAGECONTEXTMENU` | "Create PDF with PdfCraft…" on images |
+| `INSTALLOPENWITH` | "Open with SwiftPDF" on PDF files |
 
-All three are on for a first install. An upgrade keeps what the installed version has: a shortcut
-or menu entry that is there stays, and one that is missing (left out at install, or a desktop
-shortcut someone deleted) stays missing, so you don't need to pass them again. A value on the
-command line always wins: `=1` puts one back and `=0` removes it. Upgrading from a release that
-didn't have a menu yet (0.6.0 and earlier for the PDF menu, 0.2.1 and earlier for the image menu)
-adds it, as a first install would. Use the MSI for your architecture. Per-user installation
-overrides are not supported.
+Both are on for a first install. An upgrade of SwiftPDF keeps what that installation still has: a shortcut or menu entry that is there stays, and one that is missing stays missing. A value on the command line always wins: `=1` puts one back and `=0` removes it. Per-user installation overrides are not supported.
 
 **Pin the checksum, not just the version.** Release candidates of a version share its MSI version
 (MSI versions are numbers only, so 1.2.3-rc.1 and 1.2.3 are both 1.2.3), and the installer lets an

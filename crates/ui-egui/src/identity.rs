@@ -10,3 +10,9 @@ pub const DIR_NAME: &str = "SwiftPDF";
 pub const XDG_DIR_NAME: &str = "swiftpdf";
 /// The key the preferences are saved under in `app.ron` (and in browser storage on the web).
 pub const STORAGE_KEY: &str = "swiftpdf";
+
+/// Japanese when the UI language is Japanese; English otherwise. Used for SwiftPDF wording that
+/// must not replace the PdfCraft catalog strings the other languages still translate.
+pub fn localized(ja: &str, en: &str) -> String {
+    if crate::i18n::current().code() == "ja" { ja.to_owned() } else { en.to_owned() }
+}

@@ -67,11 +67,14 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     app.combine_tab.focused = false;
                 }
                 // Keep the two icon buttons, Discord's text/padding, three gaps and the mode switch's
-                // gap outside the scrolling tabs (the switch itself is measured below).
+                // gap outside the scrolling tabs (the switch itself is measured below). A view-only
+                // session does not show Discord, so that width is not reserved.
+                let show_discord = !app.session.view_only();
                 let discord_text = ui.fonts_mut(|f| f.layout_no_wrap("Discord".into(), theme::medium(13.0), t.text).size().x);
+                let discord_label = if show_discord { discord_text } else { 0.0 };
                 // The ghost button around that text: its icon and padding.
-                let discord_width = discord_text + 38.0;
-                let controls_width = discord_text + 2.0 * button + 50.0 + window_controls::width(&controls.right) + UI_MODE_GAP;
+                let discord_width = if show_discord { discord_text + 38.0 } else { 0.0 };
+                let controls_width = discord_label + 2.0 * button + 50.0 + window_controls::width(&controls.right) + UI_MODE_GAP;
                 // Open stays in sight after the tabs: its icon, text and padding, and the gaps around it.
                 let open_width = ui.fonts_mut(|f| f.layout_no_wrap(tl!("Open").into(), theme::medium(13.0), t.text).size().x) + 38.0 + 12.0;
                 let room = ui.available_width() - controls_width - open_width;
@@ -80,7 +83,7 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 // Discord's label did.
                 let gap = ui.spacing().item_spacing.x;
                 let compact = room - ui_mode_switch_width(ui, false) < TAB_MIN_WIDTH + 2.0 * (TAB_ARROW + gap);
-                let discord_saved = if compact { discord_width - button } else { 0.0 };
+                let discord_saved = if compact && show_discord { discord_width - button } else { 0.0 };
                 let mut tabs_width = (room + discord_saved - ui_mode_switch_width(ui, compact)).max(0.0);
                 // Tabs shrink to share the strip (names end in "…") and scroll only once they reach
                 // their narrowest; then arrows either side say so and step through them.
@@ -308,15 +311,17 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     if icons::button(ui, "circle-help", button, false, tl!("Keyboard shortcuts")).clicked() {
                         app.dialog = Some(Dialog::Shortcuts);
                     }
-                    // One click to the community, from anywhere in the app.
-                    let discord = if compact {
-                        // Its tooltip says "Discord".
-                        icons::button(ui, "messages-square", button, false, "Discord")
-                    } else {
-                        widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD)
-                    };
-                    if discord.clicked() {
-                        app.execute("help.discord");
+                    // One click to the community, from anywhere in the app. SwiftPDF does not offer it.
+                    if show_discord {
+                        let discord = if compact {
+                            // Its tooltip says "Discord".
+                            icons::button(ui, "messages-square", button, false, "Discord")
+                        } else {
+                            widgets::ghost_button_sized(ui, "messages-square", "Discord", tab_h).on_hover_text(pdfcraft_engine::links::DISCORD)
+                        };
+                        if discord.clicked() {
+                            app.execute("help.discord");
+                        }
                     }
                 });
             });

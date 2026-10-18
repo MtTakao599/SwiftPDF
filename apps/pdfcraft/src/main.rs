@@ -1,6 +1,6 @@
 //! PdfCraft desktop app.
 //!
-//! Usage: `pdfcraft [options] [files…]`
+//! Usage: `SwiftPDF [options] [files…]`
 //! `--create-images [images…]` stages the images in one PDF and asks for the page DPI.
 //!
 //! View options (applied after the files open; also the seed of the UI control channel):
@@ -47,14 +47,15 @@ mod updates;
 mod windows_manifest;
 
 /// Freedesktop app id: the `.desktop` file name and the hicolor icon name.
+#[cfg(not(windows))]
 const APP_ID: &str = "ai.storyteller.pdfcraft";
+/// Windows AppUserModelID. It is not PdfCraft's id, so the taskbar group is SwiftPDF's.
+#[cfg(windows)]
+const APP_ID: &str = "SwiftPDF";
 
-/// The app icon (assets/app-icon/README.md). macOS gets the version on Apple's icon grid, with a
-/// transparent margin; Windows and Linux get the full-bleed tile.
-#[cfg(target_os = "macos")]
-const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/pdfcraft-1024.png");
-#[cfg(not(target_os = "macos"))]
-const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.pdfcraft.png");
+/// Official SwiftPDF icon. The window, taskbar and Alt-Tab use this PNG; `build.rs` embeds
+/// `assets/app-icon/swiftpdf.ico` (resampled from the same image) in the executable.
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../docs/images/SwiftPDFicon.png");
 
 /// SwiftPDF's per-user folder for preferences and logs: `%LOCALAPPDATA%\SwiftPDF` on Windows,
 /// beside crash recovery, digital IDs and the single-instance socket; eframe's SwiftPDF folder
@@ -118,7 +119,7 @@ fn path_from_arg(arg: String) -> String {
     String::from_utf8(out).unwrap_or(arg)
 }
 
-/// Some programs start the PDF reader with the path unquoted (`pdfcraft.exe P:\Docs\01 Contract.PDF`),
+/// Some programs start the PDF reader with the path unquoted (`SwiftPDF.exe P:\Docs\01 Contract.PDF`),
 /// so a path with spaces arrives split into several arguments (Acrobat accepts this). When an
 /// argument names no file but it and the ones after it, joined with one space, do, rejoin them
 /// (the longest such run). Anything else is kept as given. Runs of several spaces can't be recovered: the split has lost them.
@@ -294,7 +295,8 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
         .with_inner_size([1440.0, 920.0])
         .with_min_inner_size([820.0, 520.0])
         .with_drag_and_drop(true)
-        // Wayland app id: matches packaging/linux/ai.storyteller.pdfcraft.desktop.
+        // Linux window class matches packaging/linux/ai.storyteller.pdfcraft.desktop.
+        // On Windows this is the AppUserModelID (`SwiftPDF`).
         .with_app_id(APP_ID);
     // Dock, taskbar, Alt-Tab and launcher icon when running unbundled.
     match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
@@ -374,7 +376,8 @@ fn app_creator<'a>(
         {
             app.motion.source = Some(motion::source());
         }
-        app.update_source = Some(std::sync::Arc::new(updates::latest_release));
+        // SwiftPDF has no release feed. Leaving this unset, and refusing the command while
+        // view-only, keeps Help from opening the PdfCraft GitHub or ArtCraft pages.
         app.printer_source = Some(pdfcraft_ui_egui::system_printers());
         app.os_key_store_ids = cfg!(any(target_os = "macos", target_os = "windows"));
         #[cfg(target_os = "macos")]
@@ -444,7 +447,14 @@ fn app_creator<'a>(
 /// `unsafe` calls.
 fn notify_software_renderer(app: &mut PdfCraftApp, device_type: eframe::wgpu::DeviceType) {
     if device_type == eframe::wgpu::DeviceType::Cpu {
-        app.notify_tr("PdfCraft is drawing without a graphics processor, so it may be slow. Updating the graphics driver may help.");
+        if app.session.view_only() {
+            app.notify(pdfcraft_ui_egui::identity::localized(
+                "SwiftPDF はグラフィックプロセッサーを使わずに描画しているため、動作が遅くなることがあります。グラフィックドライバーを更新すると改善する場合があります。",
+                "SwiftPDF is drawing without a graphics processor, so it may be slow. Updating the graphics driver may help.",
+            ));
+        } else {
+            app.notify_tr("PdfCraft is drawing without a graphics processor, so it may be slow. Updating the graphics driver may help.");
+        }
     }
 }
 
@@ -1334,6 +1344,7 @@ mod tests {
 
     /// X11 startup notification and docks match a window to its launcher by `StartupWMClass`,
     /// so it has to be the class the window carries: the app id, on Wayland and X11 alike.
+    #[cfg(not(windows))]
     #[test]
     fn the_desktop_entry_names_the_window_class() {
         let entry = include_str!("../../../packaging/linux/ai.storyteller.pdfcraft.desktop");

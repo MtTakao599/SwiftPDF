@@ -65,6 +65,11 @@ pub(crate) struct Updates {
 impl PdfCraftApp {
     /// Help ▸ Check for updates: ask for the latest release and show the outcome.
     pub fn check_for_updates(&mut self) {
+        // SwiftPDF is view-only and has no update server. Do not open the PdfCraft releases page.
+        if self.session.view_only() {
+            self.notify(crate::command_policy::REFUSED);
+            return;
+        }
         let Some(source) = self.update_source.clone() else {
             self.open_url(RELEASES_PAGE);
             return;

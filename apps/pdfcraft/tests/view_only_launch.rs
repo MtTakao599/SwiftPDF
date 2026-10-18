@@ -1,4 +1,4 @@
-//! SwiftPDF v0.1.0 is view-only: `pdfcraft --control <file>` doesn't start. It exits with an
+//! SwiftPDF v0.1.0 is view-only: `SwiftPDF --control <file>` doesn't start. It exits with an
 //! error before it opens a window, listens on a port, writes the control file or hands anything
 //! to a running instance.
 
@@ -15,7 +15,7 @@ fn the_control_channel_is_refused_before_anything_starts() {
     std::fs::create_dir_all(&data).unwrap();
     // The app's own folders (logs, the single-instance socket) go to a scratch folder, not the
     // user's.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pdfcraft"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_SwiftPDF"))
         .arg("--control")
         .arg(&control)
         .env("LOCALAPPDATA", &data)
@@ -35,7 +35,7 @@ fn the_control_channel_is_refused_before_anything_starts() {
         }
         if started.elapsed() > Duration::from_secs(60) {
             let _ = child.kill();
-            panic!("pdfcraft --control kept running: the launch wasn't refused");
+            panic!("SwiftPDF --control kept running: the launch wasn't refused");
         }
         std::thread::sleep(Duration::from_millis(50));
     };

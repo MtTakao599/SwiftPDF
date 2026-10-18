@@ -2829,7 +2829,7 @@ source = "Contributor-original (see assets/app-icon/README.md)"
 licence = "MIT OR Apache-2.0"
 licence_file = "assets/app-icon/LICENSE.txt"
 kind = "icon"
-usage = "Runtime window/Dock icon on macOS (apps/pdfcraft/src/main.rs)"
+usage = "PdfCraft's macOS icon grid artwork, kept with its licence. SwiftPDF's window icon is docs/images/SwiftPDFicon.png"
 sha256 = "da577d3f21fbcf5c739067787a9e683be2b064d76813b5d5fec9074a7a106538"
 
 [[asset]]
@@ -2851,8 +2851,41 @@ source = "Contributor-original (see assets/app-icon/README.md)"
 licence = "MIT OR Apache-2.0"
 licence_file = "assets/app-icon/LICENSE.txt"
 kind = "icon"
-usage = "Embedded in pdfcraft.exe by apps/pdfcraft/build.rs (Explorer, taskbar, Start menu, Alt-Tab)"
+usage = "PdfCraft's Windows icon, kept with its licence and origin. SwiftPDF.exe embeds assets/app-icon/swiftpdf.ico instead"
 sha256 = "56daaaae9ae5389794909570885809adf5e1d9183bef2d9669ed2f9bba3ed6f5"
+
+[[asset]]
+path = "assets/app-icon/swiftpdf.ico"
+title = "SwiftPDF app icon (Windows .ico, 16, 24, 32, 48, 64, 128 and 256 px)"
+author = "SwiftPDF project (official icon supplied for this distribution)"
+source = "Resampled from docs/images/SwiftPDFicon.png. Not derived from the PdfCraft icon."
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "icon"
+usage = "Embedded in SwiftPDF.exe as resources 1 and 2 by apps/pdfcraft/build.rs, and used by the MSI shortcut and PDF association icon. The artwork is the official icon; only the near-white matte outside the rounded tile is transparent."
+sha256 = "a1020e6507fe0dfa57d6a4df9ed85dfd84218e6915dbb3a666c3e98e3efa27c1"
+
+[[asset]]
+path = "docs/images/SwiftPDFicon-source.png"
+title = "SwiftPDF app icon, unprocessed source (1254 px, no alpha)"
+author = "SwiftPDF project (official icon supplied for this distribution)"
+source = "Supplied in this repository as the official SwiftPDF icon. Not derived from the PdfCraft icon."
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "icon"
+usage = "Unprocessed official icon, kept so the white matte can be regenerated. The window and Windows icons use docs/images/SwiftPDFicon.png."
+sha256 = "9f68879d7874b54e10d3e1a5c6aa152fe3119c817bd80f4ab18917aa3f139003"
+
+[[asset]]
+path = "docs/images/SwiftPDFicon.png"
+title = "SwiftPDF app icon (1254 px, exterior matte removed)"
+author = "SwiftPDF project (official icon supplied for this distribution)"
+source = "docs/images/SwiftPDFicon-source.png with only the near-white matte outside the rounded tile made transparent. Design, colors and the central symbol are unchanged."
+licence = "MIT OR Apache-2.0"
+licence_file = "LICENSE-MIT"
+kind = "icon"
+usage = "Runtime window icon (apps/pdfcraft/src/main.rs). assets/app-icon/swiftpdf.ico is resampled from this file."
+sha256 = "7ba6320411b6497ac6ae39d9711517ecd156333f4c5ba18f470869e4e8020ba0"
 
 [[asset]]
 path = "assets/app-icon/pdfcraft-document.svg"
@@ -2873,7 +2906,7 @@ source = "https://github.com/lucide-icons/lucide (npm lucide-static 1.49.0, icon
 licence = "ISC AND (MIT OR Apache-2.0)"
 licence_file = "assets/app-icon/LICENSE-document.txt"
 kind = "icon"
-usage = "Embedded in pdfcraft.exe as resource 2; the Windows installer uses it for PdfCraft.Document and Applications/pdfcraft.exe PDF file associations"
+usage = "PdfCraft's PDF document icon, kept with its Lucide and contributor licences. SwiftPDF.exe resource 2 and the SwiftPDF installer use assets/app-icon/swiftpdf.ico"
 sha256 = "ba3f9128b368fc6d17d376cf62dbdbc22455451c5c8c4779210d7a2a7409b9e6"
 
 [[asset]]
@@ -2950,7 +2983,7 @@ source = "Contributor-original (see assets/app-icon/README.md)"
 licence = "MIT OR Apache-2.0"
 licence_file = "assets/app-icon/LICENSE.txt"
 kind = "icon"
-usage = "Linux hicolor theme icon (packaging/linux/ai.storyteller.pdfcraft.desktop); runtime window icon on Windows and Linux (apps/pdfcraft/src/main.rs)"
+usage = "Linux hicolor theme icon (packaging/linux/ai.storyteller.pdfcraft.desktop). SwiftPDF's window icon is docs/images/SwiftPDFicon.png"
 sha256 = "cde7ee8c5ee38f9fc40a429fd9e6d99a035bcd321701fce331bb13bac126614d"
 
 [[asset]]

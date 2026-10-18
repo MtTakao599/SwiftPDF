@@ -1,8 +1,8 @@
 //! One PdfCraft per Windows sign-in or Linux/BSD display: a launch that only names files hands them
 //! to the PdfCraft that is already running, where they open as tabs, and exits (#282, #317, #1726).
 //!
-//! Outlook attachments, Explorer double-clicks and Open With all start `pdfcraft.exe "<file>"`, and
-//! a file manager or `xdg-open` starts `pdfcraft <file>` the same way, so until now every file got
+//! Outlook attachments, Explorer double-clicks and Open With all start `SwiftPDF.exe "<file>"`, and
+//! a file manager or `xdg-open` starts `SwiftPDF <file>` the same way, so until now every file got
 //! its own process and window. The first PdfCraft listens on a Unix domain socket. On Windows (10
 //! 1803 and later) it is in `%LOCALAPPDATA%\SwiftPDF` (never PdfCraft's folder, so SwiftPDF and
 //! PdfCraft never hand files to each other), under its own name for a portable copy,

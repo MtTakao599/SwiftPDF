@@ -53,8 +53,15 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let mut hits: Vec<(usize, Hit)> = Vec::new();
     let active = app.active_ids().map(|(_, id)| id);
     for spec in pdfcraft_engine::commands::COMMANDS {
+        if app.session.view_only() && crate::command_policy::hidden_in_view_only(spec.id) {
+            continue;
+        }
         let label = pdfcraft_engine::commands::current_label(spec, &app.session, active);
-        let translated = crate::i18n::command_label(&label);
+        let translated = if app.session.view_only() && spec.id == "help.about" {
+            crate::identity::localized("SwiftPDF について", "About SwiftPDF")
+        } else {
+            crate::i18n::command_label(&label)
+        };
         if let Some(s) = score(&translated, &q).or_else(|| score(&label, &q)).or_else(|| score(spec.id, &q).map(|s| s + 50)) {
             hits.push((
                 s,

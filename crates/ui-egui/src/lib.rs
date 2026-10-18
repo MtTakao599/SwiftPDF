@@ -2017,12 +2017,30 @@ impl PdfCraftApp {
             }
             Err(e) => {
                 use pdfcraft_engine::links::BlockedLink;
-                let template = if matches!(e, BlockedLink::MailFile | BlockedLink::MailEncodedWord) {
-                    "{who} in this document tried to open an address PdfCraft won't open: {e}."
+                let mail = matches!(e, BlockedLink::MailFile | BlockedLink::MailEncodedWord);
+                if self.session.view_only() {
+                    let template = if mail {
+                        crate::identity::localized(
+                            "この文書内の{who}が、SwiftPDF では開けないアドレスを開こうとしました：{e}。",
+                            "{who} in this document tried to open an address SwiftPDF won't open: {e}.",
+                        )
+                    } else {
+                        crate::identity::localized(
+                            "この文書内の{who}が、SwiftPDF では開けないアドレスを開こうとしました：{e}。文書から開けるのは、ウェブ（http、https）とメール（mailto）のリンクだけです。",
+                            "{who} in this document tried to open an address SwiftPDF won't open: {e}. Only web (http, https) and email (mailto) links open from documents.",
+                        )
+                    };
+                    let who = tl!(origin.noun()).to_string();
+                    let err = e.to_string();
+                    self.notify(i18n::fmt(&template, &[("who", who.as_str()), ("e", err.as_str())]));
                 } else {
-                    "{who} in this document tried to open an address PdfCraft won't open: {e}. Only web (http, https) and email (mailto) links open from documents."
-                };
-                self.notify_fmt(template, &[("who", tl!(origin.noun())), ("e", &e.to_string())]);
+                    let template = if mail {
+                        "{who} in this document tried to open an address PdfCraft won't open: {e}."
+                    } else {
+                        "{who} in this document tried to open an address PdfCraft won't open: {e}. Only web (http, https) and email (mailto) links open from documents."
+                    };
+                    self.notify_fmt(template, &[("who", tl!(origin.noun())), ("e", &e.to_string())]);
+                }
             }
         }
     }

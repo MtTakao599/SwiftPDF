@@ -1,5 +1,10 @@
 # PdfCraft app icon
 
+SwiftPDF does not use this artwork. Its window icon is `docs/images/SwiftPDFicon.png`, and
+`swiftpdf.ico` (16, 24, 32, 48, 64, 128 and 256 px, resampled from that PNG) is what
+`apps/pdfcraft/build.rs` embeds in `SwiftPDF.exe`. The files below stay so the PdfCraft icon's
+licence and origin remain on record.
+
 <img src="pdfcraft-small.svg" alt="PdfCraft app icon: an engraved lion's head on green" width="128">
 
 **Creature:** a lion, in a frontal head-and-shoulders portrait, mane running off the bottom of the tile.
@@ -30,23 +35,22 @@ Licence: [LICENSE.txt](LICENSE.txt) (`MIT OR Apache-2.0`, like the repo).
 |---|---|
 | `pdfcraft.svg` | the master vector (traced at 2048 px); every PNG, `.ico` and `.icns` is rendered from it |
 | `pdfcraft-small.svg` | a lighter vector (traced at 1024 px) for places where size matters, such as this README |
-| `pdfcraft-1024.png` | 1024 px on Apple's grid; also the runtime Dock icon on macOS |
+| `pdfcraft-1024.png` | 1024 px on Apple's grid; the PdfCraft macOS artwork, kept here |
 | `pdfcraft.icns` | macOS icon (16–1024 px) |
-| `pdfcraft.ico` | Windows icon (16–256 px), embedded in `pdfcraft.exe` by `apps/pdfcraft/build.rs` |
-| `pdfcraft-document.svg` | Windows PDF file icon master: a Lucide document outline, green badge and outlined PDF lettering; no font dependency |
-| `pdfcraft-document.ico` | Windows PDF file icon (16–256 px), embedded as resource 2 in `pdfcraft.exe` |
-| `hicolor/<n>x<n>/apps/ai.storyteller.pdfcraft.png` | Linux hicolor theme, 16–512 px; the 256 px one is the runtime icon on Windows and Linux |
+| `pdfcraft.ico` | PdfCraft Windows icon (16–256 px), kept here; SwiftPDF.exe embeds `swiftpdf.ico` |
+| `pdfcraft-document.svg` | PdfCraft PDF file icon master: a Lucide document outline, green badge and outlined PDF lettering; no font dependency |
+| `pdfcraft-document.ico` | PdfCraft PDF file icon (16–256 px), kept here; SwiftPDF uses `swiftpdf.ico` for resource 2 |
+| `hicolor/<n>x<n>/apps/ai.storyteller.pdfcraft.png` | Linux hicolor theme, 16–512 px |
 | `hicolor/scalable/apps/ai.storyteller.pdfcraft.svg` | Linux scalable icon (copy of the master) |
 
-Where it shows: `apps/pdfcraft/src/main.rs` sets the window icon (Dock, taskbar, Alt-Tab, launcher) and the
-Wayland app id `ai.storyteller.pdfcraft`; `packaging/linux/ai.storyteller.pdfcraft.desktop` names the
-hicolor icon.
+The Linux `.desktop` file still names the hicolor icon and the window class `ai.storyteller.pdfcraft`.
+SwiftPDF on Windows uses `docs/images/SwiftPDFicon.png` for the window and `swiftpdf.ico` for the
+executable, shortcuts and PDF association.
 
-Windows PDF files use resource 2 (`"pdfcraft.exe",-2`) when PdfCraft is chosen as the default
-reader; the app keeps resource 1. The document outline is adapted from Lucide `file-text`
-1.49.0 (ISC); its badge and outlined lettering are original (`MIT OR Apache-2.0`), covered by
-[LICENSE-document.txt](LICENSE-document.txt). Both icons are embedded, requiring no runtime
-sidecar. This provides a file type icon; first-page thumbnails still need a thumbnail provider.
+The PdfCraft document outline is adapted from Lucide `file-text` 1.49.0 (ISC); its badge and
+outlined lettering are original (`MIT OR Apache-2.0`), covered by
+[LICENSE-document.txt](LICENSE-document.txt). That file stays with this artwork. SwiftPDF does
+not embed it.
 
 ## Regenerate
 

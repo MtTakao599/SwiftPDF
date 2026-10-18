@@ -308,7 +308,7 @@ fn a_narrow_window_keeps_the_switch_and_room_for_a_tab() {
         assert!(detailed.right() <= width, "{width}: the switch is in the window: {detailed:?}");
         assert!(h.get_by_label_contains("Display theme:").rect().right() <= simple.left(), "{width}: the switch is the rightmost button");
         assert!(h.get_by_label("Open").rect().right() <= simple.left(), "{width}: Open stays left of the switch");
-        assert!(h.get_by_label("Discord").rect().right() <= simple.left(), "{width}: Discord stays, as an icon if need be");
+        assert!(h.query_by_label("Discord").is_none(), "{width}: view-only hides Discord");
         let active = h.get_by_label("narrow-11.pdf").rect();
         let (home, open) = (h.get_by_label("Home").rect(), h.get_by_label("Open").rect());
         assert!(active.left() > home.right() && active.right() <= open.left(), "{width}: the active tab {active:?} is in full view");

@@ -1,223 +1,186 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  PdfCraft MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
+  SwiftPDF MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
 
     wix build pdfcraft.wxs installer-ui.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d ModelsDir=... -d IconPath=... -o out.msi
 
-  Per-machine install into Program Files, a Start Menu shortcut, a desktop shortcut (on by default,
-  optional, and an update keeps it only if it is still there), an App Paths entry, PdfCraft registered as a PDF handler (offered under "Open with"
-  and in Default apps, never forced as the default), "Edit with PdfCraft" on PDF files'
-  right-click menu and "Create PDF with PdfCraft…" on image files' right-click menu (both on by
-  default, optional, and an update keeps the installed version's choice). Files opened with
-  PdfCraft arrive on its command line.
+  Per-machine install into Program Files\SwiftPDF. Start Menu and desktop shortcuts are named
+  SwiftPDF. App Paths, the PDF ProgID and RegisteredApplications are SwiftPDF's own keys.
+  SwiftPDF is offered under "Open with" and in Default apps, and never replaces the existing
+  default for .pdf. An optional "Open with SwiftPDF" entry is added to the PDF right-click menu.
+  This package does not register edit or create-PDF commands, and it does not read or write
+  PdfCraft's UpgradeCode, component ids, install folder or registry keys.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="PdfCraft"
-      Manufacturer="Learning Machines LLC"
+      Name="SwiftPDF"
+      Manufacturer="SwiftPDF"
       Version="$(var.Version)"
-      UpgradeCode="EA00C367-7270-4C50-9D8B-A7A5C88AD27F"
+      UpgradeCode="2BE82895-B377-4701-A51F-E03759ECEF56"
       Scope="perMachine"
       Compressed="yes"
       Language="1033">
-    <SummaryInformation Description="PdfCraft PDF workbench" Manufacturer="Learning Machines LLC" />
-    <!-- HKLM registrations must never point into a per-user installation (#305). Allow removal
-         of an existing installation even if an older MSI let it install per-user. -->
+    <!-- WiX requires a non-empty Manufacturer. Windows shows it as the publisher in
+         Apps & Features. SwiftPDF is the product name used there; it is not a legal entity,
+         and no personal or company name is invented for this package. -->
+    <SummaryInformation Description="SwiftPDF" Manufacturer="SwiftPDF" />
+    <!-- HKLM registrations must never point into a per-user installation. Allow removal
+         of an existing SwiftPDF installation even if an older MSI let it install per-user. -->
     <Launch Condition="ALLUSERS = 1 OR (Installed AND REMOVE = &quot;ALL&quot;)"
-        Message="PdfCraft must be installed for all users. Run setup with administrator privileges and ALLUSERS=1; per-user installation is not supported." />
+        Message="SwiftPDF must be installed for all users. Run setup with administrator privileges and ALLUSERS=1; per-user installation is not supported." />
     <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
          (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="A newer version of PdfCraft is already installed." />
+        DowngradeErrorMessage="A newer version of SwiftPDF is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <!-- Windows Installer requires an Icon id ending in .ico or .exe, or advertised shortcuts and
-         Add/Remove Programs show a blank icon (#57). -->
-    <Icon Id="PdfcraftIcon.ico" SourceFile="$(var.IconPath)" />
-    <Property Id="ARPPRODUCTICON" Value="PdfcraftIcon.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://getartcraft.com/apps/pdfcraft" />
-    <Property Id="ARPURLUPDATEINFO" Value="https://getartcraft.com/apps/pdfcraft" />
-    <Property Id="ARPHELPLINK" Value="https://discord.gg/artcraft" />
-    <!-- Desktop shortcut (#143): on by default for a first install, a checkbox in the full-UI
+         Add/Remove Programs show a blank icon. -->
+    <Icon Id="SwiftPdfIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="SwiftPdfIcon.ico" />
+    <!-- No support site, Discord or update page. Those ARP links are omitted so Apps & Features
+         does not send people to ArtCraft or PdfCraft. -->
+    <!-- Desktop shortcut: on by default for a first install, a checkbox in the full-UI
          welcome dialog, and INSTALLDESKTOPSHORTCUT=0 on the msiexec command line for unattended
          installs. Secure, so the choice made in the (unelevated) UI reaches the elevated install.
-         An update keeps the shortcut only if it is still on the desktop (#1058): the launcher
-         updates with /passive and no properties, so deleting the shortcut is the only way its
-         users can say no. A value given on the command line wins. -->
+         An update keeps the shortcut only if it is still on the desktop. A value given on the
+         command line wins. -->
     <Property Id="INSTALLDESKTOPSHORTCUT" Secure="yes" />
     <Property Id="EXISTINGDESKTOPSHORTCUT">
       <DirectorySearch Id="DesktopSearch" Path="[DesktopFolder]" Depth="0">
-        <FileSearch Name="PdfCraft.lnk" />
+        <FileSearch Name="SwiftPDF.lnk" />
       </DirectorySearch>
     </Property>
     <SetProperty Id="INSTALLDESKTOPSHORTCUT" Value="1" After="AppSearch" Sequence="first"
         Condition="NOT INSTALLDESKTOPSHORTCUT AND (NOT WIX_UPGRADE_DETECTED OR EXISTINGDESKTOPSHORTCUT)" />
-    <!-- The File Explorer menus: "Edit with PdfCraft" for PDF files (#682) and "Create PDF with
-         PdfCraft…" for images (#190). Each is on by default for a first install and has a property
-         to leave it out of unattended installs: INSTALLPDFCONTEXTMENU=0 (also a welcome-dialog
-         checkbox) and INSTALLIMAGECONTEXTMENU=0. Secure, like the desktop shortcut's.
-         An update keeps the installed version's choice (#305) by looking for the menu's registry
-         key, the way the desktop shortcut looks for its file: AppSearch runs before the old version
-         is removed. Releases from before a menu existed (the PDF one came in 0.7.1, the image one in
-         0.4.0) never had the key, so updating from one of them counts as a first install; the
-         OnlyDetect rows below tell them apart. A value given on the command line wins. -->
-    <Upgrade Id="EA00C367-7270-4C50-9D8B-A7A5C88AD27F">
-      <UpgradeVersion Minimum="0.7.1" IncludeMinimum="yes" OnlyDetect="yes" Property="PDFCONTEXTMENURELEASE" />
-      <UpgradeVersion Minimum="0.4.0" IncludeMinimum="yes" OnlyDetect="yes" Property="IMAGECONTEXTMENURELEASE" />
-    </Upgrade>
-    <Property Id="INSTALLPDFCONTEXTMENU" Secure="yes" />
-    <Property Id="EXISTINGPDFCONTEXTMENU">
-      <RegistrySearch Id="PdfContextMenuSearch" Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit" Type="raw" />
+    <!-- "Open with SwiftPDF" on PDF files. On for a first install. An update keeps it only while
+         SwiftPDF's own menu key is still present. WIX_UPGRADE_DETECTED is this package's
+         UpgradeCode, so an installed PdfCraft does not count. -->
+    <Property Id="INSTALLOPENWITH" Secure="yes" />
+    <Property Id="EXISTINGOPENWITH">
+      <RegistrySearch Id="OpenWithSearch" Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\SwiftPDF.Open" Type="raw" />
     </Property>
-    <SetProperty Id="INSTALLPDFCONTEXTMENU" Value="1" After="AppSearch" Sequence="first"
-        Condition="NOT INSTALLPDFCONTEXTMENU AND (NOT PDFCONTEXTMENURELEASE OR EXISTINGPDFCONTEXTMENU)" />
-    <Property Id="INSTALLIMAGECONTEXTMENU" Secure="yes" />
-    <Property Id="EXISTINGIMAGECONTEXTMENU">
-      <RegistrySearch Id="ImageContextMenuSearch" Root="HKLM" Key="Software\Classes\SystemFileAssociations\.png\shell\PdfCraft.CreatePdf" Type="raw" />
-    </Property>
-    <SetProperty Id="INSTALLIMAGECONTEXTMENU" Value="1" After="AppSearch" Sequence="first"
-        Condition="NOT INSTALLIMAGECONTEXTMENU AND (NOT IMAGECONTEXTMENURELEASE OR EXISTINGIMAGECONTEXTMENU)" />
-    <UIRef Id="PdfcraftInstallerUI" />
+    <SetProperty Id="INSTALLOPENWITH" Value="1" After="AppSearch" Sequence="first"
+        Condition="NOT INSTALLOPENWITH AND (NOT WIX_UPGRADE_DETECTED OR EXISTINGOPENWITH)" />
+    <UIRef Id="SwiftPdfInstallerUI" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="PdfCraft">
+      <Directory Id="INSTALLFOLDER" Name="SwiftPDF">
         <Directory Id="ModelsFolder" Name="models" />
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
     <StandardDirectory Id="DesktopFolder" />
 
-    <Feature Id="Main" Title="PdfCraft" Level="1">
-      <ComponentGroupRef Id="PdfcraftFiles" />
-      <ComponentGroupRef Id="PdfcraftModels" />
+    <Feature Id="Main" Title="SwiftPDF" Level="1">
+      <ComponentGroupRef Id="SwiftPdfFiles" />
+      <ComponentGroupRef Id="SwiftPdfModels" />
     </Feature>
   </Package>
 
   <Fragment>
-    <ComponentGroup Id="PdfcraftFiles" Directory="INSTALLFOLDER">
-      <Component Id="PdfcraftApp" Guid="E724C1C6-091F-4E21-A685-80D089FDBE21">
-        <File Id="PdfcraftExe" Source="$(var.BinDir)\pdfcraft.exe" KeyPath="yes" />
+    <ComponentGroup Id="SwiftPdfFiles" Directory="INSTALLFOLDER">
+      <Component Id="SwiftPdfApp" Guid="55EB12B3-D4D6-41A7-A26F-655E7145AE4F">
+        <File Id="SwiftPdfExe" Source="$(var.BinDir)\SwiftPDF.exe" KeyPath="yes" />
 
-        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\pdfcraft.exe" Value="[#PdfcraftExe]" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\SwiftPDF.exe" Value="[#SwiftPdfExe]" Type="string" />
 
-        <!-- PDF files (#107): PdfCraft is offered under "Open with" and in Settings ▸ Default
-             apps, through Windows' Default Programs registration (a ProgID, OpenWithProgids,
-             Capabilities and RegisteredApplications). It never takes over an existing default:
-             .pdf's own default value is left alone, and the user chooses. Without this, the only
-             PdfCraft entry to pick was the advertised Start Menu shortcut, which Windows can't
-             run as a file handler ("This app can't run on your PC"). -->
-        <RegistryValue Root="HKLM" Key="Software\Classes\PdfCraft.Document" Value="PDF Document" Type="string" />
+        <!-- PDF files: SwiftPDF is offered under "Open with" and in Settings ▸ Default apps.
+             .pdf's own default value is left alone, and the user chooses. -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\SwiftPDF.Document" Value="PDF Document" Type="string" />
         <!-- A negative index selects the stable icon resource ID, rather than its position.
-             Resource 1 is the app's lion; resource 2 is the PDF document (build.rs). -->
-        <RegistryValue Root="HKLM" Key="Software\Classes\PdfCraft.Document\DefaultIcon" Value="&quot;[#PdfcraftExe]&quot;,-2" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\PdfCraft.Document\shell\open\command" Value="&quot;[#PdfcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\.pdf\OpenWithProgids" Name="PdfCraft.Document" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pdfcraft.exe" Name="FriendlyAppName" Value="PdfCraft" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pdfcraft.exe\DefaultIcon" Value="&quot;[#PdfcraftExe]&quot;,-2" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pdfcraft.exe\SupportedTypes" Name=".pdf" Value="" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\pdfcraft.exe\shell\open\command" Value="&quot;[#PdfcraftExe]&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Capabilities" Name="ApplicationName" Value="PdfCraft" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Capabilities" Name="ApplicationDescription" Value="Open-source PDF workbench" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Capabilities" Name="ApplicationIcon" Value="[#PdfcraftExe],0" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Capabilities\FileAssociations" Name=".pdf" Value="PdfCraft.Document" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\RegisteredApplications" Name="PdfCraft" Value="Software\PdfCraft\Capabilities" Type="string" />
+             Resource 1 is the app icon; resource 2 is the PDF document (build.rs). -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\SwiftPDF.Document\DefaultIcon" Value="&quot;[#SwiftPdfExe]&quot;,-2" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SwiftPDF.Document\shell\open\command" Value="&quot;[#SwiftPdfExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.pdf\OpenWithProgids" Name="SwiftPDF.Document" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\SwiftPDF.exe" Name="FriendlyAppName" Value="SwiftPDF" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\SwiftPDF.exe\DefaultIcon" Value="&quot;[#SwiftPdfExe]&quot;,-2" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\SwiftPDF.exe\SupportedTypes" Name=".pdf" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\SwiftPDF.exe\shell\open\command" Value="&quot;[#SwiftPdfExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Capabilities" Name="ApplicationName" Value="SwiftPDF" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Capabilities" Name="ApplicationDescription" Value="View PDF files" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Capabilities" Name="ApplicationIcon" Value="[#SwiftPdfExe],0" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Capabilities\FileAssociations" Name=".pdf" Value="SwiftPDF.Document" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\RegisteredApplications" Name="SwiftPDF" Value="Software\SwiftPDF\Capabilities" Type="string" />
       </Component>
 
-      <!-- Shortcuts (#143) are plain links to pdfcraft.exe, not advertised MSI shortcuts: advertised
-           ones point at a Windows Installer descriptor rather than the program, which Windows can't
-           use as a file handler (#107), and 0.2.1's advertised one went missing from the Start menu
-           (#143). Each has its own component with an HKLM key path, so Windows Installer removes it
-           on uninstall; in this per-machine package both folders are the all-users ones. -->
-      <Component Id="PdfcraftStartMenuShortcut" Directory="ProgramMenuFolder" Guid="DC028192-C233-4F99-9A77-ED458C60DF26">
-        <Shortcut Id="StartMenuShortcut" Name="PdfCraft" Description="PdfCraft PDF workbench"
-            Target="[#PdfcraftExe]" WorkingDirectory="INSTALLFOLDER" Icon="PdfcraftIcon.ico" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Shortcuts" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      <!-- Shortcuts are plain links to SwiftPDF.exe, not advertised MSI shortcuts. Each has its
+           own component with an HKLM key path, so Windows Installer removes it on uninstall. -->
+      <Component Id="SwiftPdfStartMenuShortcut" Directory="ProgramMenuFolder" Guid="20020BE4-7332-4EE0-92F9-B0377A83443C">
+        <Shortcut Id="StartMenuShortcut" Name="SwiftPDF" Description="SwiftPDF"
+            Target="[#SwiftPdfExe]" WorkingDirectory="INSTALLFOLDER" Icon="SwiftPdfIcon.ico" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Shortcuts" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
-      <Component Id="PdfcraftDesktopShortcut" Directory="DesktopFolder" Guid="F6948627-32AB-4D78-8865-0FDF417CE442"
+      <Component Id="SwiftPdfDesktopShortcut" Directory="DesktopFolder" Guid="17FDFB9A-B361-4D44-8858-E945FCA9CBBD"
           Condition="INSTALLDESKTOPSHORTCUT = 1">
-        <Shortcut Id="DesktopShortcut" Name="PdfCraft" Description="PdfCraft PDF workbench"
-            Target="[#PdfcraftExe]" WorkingDirectory="INSTALLFOLDER" Icon="PdfcraftIcon.ico" IconIndex="0" />
-        <RegistryValue Root="HKLM" Key="Software\PdfCraft\Shortcuts" Name="Desktop" Type="integer" Value="1" KeyPath="yes" />
+        <Shortcut Id="DesktopShortcut" Name="SwiftPDF" Description="SwiftPDF"
+            Target="[#SwiftPdfExe]" WorkingDirectory="INSTALLFOLDER" Icon="SwiftPdfIcon.ico" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\SwiftPDF\Shortcuts" Name="Desktop" Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
-      <!-- PDF context menu (#682): "Edit with PdfCraft" opens the file in PdfCraft whichever app is
-           the default for .pdf, which it leaves alone (SystemFileAssociations, like the image
-           menu). Several PDFs selected (up to 15, Windows' limit for this kind of entry) start one
-           launch each, and the single-instance hand-off opens them as tabs of one window. On
-           Windows 11 the entry is under "Show more options": the first-level menu only takes
-           packaged apps' (IExplorerCommand) entries. Its own component with an HKLM key path, so
-           INSTALLPDFCONTEXTMENU=0 leaves it out and uninstall removes it. -->
-      <Component Id="PdfcraftPdfContextMenu" Guid="439F084F-657D-4AC2-A4CC-F099C518D71F"
-          Condition="INSTALLPDFCONTEXTMENU = 1">
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit" Value="Edit with PdfCraft" Type="string" KeyPath="yes" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit" Name="Icon" Value="&quot;[#PdfcraftExe]&quot;,0" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit" Name="MultiSelectModel" Value="Document" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\PdfCraft.Edit\command" Value="&quot;[#PdfcraftExe]&quot; &quot;%1&quot;" Type="string" />
+      <!-- "Open with SwiftPDF" opens the file whichever app is the default for .pdf. On Windows 11
+           the entry is under "Show more options". Its own component with an HKLM key path, so
+           INSTALLOPENWITH=0 leaves it out and uninstall removes it. -->
+      <Component Id="SwiftPdfOpenMenu" Guid="75D5BCA9-EEF3-4B9F-9323-1294CE36D116"
+          Condition="INSTALLOPENWITH = 1">
+        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\SwiftPDF.Open" Value="Open with SwiftPDF" Type="string" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\SwiftPDF.Open" Name="Icon" Value="&quot;[#SwiftPdfExe]&quot;,0" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\SwiftPDF.Open" Name="MultiSelectModel" Value="Document" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.pdf\shell\SwiftPDF.Open\command" Value="&quot;[#SwiftPdfExe]&quot; &quot;%1&quot;" Type="string" />
       </Component>
 
-      <!-- Image context menu (#190): "Create PDF with PdfCraft…" opens the DPI chooser, without
-           changing image file defaults. Its own component with an HKLM key path, so
-           INSTALLIMAGECONTEXTMENU=0 leaves it out and uninstall removes it. These rows were in
-           PdfcraftApp up to 0.7.1; moving them is safe because MajorUpgrade removes the old version
-           before installing (afterInstallValidate), so no old row is left behind. -->
-      <Component Id="PdfcraftImageContextMenu" Guid="1B783BF3-12DF-4588-AF80-E2CEA8BC1E5A"
-          Condition="INSTALLIMAGECONTEXTMENU = 1">
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.png\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" KeyPath="yes" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.png\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.png\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpg\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpg\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpg\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpeg\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpeg\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpeg\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tif\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tif\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tif\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tiff\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tiff\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tiff\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.gif\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.gif\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.gif\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.bmp\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.bmp\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.bmp\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jp2\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jp2\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jp2\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.j2k\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.j2k\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.j2k\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpx\shell\PdfCraft.CreatePdf" Value="Create PDF with PdfCraft…" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpx\shell\PdfCraft.CreatePdf" Name="MultiSelectModel" Value="Single" Type="string" />
-        <RegistryValue Root="HKLM" Key="Software\Classes\SystemFileAssociations\.jpx\shell\PdfCraft.CreatePdf\command" Value="&quot;[#PdfcraftExe]&quot; --create-images &quot;%1&quot;" Type="string" />
+      <!-- The embedded PDF icon's ISC notice and project licences travel with the binary. -->
+      <Component Id="SwiftPdfDocumentIconLicense" Guid="5F98A897-B0FE-4E1F-8D3D-012A09402174">
+        <File Id="SwiftPdfDocumentIconLicenseFile" Source="$(var.BinDir)\LICENSE-document.txt" KeyPath="yes" />
       </Component>
-
-      <Component Id="PdfcraftCli">
-        <File Id="PdfcraftCliExe" Source="$(var.BinDir)\pdfcraft-cli.exe" KeyPath="yes" />
+      <Component Id="SwiftPdfMitLicense" Guid="BE48E106-A665-488A-A933-92AE1AD7B9B6">
+        <File Id="SwiftPdfMitLicenseFile" Source="$(var.BinDir)\LICENSE-MIT" KeyPath="yes" />
       </Component>
-      <!-- The embedded PDF icon's ISC notice and project licences travel with the binaries. -->
-      <Component Id="PdfcraftDocumentIconLicense">
-        <File Id="PdfcraftDocumentIconLicenseFile" Source="$(var.BinDir)\LICENSE-document.txt" KeyPath="yes" />
+      <Component Id="SwiftPdfApacheLicense" Guid="00188FEC-E3C7-4AE3-B89C-7E352122C0B6">
+        <File Id="SwiftPdfApacheLicenseFile" Source="$(var.BinDir)\LICENSE-APACHE" KeyPath="yes" />
       </Component>
-      <Component Id="PdfcraftMitLicense">
-        <File Id="PdfcraftMitLicenseFile" Source="$(var.BinDir)\LICENSE-MIT" KeyPath="yes" />
+      <Component Id="SwiftPdfNotice" Guid="AB05D169-73FE-440B-AC2E-302E176BC84C">
+        <File Id="SwiftPdfNoticeFile" Source="$(var.BinDir)\NOTICE" KeyPath="yes" />
       </Component>
-      <Component Id="PdfcraftApacheLicense">
-        <File Id="PdfcraftApacheLicenseFile" Source="$(var.BinDir)\LICENSE-APACHE" KeyPath="yes" />
+      <!-- OFL-1.1 licences for the faces embedded in SwiftPDF.exe. Not PdfCraft component ids. -->
+      <Component Id="SwiftPdfOflBizUdPgothic" Guid="2D4CED90-02E3-4205-ACCF-92E853E9EB5C">
+        <File Id="SwiftPdfOflBizUdPgothicFile" Source="$(var.BinDir)\OFL-biz-ud-pgothic.txt" KeyPath="yes" />
       </Component>
-      <Component Id="PdfcraftNotice">
-        <File Id="PdfcraftNoticeFile" Source="$(var.BinDir)\NOTICE" KeyPath="yes" />
+      <Component Id="SwiftPdfOflBizUdMincho" Guid="57CC7233-5B9E-4EC7-84EA-82B4A826C9D3">
+        <File Id="SwiftPdfOflBizUdMinchoFile" Source="$(var.BinDir)\OFL-biz-ud-mincho.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflShipporiMincho" Guid="5D783F96-FC1E-4537-A916-73EE16344071">
+        <File Id="SwiftPdfOflShipporiMinchoFile" Source="$(var.BinDir)\OFL-shippori-mincho.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflNotoSansArabic" Guid="5D11A0C1-A73D-49C8-8D56-829DF5620822">
+        <File Id="SwiftPdfOflNotoSansArabicFile" Source="$(var.BinDir)\OFL-noto-sans-arabic.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflNotoSansThai" Guid="81D5B6E1-6951-4265-B30E-C0A57AA3A1FA">
+        <File Id="SwiftPdfOflNotoSansThaiFile" Source="$(var.BinDir)\OFL-noto-sans-thai.txt" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
-    <!-- OCR models (#103), with their licences and ATTRIBUTION.txt, in models\ beside pdfcraft.exe
-         where the app looks for them: every file `cargo xtask models` fetched (package.ps1), one
-         component each, so new models ship without naming them here. -->
-    <ComponentGroup Id="PdfcraftModels" Directory="ModelsFolder">
-      <Files Include="$(var.ModelsDir)\*" />
+    <!-- OCR models, with their licences and ATTRIBUTION.txt, in models\ beside SwiftPDF.exe.
+         Each file has its own GUID. A wildcard harvest would reuse WiX's path-based GUID, which
+         can match PdfCraft when the file name and directory id are the same. package.ps1 rejects
+         a models folder that gains or loses a file, so a new model cannot ship without a new GUID. -->
+    <ComponentGroup Id="SwiftPdfModels" Directory="ModelsFolder">
+      <Component Id="SwiftPdfModelDetection" Guid="752CA59E-86AB-4006-8206-FCAE51756ADB">
+        <File Id="SwiftPdfModelDetectionFile" Source="$(var.ModelsDir)\text-detection.rten" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfModelRecognition" Guid="3BD6A1A4-0559-4633-95A7-6ACAF09B2461">
+        <File Id="SwiftPdfModelRecognitionFile" Source="$(var.ModelsDir)\text-recognition.rten" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfModelDetectionLicense" Guid="A0DFC9B8-82D5-4955-9EF1-C43BA222E8BB">
+        <File Id="SwiftPdfModelDetectionLicenseFile" Source="$(var.ModelsDir)\text-detection.rten.LICENCE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfModelRecognitionLicense" Guid="511CE02A-7BF4-463F-B7D9-E72BE1109C00">
+        <File Id="SwiftPdfModelRecognitionLicenseFile" Source="$(var.ModelsDir)\text-recognition.rten.LICENCE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfModelAttribution" Guid="1DACAAE2-972E-4274-9F7C-0459C28BDA42">
+        <File Id="SwiftPdfModelAttributionFile" Source="$(var.ModelsDir)\ATTRIBUTION.txt" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>

@@ -22,7 +22,13 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin { left: 36, right: 36, top: 28, bottom: 28 }).show(ui, |ui| {
-            ui.label(egui::RichText::new(tl!("Welcome to PdfCraft")).font(theme::semibold(24.0)));
+            let view_only = app.session.view_only();
+            let welcome = if view_only {
+                crate::identity::localized("SwiftPDF へようこそ", "Welcome to SwiftPDF")
+            } else {
+                tl!("Welcome to PdfCraft").to_string()
+            };
+            ui.label(egui::RichText::new(welcome).font(theme::semibold(24.0)));
             ui.label(
                 egui::RichText::new(tl!("An open-source PDF workbench — local, private, and scriptable."))
                     .color(t.text_muted)
@@ -31,7 +37,6 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             ui.add_space(14.0);
             // A view-only app has nothing to promote and no editing tools to recommend. Both come
             // back with editing; Open file, folders and the recent list stay.
-            let view_only = app.session.view_only();
             if !view_only {
                 egui::Frame::NONE
                     .fill(t.card)
@@ -154,7 +159,15 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             });
             ui.add_space(8.0);
             if app.recent.is_empty() {
-                ui.label(egui::RichText::new(tl!("Files you open in PdfCraft appear here. Drop a PDF anywhere to open it.")).color(t.text_muted));
+                let empty = if view_only {
+                    crate::identity::localized(
+                        "SwiftPDF で開いたファイルがここに表示されます。PDF をウィンドウにドロップして開くこともできます。",
+                        "Files you open in SwiftPDF appear here. Drop a PDF anywhere to open it.",
+                    )
+                } else {
+                    tl!("Files you open in PdfCraft appear here. Drop a PDF anywhere to open it.").to_string()
+                };
+                ui.label(egui::RichText::new(empty).color(t.text_muted));
             }
             let mut open = None;
             let mut remove = None;
@@ -220,7 +233,14 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             ui.add_space(20.0);
             widgets::section_title(ui, tl!("Privacy"));
             ui.label(
-                egui::RichText::new(tl!("PdfCraft works offline. No telemetry, no account, and no cloud processing unless you add a provider."))
+                egui::RichText::new(if view_only {
+                    crate::identity::localized(
+                        "SwiftPDF はオフラインで動作します。使用状況の送信やアカウント登録はありません。サービス提供元を追加しない限り、クラウド処理も行いません。",
+                        "SwiftPDF works offline. No telemetry, no account, and no cloud processing unless you add a provider.",
+                    )
+                } else {
+                    tl!("PdfCraft works offline. No telemetry, no account, and no cloud processing unless you add a provider.").to_string()
+                })
                     .color(t.text_muted),
             );
         });

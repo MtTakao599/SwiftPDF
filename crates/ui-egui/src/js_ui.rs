@@ -380,7 +380,15 @@ pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tok
     ui.label(egui::RichText::new(tl!("For page sizes and margins.")).small().color(t.text_muted));
     // The web build has no file paths to reopen.
     #[cfg(not(target_arch = "wasm32"))]
-    ui.add(widgets::checkbox(&mut app.reopen_last_session, tl!("Reopen the files that were open when PdfCraft last closed")));
+    let reopen = if app.session.view_only() {
+        crate::identity::localized(
+            "前回 SwiftPDF を閉じたときに開いていたファイルを再度開く",
+            "Reopen the files that were open when SwiftPDF last closed",
+        )
+    } else {
+        tl!("Reopen the files that were open when PdfCraft last closed").to_string()
+    };
+    ui.add(widgets::checkbox(&mut app.reopen_last_session, reopen));
     // The web build has no files on disk to watch.
     #[cfg(not(target_arch = "wasm32"))]
     ui.add(widgets::checkbox(&mut app.reload_changed_files, tl!("Reload documents when their files change on disk")));

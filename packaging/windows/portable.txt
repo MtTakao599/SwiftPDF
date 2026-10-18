@@ -1,9 +1,8 @@
-PdfCraft portable mode
+SwiftPDF portable mode
 
-While this file sits next to pdfcraft.exe, PdfCraft keeps its settings, log files, crash-recovery
-autosaves and new digital IDs in the PdfCraftData folder beside it, and writes nothing to
-%APPDATA% or %LOCALAPPDATA%. Copy the whole folder to move PdfCraft with its settings.
+While this file sits next to SwiftPDF.exe, SwiftPDF keeps its settings, log files, crash-recovery
+autosaves and new digital IDs in the Data folder beside it, and writes nothing to
+%APPDATA% or %LOCALAPPDATA%. Copy the whole folder, including Data, to move SwiftPDF with its settings.
 
-Delete this file to use the normal per-user folders (%APPDATA%\PdfCraft and
-%LOCALAPPDATA%\PdfCraft) instead. If PdfCraftData can't be written (for example on a read-only
-drive), PdfCraft says so and uses the per-user folders instead.
+Delete this file to use the normal per-user folder (%LOCALAPPDATA%\SwiftPDF) instead. If Data
+can't be written (for example on a read-only drive), SwiftPDF says so and uses the per-user folder instead.

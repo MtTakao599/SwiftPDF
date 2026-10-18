@@ -1152,8 +1152,11 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     1 => crate::credits::contributors_ui(ui),
                     2 => crate::credits::models_ui(ui),
                     _ => {
+                        let view_only = app.session.view_only();
                         ui.horizontal(|ui| {
-                            widgets::artcraft_mark(ui, 40.0);
+                            if !view_only {
+                                widgets::artcraft_mark(ui, 40.0);
+                            }
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(crate::identity::APP_NAME).font(theme::semibold(20.0)));
                                 ui.label(crate::i18n::fmt(tl!("Version {v}"), &[("v", &pdfcraft_engine::build_info::version())]));
@@ -1169,13 +1172,20 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                             .small(),
                         );
                         ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(tl!("Part of")).color(t.text_muted));
-                            widgets::artcraft_logo(ui, 16.0);
-                        });
-                        ui.add_space(6.0);
-                        if let Some(cmd) = widgets::community_links(ui) {
-                            link_command = Some(cmd);
+                        if view_only {
+                            ui.label(crate::identity::localized(
+                                "PdfCraft を基にしています。Copyright (c) the PdfCraft contributors.",
+                                "Based on PdfCraft. Copyright (c) the PdfCraft contributors.",
+                            ));
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(tl!("Part of")).color(t.text_muted));
+                                widgets::artcraft_logo(ui, 16.0);
+                            });
+                            ui.add_space(6.0);
+                            if let Some(cmd) = widgets::community_links(ui) {
+                                link_command = Some(cmd);
+                            }
                         }
                     }
                 }

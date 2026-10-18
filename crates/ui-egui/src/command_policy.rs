@@ -62,13 +62,17 @@ const VIEW_ONLY: &[&str] = &[
     // The app.
     "app.preferences",
     "help.shortcuts",
-    "help.discord",
-    "help.app_page",
-    "help.github",
-    "help.website",
-    "help.check_updates",
     "help.about",
 ];
+
+/// Help commands that would open a PdfCraft or ArtCraft page, or check that project for updates.
+/// A view-only SwiftPDF session neither runs them nor shows them.
+const HIDDEN_IN_VIEW_ONLY: &[&str] = &["help.discord", "help.app_page", "help.github", "help.website", "help.check_updates"];
+
+/// Whether a view-only session hides this command instead of offering it.
+pub(crate) fn hidden_in_view_only(id: &str) -> bool {
+    HIDDEN_IN_VIEW_ONLY.contains(&id)
+}
 
 /// Whether a view-only session runs the command `id`; unknown commands don't.
 pub fn allowed_in_view_only(id: &str) -> bool {
@@ -172,6 +176,11 @@ mod tests {
             "edit.redo",
             "tools.js_console",
             "tools.document_js",
+            "help.discord",
+            "help.app_page",
+            "help.github",
+            "help.website",
+            "help.check_updates",
             "no.such.command",
             "",
         ] {

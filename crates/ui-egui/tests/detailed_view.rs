@@ -107,8 +107,26 @@ fn a_view_only_detailed_window_keeps_reading_and_hides_editing() {
     h.run_steps(3);
     assert!(h.query_by_label_contains("ArtCraft community").is_none());
     assert!(h.query_by_label_contains("Recommended tools").is_none());
+    assert!(h.query_by_label_contains("Welcome to SwiftPDF").is_some(), "the detailed home names SwiftPDF");
+    assert!(h.query_by_label_contains("Welcome to PdfCraft").is_none(), "the detailed home does not name PdfCraft");
     assert!(h.query_by_label("Open file").is_some());
     assert_eq!(h.state().views.len(), 2, "Home closes nothing");
+}
+
+#[test]
+fn the_detailed_home_names_swiftpdf_in_japanese() {
+    let _serial = serial();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "ja").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.set_ui_mode(UiMode::Detailed);
+        app
+    });
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("SwiftPDF へようこそ").is_some(), "Japanese detailed home names SwiftPDF");
+    assert!(h.query_by_label_contains("PdfCraft へようこそ").is_none());
 }
 
 #[test]

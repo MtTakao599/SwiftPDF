@@ -1,4 +1,8 @@
 //! Asks GitHub for the latest PdfCraft release (Help ▸ Check for updates, issue #28).
+//!
+//! The SwiftPDF desktop app does not call this. It has no update server, and a view-only
+//! session refuses the command before any page would open. The parser stays for its tests.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::time::Duration;
 

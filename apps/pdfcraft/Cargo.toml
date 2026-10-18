@@ -4,6 +4,13 @@ description = "PdfCraft desktop app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# src/main.rs would otherwise become a bin named pdfcraft. One explicit target keeps the
+# package name, and the Windows (and other) executable, as SwiftPDF.
+autobins = false
+
+[[bin]]
+name = "SwiftPDF"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -66,5 +73,5 @@ windows = { version = "0.62", default-features = false, features = ["std", "UI_V
 uds_windows = "=1.2.1"
 
 [build-dependencies]
-# Icon + VERSIONINFO for pdfcraft.exe; build.rs only uses it when targeting Windows.
+# Icon + VERSIONINFO for SwiftPDF.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
