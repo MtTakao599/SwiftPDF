@@ -275,18 +275,48 @@ fn typing_moving_styling_and_deleting_added_content() {
     assert!(img.flip_h);
 }
 
-/// #125: text the standard fonts can't draw stays in the editor with a warning instead of being
-/// written to the page as `?` (or lost).
+/// The warning the text box shows for `c`, matching the two wordings in the editor: Japanese
+/// (and the other CJK ranges that face covers) names the Japanese font, and anything else names
+/// the character.
+fn undrawable_warning(c: char) -> &'static str {
+    if matches!(u32::from(c), 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
+        "Japanese font cannot write"
+    } else {
+        "can't draw"
+    }
+}
+
+/// Text the faces in this build cannot draw: 世界 when no Japanese face can write it, otherwise a
+/// character none of the faces cover.
+fn undrawable_entry() -> (String, &'static str) {
+    let sample =
+        |text: &str| pdfcraft_engine::AddedText { text: text.to_owned(), rect: [0.0, 0.0, 200.0, 40.0], ..pdfcraft_engine::AddedText::default() };
+    let text = if let Some(c) = pdfcraft_engine::first_undrawable(&sample("Hello 世界")) {
+        return ("Hello 世界".to_owned(), undrawable_warning(c));
+    } else {
+        // This build can write 世界. The warning path still has to fire for a character no face has.
+        "Hello \u{1F600}"
+    };
+    let c = pdfcraft_engine::first_undrawable(&sample(text)).expect("the fallback character is not covered by any face");
+    (text.to_owned(), undrawable_warning(c))
+}
+
+/// #125: text the fonts can't draw stays in the editor with a warning instead of being written to
+/// the page as `?` (or lost). When this build's Japanese face can draw 世界, that text is not the
+/// sample: it commits, and a character the face still lacks is what stays in the editor.
 #[test]
 fn text_the_standard_fonts_cant_draw_stays_in_the_editor() {
+    let (blocked, warning) = undrawable_entry();
+    let japanese = pdfcraft_engine::AddedText { text: "世界".into(), rect: [0.0, 0.0, 80.0, 24.0], ..pdfcraft_engine::AddedText::default() };
+    let japanese_draws = pdfcraft_engine::first_undrawable(&japanese).is_none();
     let mut h = harness();
     assert!(h.state_mut().execute("edit.text"));
     h.run_steps(2);
     let p = at(&h, 40.0, 300.0);
     click(&mut h, p);
-    h.event(egui::Event::Text("Hello 世界".into()));
+    h.event(egui::Event::Text(blocked.clone()));
     h.run_steps(2);
-    h.get_by_label_contains("can't draw “世” (U+4E16)");
+    h.get_by_label_contains(warning);
     if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
         h.render().unwrap().save(format!("{dir}/undrawable-text.png")).unwrap();
     }
@@ -294,12 +324,12 @@ fn text_the_standard_fonts_cant_draw_stays_in_the_editor() {
     h.run_steps(3);
     assert!(texts(&h).is_empty(), "nothing was written to the page");
     let draft = h.state().views[0].content.draft.as_ref().map(|d| d.text.clone());
-    assert_eq!(draft.as_deref(), Some("Hello 世界"), "the typed text is kept");
+    assert_eq!(draft.as_deref(), Some(blocked.as_str()), "the typed text is kept");
     // A click elsewhere on the page doesn't finish it, or replace it with a new box.
     let elsewhere = at(&h, 40.0, 150.0);
     click(&mut h, elsewhere);
     let draft = h.state().views[0].content.draft.as_ref().map(|d| d.text.clone());
-    assert_eq!(draft.as_deref(), Some("Hello 世界"), "clicking elsewhere keeps the typed text");
+    assert_eq!(draft.as_deref(), Some(blocked.as_str()), "clicking elsewhere keeps the typed text");
     assert!(texts(&h).is_empty());
     // Once the text can be drawn, Done adds it (Done took the focus, so edit the draft directly).
     if let Some(d) = h.state_mut().views[0].content.draft.as_mut() {
@@ -309,6 +339,21 @@ fn text_the_standard_fonts_cant_draw_stays_in_the_editor() {
     h.get_by_label("Done adding text").click();
     h.run_steps(3);
     assert_eq!(texts(&h), ["Hello world"]);
+    if japanese_draws {
+        // Done in the full editor puts the tool down, so pick it up again. Above the box just
+        // added, so this click starts a new one instead of dragging that box.
+        assert!(h.state_mut().execute("edit.text"));
+        h.run_steps(2);
+        let p = at(&h, 40.0, 80.0);
+        click(&mut h, p);
+        h.event(egui::Event::Text("世界".into()));
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("Japanese font cannot write").is_none(), "drawable Japanese is not a warning");
+        assert!(h.query_by_label_contains("can't draw").is_none(), "drawable Japanese is not a warning");
+        h.get_by_label("Done adding text").click();
+        h.run_steps(3);
+        assert!(texts(&h).iter().any(|text| text.contains('世')), "Japanese this build can draw is saved");
+    }
 }
 
 /// Text kept because it can't be drawn goes with its page when the page is deleted, so nothing

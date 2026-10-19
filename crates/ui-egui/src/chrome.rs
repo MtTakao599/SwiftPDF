@@ -590,63 +590,121 @@ fn tab(
     })
 }
 
+/// Width of a mode-bar label the way [`widgets::mode_tab`] and [`widgets::ghost_button`] measure it.
+fn bar_text_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    let font = theme::medium(size);
+    ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x)
+}
+
+/// The mode bar's height, and whether the tools wrap. One 48px row, right-aligned, when the tabs
+/// and the full search field fit; extra rows when a narrow window would push 文字入力 off screen.
+fn mode_bar_layout(app: &PdfCraftApp, ui: &egui::Ui) -> (f32, bool) {
+    let inner = (ui.available_width() - 20.0).max(1.0);
+    let menu = bar_text_width(ui, tl!("Menu"), 13.0) + 38.0;
+    let mut tabs = 0.0;
+    let mut tab_count = 0.0;
+    for (mode, label) in
+        [(Mode::AllTools, "All tools"), (Mode::Read, "Read"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")]
+    {
+        if app.session.view_only() && !mode.offered_in_view_only() {
+            continue;
+        }
+        tabs += bar_text_width(ui, tl!(label), 13.5) + 22.0;
+        tab_count += 1.0;
+    }
+    let text = if app.command_allowed("edit.text") {
+        let label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
+        bar_text_width(ui, label, 13.0) + 38.0
+    } else {
+        0.0
+    };
+    let left = menu + tabs + 2.0 * (tab_count + 1.0) + 16.0;
+    // Print, save and properties are icon buttons. The wide bar's search field is 260 wide.
+    let wide = left + text + 32.0 * 3.0 + 260.0 + 40.0;
+    if wide <= inner {
+        return (48.0, false);
+    }
+    let tools = text + 32.0 * 3.0 + 120.0 + 24.0;
+    let rows = ((left + tools) / inner).ceil().clamp(2.0, 3.0);
+    (rows * 48.0, true)
+}
+
 pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
+    let (height, narrow) = mode_bar_layout(app, ui);
     egui::Panel::top("mode_bar")
-        .exact_size(48.0)
+        .exact_size(height)
         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, t.divider)))
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                main_menu(app, ui);
-                ui.add_space(6.0);
-                ui.painter().vline(ui.cursor().left(), ui.max_rect().y_range().shrink(12.0), Stroke::new(1.0, t.divider));
-                ui.add_space(10.0);
-                for (mode, label) in
-                    [(Mode::AllTools, "All tools"), (Mode::Read, "Read"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")]
-                {
-                    // Edit, Convert and E-Sign stay in the bar for a session that can edit.
-                    if app.session.view_only() && !mode.offered_in_view_only() {
-                        continue;
-                    }
-                    if widgets::mode_tab(ui, tl!(label), app.mode == mode).clicked() {
-                        app.switch_mode(mode, true);
-                    }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let has_doc = app.active.is_some();
-                    ui.add_enabled_ui(has_doc, |ui| {
-                        let tip = crate::commands::command_tip(ui.ctx(), tl!("Print ({key})"), "print.dialog");
-                        if ui
-                            .add_enabled_ui(app.command_allowed("print.dialog"), |ui| icons::button(ui, "printer", 32.0, false, &tip))
-                            .inner
-                            .clicked()
-                        {
-                            app.run_command("print.dialog");
-                        }
-                        if app.command_allowed("edit.text") {
-                            let label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
-                            if widgets::ghost_button(ui, "type", label).clicked() {
-                                app.execute("edit.text");
-                            }
-                        }
-                        let tip = crate::commands::command_tip(ui.ctx(), tl!("Save ({key})"), "file.save");
-                        if ui.add_enabled_ui(app.command_allowed("file.save"), |ui| icons::button(ui, "save", 32.0, false, &tip)).inner.clicked() {
-                            app.run_command("file.save");
-                        }
-                        let tip = crate::commands::command_tip(ui.ctx(), tl!("Document properties ({key})"), "file.properties");
-                        if icons::button(ui, "info", 32.0, false, &tip).clicked() {
-                            app.dialog = Some(Dialog::Properties(PropsTab::Description));
-                        }
-                    });
-                    ui.add_space(8.0);
-                    if widgets::search_box(ui, tl!("Find tools and commands"), 260.0).clicked() {
-                        app.palette_open = true;
-                    }
+            if narrow {
+                // Wrapped, so a short window keeps every tool on screen instead of sliding it off the left.
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(36.0);
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    mode_bar_leading(app, ui, &t);
+                    mode_bar_tools(app, ui, None);
                 });
-            });
+            } else {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    mode_bar_leading(app, ui, &t);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        mode_bar_tools(app, ui, Some(260.0));
+                    });
+                });
+            }
         });
+}
+
+/// Menu and the mode tabs, shared by the single-row bar and the wrapped narrow one.
+fn mode_bar_leading(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    main_menu(app, ui);
+    ui.add_space(6.0);
+    ui.painter().vline(ui.cursor().left(), ui.max_rect().y_range().shrink(12.0), Stroke::new(1.0, t.divider));
+    ui.add_space(10.0);
+    for (mode, label) in
+        [(Mode::AllTools, "All tools"), (Mode::Read, "Read"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")]
+    {
+        // Edit, Convert and E-Sign stay in the bar for a session that can edit.
+        if app.session.view_only() && !mode.offered_in_view_only() {
+            continue;
+        }
+        if widgets::mode_tab(ui, tl!(label), app.mode == mode).clicked() {
+            app.switch_mode(mode, true);
+        }
+    }
+}
+
+/// Print, text entry, save, properties and the tool search. `search_width` is the fixed field of
+/// the wide bar; `None` shrinks the field to the room left on a wrapped row.
+fn mode_bar_tools(app: &mut PdfCraftApp, ui: &mut egui::Ui, search_width: Option<f32>) {
+    let has_doc = app.active.is_some();
+    ui.add_enabled_ui(has_doc, |ui| {
+        let tip = crate::commands::command_tip(ui.ctx(), tl!("Print ({key})"), "print.dialog");
+        if ui.add_enabled_ui(app.command_allowed("print.dialog"), |ui| icons::button(ui, "printer", 32.0, false, &tip)).inner.clicked() {
+            app.run_command("print.dialog");
+        }
+        if app.command_allowed("edit.text") {
+            let label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
+            if widgets::ghost_button(ui, "type", label).clicked() {
+                app.execute("edit.text");
+            }
+        }
+        let tip = crate::commands::command_tip(ui.ctx(), tl!("Save ({key})"), "file.save");
+        if ui.add_enabled_ui(app.command_allowed("file.save"), |ui| icons::button(ui, "save", 32.0, false, &tip)).inner.clicked() {
+            app.run_command("file.save");
+        }
+        let tip = crate::commands::command_tip(ui.ctx(), tl!("Document properties ({key})"), "file.properties");
+        if icons::button(ui, "info", 32.0, false, &tip).clicked() {
+            app.dialog = Some(Dialog::Properties(PropsTab::Description));
+        }
+    });
+    ui.add_space(8.0);
+    let search_width = search_width.unwrap_or_else(|| (ui.available_width() - 4.0).clamp(72.0, 260.0));
+    if widgets::search_box(ui, tl!("Find tools and commands"), search_width).clicked() {
+        app.palette_open = true;
+    }
 }
 
 fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {

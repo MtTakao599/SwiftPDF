@@ -712,6 +712,9 @@ fn the_text_bar_stays_short_in_simple_and_detailed_mode() {
         harness.run_steps(4);
         harness.get_by_label("文字入力").click();
         harness.run_steps(4);
+        if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
+            harness.render().unwrap().save(format!("{dir}/text-bar-{mode:?}.png")).unwrap();
+        }
         let color = harness.get_by_label("文字色");
         let rect = color.rect();
         assert!(rect.bottom() < 220.0, "{mode:?} bar is too tall: {rect:?}");
@@ -719,6 +722,18 @@ fn the_text_bar_stays_short_in_simple_and_detailed_mode() {
         color.click();
         harness.run_steps(3);
         assert!(harness.query_by_label("Red").is_some(), "{mode:?} colour popup");
+        // Every control of this bar stays on screen when the window is only 420 wide.
+        let on_screen = [
+            "文字入力を終了",
+            match mode {
+                UiMode::Simple => "文書のプロパティ",
+                UiMode::Detailed => "Find tools and commands",
+            },
+        ];
+        for label in on_screen {
+            let rect = harness.get_by_label(label).rect();
+            assert!(rect.left() >= 0.0 && rect.right() <= 430.0 && rect.bottom() < 260.0, "{mode:?} {label} is off screen: {rect:?}");
+        }
     }
 }
 
@@ -860,4 +875,168 @@ fn text_entry_drags_a_confirmed_string_without_leaving_the_tool() {
     let copy = again.open("moved.pdf", None, Arc::new(saved), None).unwrap();
     let stored: Vec<_> = again.get(copy).unwrap().added().iter().map(|item| item.content.clone()).collect();
     assert_eq!(stored, redone);
+}
+
+#[test]
+fn text_entry_drags_an_unconfirmed_box_by_its_frame_during_ime_composition() {
+    let _serial = serial();
+    let dir = Dir::new("drag-draft");
+    let original = dir.join("opened.pdf");
+    let bytes = pdf();
+    std::fs::write(&original, &bytes).unwrap();
+    let hash = sha256(&bytes);
+    let sample = pdfcraft_engine::AddedText { text: "東京大阪".into(), rect: [0.0, 0.0, 120.0, 24.0], ..pdfcraft_engine::AddedText::default() };
+    let (typed, preedit, composed) =
+        if pdfcraft_engine::first_undrawable(&sample).is_none() { ("東京", "おおさか", "大阪") } else { ("Tokyo", "osaka", "Osaka") };
+    let original_s = original.to_string_lossy().into_owned();
+    let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.grant_save_as();
+        app.grant_edit_text();
+        app.set_ui_mode(UiMode::Simple);
+        app.open_bytes("opened.pdf", Some(original_s), bytes).unwrap();
+        app
+    });
+    let scale = |harness: &Harness<'static, PdfCraftApp>| harness.state().views[0].page_screen_rect(0).expect("page on screen").width() / 300.0;
+    let at = |harness: &Harness<'static, PdfCraftApp>, x: f32, y: f32| {
+        harness.state().views[0].page_screen_rect(0).expect("page on screen").min + egui::vec2(x, y) * scale(harness)
+    };
+    let press_release = |harness: &mut Harness<'static, PdfCraftApp>, p: egui::Pos2| {
+        harness.hover_at(p);
+        harness.run_steps(1);
+        harness.drag_at(p);
+        harness.run_steps(1);
+        harness.drop_at(p);
+        harness.run_steps(3);
+    };
+    let draft = |harness: &Harness<'static, PdfCraftApp>| harness.state().views[0].content.draft.clone();
+    let added = |harness: &Harness<'static, PdfCraftApp>| {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().added().iter().map(|item| item.content.clone()).collect::<Vec<_>>()
+    };
+    let dirty = |harness: &Harness<'static, PdfCraftApp>| {
+        let state = harness.state();
+        state.session.get(state.views[0].id).unwrap().dirty
+    };
+    let ime_intact = |harness: &Harness<'static, PdfCraftApp>, phase: &str| {
+        let ime = harness.output().platform_output.ime.as_ref();
+        assert!(ime.is_some_and(|ime| !ime.should_interrupt_composition), "the text box lost the IME during {phase}");
+    };
+    // The middle of the frame's left side: outside the text, inside the frame.
+    let frame_grip = |harness: &Harness<'static, PdfCraftApp>| {
+        let frame = harness.get_by_label("Move text box").rect();
+        egui::pos2(frame.left() + 3.0, frame.center().y)
+    };
+    harness.run_steps(6);
+    harness.get_by_label("文字入力").click();
+    harness.run_steps(3);
+    let blank = at(&harness, 40.0, 36.0);
+    press_release(&mut harness, blank);
+    assert!(draft(&harness).is_some(), "a click on the page opens a text box");
+    harness.event(egui::Event::Text(typed.into()));
+    harness.run_steps(2);
+    harness.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: preedit.into(), active_range_chars: Some(0..preedit.chars().count()) }));
+    harness.run_steps(2);
+    ime_intact(&harness, "composition");
+    let before = draft(&harness).unwrap();
+
+    // A click on the frame is not a click away: the box stays open and keeps the IME.
+    let grip = frame_grip(&harness);
+    press_release(&mut harness, grip);
+    ime_intact(&harness, "a click on the frame");
+    assert_eq!(draft(&harness).map(|d| d.style.rect), Some(before.style.rect), "a click on the frame does not move the box");
+    assert!(added(&harness).is_empty());
+
+    let grip = frame_grip(&harness);
+    let shift = egui::vec2(40.0, 150.0);
+    harness.hover_at(grip);
+    harness.run_steps(1);
+    harness.drag_at(grip);
+    harness.run_steps(1);
+    for k in 1..=3 {
+        harness.hover_at(grip + shift * (k as f32 / 3.0));
+        harness.step();
+        ime_intact(&harness, "the drag");
+        assert!(draft(&harness).is_some(), "the box stays open while dragged");
+    }
+    if let Ok(dir) = std::env::var("PDFCRAFT_SHOTS") {
+        harness.render().unwrap().save(format!("{dir}/dragging-unconfirmed-text.png")).unwrap();
+    }
+    harness.drop_at(grip + shift);
+    harness.run_steps(3);
+    ime_intact(&harness, "the drop");
+    let moved = draft(&harness).expect("the box is still being typed after the drag");
+    let delta = shift / scale(&harness);
+    assert!(
+        (moved.style.rect[0] - before.style.rect[0] - delta.x as f64).abs() < 1.0,
+        "moved right: {:?} -> {:?}",
+        before.style.rect,
+        moved.style.rect
+    );
+    assert!(
+        (before.style.rect[3] - moved.style.rect[3] - delta.y as f64).abs() < 1.0,
+        "moved down: {:?} -> {:?}",
+        before.style.rect,
+        moved.style.rect
+    );
+    assert_eq!(moved.text, before.text, "the text and the conversion in progress are kept");
+    assert_eq!(
+        (moved.style.size, moved.style.color, moved.style.family, moved.style.bold),
+        (before.style.size, before.style.color, before.style.family, before.style.bold)
+    );
+    assert!(added(&harness).is_empty() && !dirty(&harness), "nothing is written before Done");
+
+    harness.event(egui::Event::Ime(egui::ImeEvent::Commit(composed.into())));
+    harness.run_steps(2);
+    assert_eq!(draft(&harness).map(|d| d.text), Some(format!("{typed}{composed}")), "the conversion finishes in the moved box");
+    harness.get_by_label("Done").click();
+    harness.run_steps(4);
+    assert!(draft(&harness).is_none());
+    let committed = added(&harness);
+    let [pdfcraft_engine::AddedContent::Text(text)] = committed.as_slice() else { panic!("one added string: {committed:?}") };
+    assert_eq!(text.text, format!("{typed}{composed}"));
+    assert!((text.rect[0] - moved.style.rect[0]).abs() < 0.01 && (text.rect[3] - moved.style.rect[3]).abs() < 0.01, "{:?}", text.rect);
+    assert_eq!(harness.state().quick_tool, pdfcraft_ui_egui::QuickTool::AddText);
+
+    assert!(harness.state_mut().execute("edit.undo"));
+    harness.run_steps(2);
+    assert!(added(&harness).is_empty(), "one undo removes the moved string");
+    assert!(harness.state_mut().execute("edit.redo"));
+    harness.run_steps(2);
+    assert_eq!(added(&harness), committed);
+
+    // A dragged box that is cancelled adds nothing.
+    let blank = at(&harness, 40.0, 110.0);
+    press_release(&mut harness, blank);
+    harness.event(egui::Event::Text("Cancelled".into()));
+    harness.run_steps(2);
+    let grip = frame_grip(&harness);
+    harness.hover_at(grip);
+    harness.run_steps(1);
+    harness.drag_at(grip);
+    harness.run_steps(1);
+    harness.hover_at(grip + egui::vec2(30.0, 30.0));
+    harness.run_steps(1);
+    harness.drop_at(grip + egui::vec2(30.0, 30.0));
+    harness.run_steps(3);
+    assert_eq!(draft(&harness).map(|d| d.text), Some("Cancelled".into()));
+    harness.get_by_label("Cancel").click();
+    harness.run_steps(3);
+    assert!(draft(&harness).is_none());
+    assert_eq!(added(&harness), committed, "Cancel discards the moved box");
+
+    let dest = dir.join("moved-draft.pdf");
+    harness.state_mut().save_override = Some(dest.to_string_lossy().into_owned());
+    assert!(harness.state_mut().execute("file.save_as"));
+    harness.run_steps(2);
+    assert!(harness.state_mut().confirm_save_copy());
+    harness.run_steps(3);
+    assert_eq!(sha256(&std::fs::read(&original).unwrap()), hash);
+    let mut again = Session::new().with_view_only(true);
+    let copy = again.open("moved-draft.pdf", None, Arc::new(std::fs::read(&dest).unwrap()), None).unwrap();
+    let stored: Vec<_> = again.get(copy).unwrap().added().iter().map(|item| item.content.clone()).collect();
+    assert_eq!(stored, committed, "the moved position survives the saved copy");
 }

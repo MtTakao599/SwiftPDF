@@ -57,6 +57,9 @@ pub(crate) fn undrawn_message(n: &pdfcraft_engine::TextNotice) -> String {
 
 const SELECT_BLUE: Color32 = Color32::from_rgb(0x14, 0x73, 0xE6);
 
+/// The width of the frame that moves a text box while it is being typed.
+const DRAFT_FRAME: f32 = 6.0;
+
 /// The text being typed or retyped in place.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextDraft {
@@ -85,6 +88,12 @@ pub struct ContentView {
     /// Select the item an add creates (the page's item count before it).
     pub select_added: Option<(usize, usize)>,
     grab: Option<(usize, Grab, Pos2)>,
+    /// The draft being dragged by its frame: its page, where the press began, and the draft's
+    /// box then. Nothing is committed until Done.
+    draft_grab: Option<(usize, Pos2, [f64; 4])>,
+    /// The text box's size on screen last frame, so the frame around it can take the press
+    /// before the text box sees it.
+    editor_size: Option<egui::Vec2>,
     undrawable: UndrawableMemo,
     layout: Option<(AddedText, f32, f64, [f64; 4])>,
 }
@@ -285,6 +294,19 @@ fn dragged(r: Rect, grab: Grab, d: egui::Vec2, keep_aspect: bool) -> Rect {
             Rect::from_two_pos(out.min, out.max)
         }
     }
+}
+
+/// A draft's box (display space) moved by `delta`, kept on a `page_width` × `page_height` page:
+/// its top edge stays on the page and at least the start of its first line stays visible.
+fn moved_draft_rect(start: [f64; 4], delta: [f64; 2], page_width: f64, page_height: f64) -> [f64; 4] {
+    // Finite inputs keep both clamps' bounds ordered (`clamp` panics otherwise).
+    if !delta.iter().chain(&start).chain(&[page_width, page_height]).all(|v| v.is_finite()) {
+        return start;
+    }
+    let (width, height) = (start[2] - start[0], start[3] - start[1]);
+    let left = (start[0] + delta[0]).clamp(0.0, (page_width - 20.0).max(0.0));
+    let top = (start[3] + delta[1]).clamp(height.min(page_height).max(0.0), page_height.max(0.0));
+    [left, top - height, left + width, top]
 }
 
 /// Added text and images keep pointer ownership over a form field while editing content.
@@ -547,13 +569,30 @@ pub(crate) fn confirms_text_entry(done_clicked: bool, lost_focus: bool, pointer_
 /// committed (a click away, or Done), and whether Done finished adding text. Discard or Escape
 /// throws the draft away. `labelled` shows 確定 and キャンセル for the view-only text tool.
 pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, added: &[Added], labelled: bool) -> (Option<Edit>, bool) {
-    let Some(page) = view.content.draft.as_ref().map(|d| d.page) else { return (None, false) };
+    let Some(page) = view.content.draft.as_ref().map(|d| d.page) else {
+        view.content.draft_grab = None;
+        return (None, false);
+    };
     let Some(xf) = view.page_xform(page) else { return (None, false) };
     let zoom = xf.rect.width() / xf.pw.max(1.0);
+    let Some((page_width, page_height)) = info.pages.get(page).map(|p| (p.width as f64, p.height as f64)) else { return (None, false) };
+    if let Some((grab_page, from, start)) = view.content.draft_grab {
+        let (pointer, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+        if grab_page != page {
+            view.content.draft_grab = None;
+        } else {
+            if let (Some(p), Some(d)) = (pointer, view.content.draft.as_mut()) {
+                let (a, b) = (to_display(&xf, info, page, from), to_display(&xf, info, page, p));
+                d.style.rect = moved_draft_rect(start, [b[0] - a[0], b[1] - a[1]], page_width, page_height);
+            }
+            if !down {
+                view.content.draft_grab = None;
+            }
+        }
+    }
     let Some(draft) = view.content.draft.as_mut() else { return (None, false) };
     let font = crate::edit_text_ui::editor_font(&draft.style, (draft.style.size as f32 * zoom).clamp(1.0, 300.0));
     let text = AddedText { text: draft.text.clone(), ..draft.style.clone() };
-    let Some(page_width) = info.pages.get(page).map(|p| p.width as f64) else { return (None, false) };
     if let Some((key, z, width, rect)) = &view.content.layout
         && *key == text
         && *z == zoom
@@ -575,36 +614,72 @@ pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, ad
         view.content.layout = Some((text, zoom, page_width, draft.rect));
     }
     let r = screen_rect(&xf, info, page, draft.rect);
-    let source_rect = draft.index.map(|_| screen_rect(&xf, info, page, draft.style.rect));
+    // Where the retyped item is drawn on the page, which stays put while its draft is dragged.
+    let source_rect = draft
+        .index
+        .and_then(|index| on_page(added, page).into_iter().find(|(i, _)| *i == index))
+        .map(|(_, a)| screen_rect(&xf, info, page, a.content.rect()));
     let background_ready = draft.index.is_some_and(|index| view.text_background.ready_added(page, index));
     let tokens = Tokens::get(ctx);
     let (mut commit, mut cancel, mut done) = (false, false, false);
     let mut undrawable = None;
+    let (mut start_grab, mut editor_size) = (None, view.content.editor_size);
+    let dragging = view.content.draft_grab.is_some();
     let memo = &view.content.undrawable;
-    egui::Area::new(egui::Id::new(("added-text", view.id.0))).order(egui::Order::Foreground).fixed_pos(r.min).constrain(false).show(ctx, |ui| {
+    let margin = egui::vec2(DRAFT_FRAME, DRAFT_FRAME);
+    let area = egui::Area::new(egui::Id::new(("added-text", view.id.0))).order(egui::Order::Foreground).fixed_pos(r.min - margin).constrain(false);
+    area.show(ctx, |ui| {
         let Some(t) = view.content.draft.as_mut() else { return };
-        ui.set_width(r.width() + 64.0);
+        ui.set_width(r.width() + 64.0 + DRAFT_FRAME);
         if let Some(source_rect) = source_rect.filter(|_| !background_ready) {
             ui.painter().rect_filled(source_rect.union(r).expand(1.0), CornerRadius::ZERO, Color32::WHITE);
+        }
+        // The frame around the text moves it. It is laid down before the text box, which is on
+        // top of it inside, so a press in the text still edits. It senses clicks too: a drag-only
+        // widget around a click widget would hand its presses to that widget.
+        let frame_rect = Rect::from_min_size(r.min, editor_size.unwrap_or(egui::vec2(r.width().max(60.0), r.height()))).expand(DRAFT_FRAME);
+        let frame = ui.interact(frame_rect, ui.id().with("added-text-move"), egui::Sense::click_and_drag());
+        frame.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, crate::identity::localized("入力欄を移動", "Move text box")));
+        if frame.drag_started() {
+            start_grab = ui.input(|i| i.pointer.press_origin());
+        }
+        let active = dragging || frame.dragged() || frame.hovered();
+        let band = SELECT_BLUE.gamma_multiply(if active { 0.45 } else { 0.2 });
+        ui.painter().rect_stroke(frame_rect.shrink(DRAFT_FRAME / 2.0), CornerRadius::ZERO, Stroke::new(DRAFT_FRAME, band), egui::StrokeKind::Middle);
+        // A press on the frame is not a click away: the text keeps its focus, so an IME
+        // conversion in progress is not interrupted (asking for the focus back would end it).
+        let hold_focus = dragging || frame.is_pointer_button_down_on() || frame.clicked() || frame.dragged() || frame.drag_stopped();
+        let surrender = ui.ctx().options(|o| o.input_options.surrender_focus_on);
+        if hold_focus {
+            ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
         }
         // The box is white in every theme, so the caret must not follow the theme (pale in dark mode) (#655).
         ui.visuals_mut().text_cursor.stroke.color = crate::edit_text_ui::caret_color_on(Color32::WHITE);
         let [cr, cg, cb] = t.style.color.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let resp = ui.add(
-                egui::TextEdit::multiline(&mut t.text)
-                    .font(font)
-                    .desired_width(r.width().max(60.0))
-                    .desired_rows(1)
-                    .background_color(if background_ready { Color32::TRANSPARENT } else { Color32::WHITE })
-                    .text_color(Color32::from_rgb(cr, cg, cb))
-                    .hint_text(tl!("Type text"))
-                    .id_salt("added-text-edit"),
-            );
-            if t.focus {
-                resp.request_focus();
-                t.focus = false;
+            let resp = egui::Frame::NONE.inner_margin(DRAFT_FRAME).show(ui, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut t.text)
+                        .font(font)
+                        .desired_width(r.width().max(60.0))
+                        .desired_rows(1)
+                        .background_color(if background_ready { Color32::TRANSPARENT } else { Color32::WHITE })
+                        .text_color(Color32::from_rgb(cr, cg, cb))
+                        .hint_text(tl!("Type text"))
+                        .id_salt("added-text-edit"),
+                );
+                if t.focus {
+                    resp.request_focus();
+                    t.focus = false;
+                }
+                resp
+            });
+            let resp = resp.inner;
+            ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = surrender);
+            editor_size = Some(resp.rect.size());
+            if dragging || frame.dragged() || frame.hovered() && !resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             }
             let buttons = egui::Frame::NONE
                 .fill(tokens.card)
@@ -631,7 +706,7 @@ pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, ad
                 .input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())));
             // Enter confirms an IME conversion or inserts a line. It is not a way to finish.
             cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
-            commit = confirms_text_entry(done, resp.lost_focus() && !view.objects.hold_editor, on_buttons, ime_composing);
+            commit = confirms_text_entry(done, resp.lost_focus() && !view.objects.hold_editor, on_buttons || hold_focus, ime_composing);
         });
         // Page text is drawn with the standard fonts; anything else would be saved as `?` (#125).
         undrawable = self::undrawable(t, memo);
@@ -647,14 +722,22 @@ pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, ad
             ui.label(egui::RichText::new(message).small().color(UNDRAWABLE));
         }
     });
+    view.content.editor_size = editor_size;
+    if let Some(from) = start_grab
+        && let Some(d) = view.content.draft.as_ref()
+    {
+        view.content.draft_grab = Some((page, from, d.style.rect));
+        ctx.request_repaint();
+    }
     if cancel {
-        view.content.draft = None;
+        (view.content.draft, view.content.draft_grab) = (None, None);
         return (None, false);
     }
     // Text that can't be drawn stays in the editor, with the warning, rather than being lost.
     if !commit || undrawable.is_some() {
         return (None, false);
     }
+    view.content.draft_grab = None;
     let edit = view.content.draft.take().and_then(|d| finish(&mut view.content, d, added));
     (edit, done)
 }
@@ -734,8 +817,8 @@ fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>,
         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
         let title = ui.label(egui::RichText::new(crate::identity::localized("文字入力", "Add text")).strong());
         title.on_hover_text(crate::identity::localized(
-            "ページをクリックして入力します。変換中のEnterでは確定しません。確定後は文字をドラッグして移動できます。",
-            "Click the page and type. Enter during IME conversion does not finish the text. After Done, drag the text to move it.",
+            "ページをクリックして入力します。変換中のEnterでは確定しません。入力中は青い枠を、確定後は文字をドラッグして移動できます。",
+            "Click the page and type. Enter during IME conversion does not finish the text. Drag the blue frame to move the text while typing, or the text itself after Done.",
         ));
         egui::ComboBox::from_id_salt("entry-font-family").selected_text(s.family.label()).width(110.0).show_ui(ui, |ui| {
             for family in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
@@ -1140,6 +1223,21 @@ mod tests {
         assert_eq!(super::adding_text_step(false, true, false), super::TextToolStep::NewBox);
         assert_eq!(super::adding_text_step(true, false, false), super::TextToolStep::Wait, "a drag from empty page adds nothing");
         assert_eq!(super::adding_text_step(false, false, true), super::TextToolStep::Wait);
+    }
+
+    #[test]
+    fn a_dragged_draft_moves_whole_and_stays_on_its_page() {
+        let start = [40.0, 250.0, 240.0, 264.0];
+        assert_eq!(super::moved_draft_rect(start, [10.0, -30.0], 300.0, 300.0), [50.0, 220.0, 250.0, 234.0]);
+        assert_eq!(super::moved_draft_rect(start, [-100.0, 100.0], 300.0, 300.0), [0.0, 286.0, 200.0, 300.0], "kept inside the top left");
+        assert_eq!(super::moved_draft_rect(start, [500.0, -500.0], 300.0, 300.0), [280.0, 0.0, 480.0, 14.0], "its first letters stay on the page");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(super::moved_draft_rect(start, [bad, 0.0], 300.0, 300.0), start);
+            assert_eq!(super::moved_draft_rect(start, [5.0, 5.0], 300.0, bad), start, "a bad page size leaves the box where it is");
+        }
+        // A box taller than its page, and a page with no size, do not cross the clamp bounds.
+        assert_eq!(super::moved_draft_rect([0.0, 0.0, 10.0, 500.0], [0.0, 0.0], 300.0, 300.0), [0.0, -200.0, 10.0, 300.0]);
+        assert_eq!(super::moved_draft_rect(start, [5.0, 5.0], 0.0, 0.0), [0.0, -14.0, 200.0, 0.0]);
     }
 
     #[test]

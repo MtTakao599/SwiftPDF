@@ -228,18 +228,45 @@ fn on_disk(_path: &str) -> bool {
     true
 }
 
+/// How tall the simple document bar is for `labels`: one row when they fit, otherwise as many
+/// wrapped rows as they need. A fixed row pushed 文字入力 off the left of a narrow window, where
+/// its click never landed.
+fn viewer_bar_height(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    let font = theme::medium(13.0);
+    let text: f32 = labels
+        .iter()
+        .map(|label| ui.fonts_mut(|fonts| fonts.layout_no_wrap((*label).to_owned(), font.clone(), Color32::WHITE).size().x) + 38.0)
+        .sum();
+    let gaps = ui.spacing().item_spacing.x * labels.len().saturating_sub(1) as f32;
+    // The panel's horizontal margin is 10 on each side.
+    let inner = (ui.available_width() - 20.0).max(1.0);
+    let total = text + gaps;
+    let rows = if total <= inner + 1.0 { 1.0 } else { (total / inner).ceil().clamp(2.0, 4.0) };
+    if rows <= 1.0 { 40.0 } else { 4.0 + rows * 36.0 }
+}
+
 /// The simple interface's bar over a document: finding text and the document's properties (the
 /// rail beside the page has the pages, bookmarks, zoom and turning).
 pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     if app.active.is_none() {
         return;
     }
+    let text_label = if app.quick_tool == crate::QuickTool::AddText { "文字入力を終了" } else { "文字入力" };
+    let mut labels = vec!["文書のプロパティ", "検索"];
+    if app.command_allowed("file.save_as") {
+        labels.push("名前を付けて保存");
+    }
+    if app.command_allowed("edit.text") {
+        labels.push(text_label);
+    }
+    let height = viewer_bar_height(ui, &labels);
     let t = Tokens::get(ui.ctx());
     egui::Panel::top("simple_bar")
-        .exact_size(40.0)
+        .exact_size(height)
         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, t.divider)))
         .show(ui, |ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let align = if height <= 40.0 { Align::Center } else { Align::Min };
+            ui.with_layout(Layout::right_to_left(align).with_main_wrap(true), |ui| {
                 if widgets::ghost_button(ui, "info", "文書のプロパティ").clicked() {
                     app.execute("file.properties");
                 }
