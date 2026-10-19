@@ -14,9 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::PdfCraftApp;
 
 static BLOCKED: AtomicBool = AtomicBool::new(false);
-/// A copy of an opened PDF to a new path. This does not turn [`BLOCKED`] off, so print, export
-/// and in-place save stay refused.
+/// A copy of an opened PDF to a new path. This does not turn [`BLOCKED`] off, so export and
+/// in-place save stay refused.
 static SAVE_AS: AtomicBool = AtomicBool::new(false);
+/// Printing and print preview. This does not turn [`BLOCKED`] off, so in-place save and export
+/// stay refused. Saving the print-ready PDF still goes through the new-file writer.
+static PRINT: AtomicBool = AtomicBool::new(false);
 
 /// What the user is told when an output is refused.
 pub const REFUSED: &str = "This app is view-only: it doesn't save, print or export files.";
@@ -41,9 +44,19 @@ pub fn set_save_as_allowed(on: bool) {
     SAVE_AS.store(on, Ordering::SeqCst);
 }
 
-/// Whether the view-only copy writer may run. Print, export and in-place save do not read this.
+/// Whether the view-only copy writer may run. Export and in-place save do not read this.
 pub fn save_as_allowed() -> bool {
     SAVE_AS.load(Ordering::SeqCst)
+}
+
+/// Allow printing. It does not clear [`set_blocked`].
+pub fn set_print_allowed(on: bool) {
+    PRINT.store(on, Ordering::SeqCst);
+}
+
+/// Whether printing may run while file output stays blocked.
+pub fn print_allowed() -> bool {
+    PRINT.load(Ordering::SeqCst)
 }
 
 impl PdfCraftApp {
@@ -62,7 +75,7 @@ impl PdfCraftApp {
     }
 
     /// Grant saving the opened bytes to a new file. View-only stays on, and [`set_blocked`] stays
-    /// on, so this does not allow in-place save, print or export.
+    /// on, so this does not allow in-place save or export.
     pub fn grant_save_as(&mut self) {
         self.session.grant(pdfcraft_engine::Capability::SaveAs);
         set_save_as_allowed(true);
@@ -71,6 +84,13 @@ impl PdfCraftApp {
     /// Grant adding text onto the open PDF. View-only stays on, and no other edit is granted.
     pub fn grant_edit_text(&mut self) {
         self.session.grant(pdfcraft_engine::Capability::EditText);
+    }
+
+    /// Grant printing the open PDF. View-only stays on, and [`set_blocked`] stays on, so this
+    /// does not allow in-place save, export, or replacing an existing file.
+    pub fn grant_print(&mut self) {
+        self.session.grant(pdfcraft_engine::Capability::Print);
+        set_print_allowed(true);
     }
 
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so

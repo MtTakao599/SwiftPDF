@@ -57,6 +57,11 @@ pub(crate) enum Ask {
     /// the web build has no copy picker.
     #[cfg(not(target_arch = "wasm32"))]
     SaveCopy(rfd::AsyncFileDialog),
+    /// Choose a new path for the imposed print PDF. Allowed while output stays blocked, only
+    /// when printing and saving a new file are both permitted. It does not replace an existing
+    /// file and does not mark the open document saved.
+    #[cfg(not(target_arch = "wasm32"))]
+    PrintPdf(rfd::AsyncFileDialog),
 }
 
 /// What to do with the chosen paths, on a later frame.
@@ -197,6 +202,14 @@ impl PdfCraftApp {
             self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
             return false;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(ask, Ask::PrintPdf(_)) && !self.print_file_permitted() {
+            self.notify(crate::identity::localized(
+                "印刷用PDFの保存は許可されていません。プリンターへの印刷とは別です。",
+                "Saving the print-ready PDF is not allowed. Printing to a printer is separate from this save.",
+            ));
+            return false;
+        }
         if self.pickers.showing.swap(true, Ordering::SeqCst) {
             self.notify_tr("Another file dialog is still open. Finish with it first.");
             return false;
@@ -225,6 +238,11 @@ impl PdfCraftApp {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Ask::SaveCopy(d) => {
+                let pick = d.save_file();
+                self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Ask::PrintPdf(d) => {
                 let pick = d.save_file();
                 self.pickers.spawn(target, ctx, async move { one(pick.await) }, then)
             }

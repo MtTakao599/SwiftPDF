@@ -290,11 +290,41 @@ fn default_printer(printers: &[spool::Printer]) -> Option<String> {
 }
 
 impl PdfCraftApp {
+    /// Printing is allowed: either the session is not view-only, or [`Capability::Print`] was
+    /// granted without lifting the block on every other file.
+    pub(crate) fn print_permitted(&self) -> bool {
+        if self.session.view_only() {
+            self.session.allows(pdfcraft_engine::Capability::Print) && crate::output_policy::print_allowed()
+        } else {
+            !crate::output_policy::blocked()
+        }
+    }
+
+    /// Saving the imposed PDF while output stays blocked: a new file only, and only when a copy
+    /// is already allowed. It does not mark the open document saved.
+    pub(crate) fn print_file_permitted(&self) -> bool {
+        self.print_permitted()
+            && self.session.view_only()
+            && self.session.allows(pdfcraft_engine::Capability::SaveAs)
+            && crate::output_policy::save_as_allowed()
+            && crate::output_policy::blocked()
+    }
+
     pub fn open_print(&mut self) {
-        if self.refuse_output() {
+        if !self.print_permitted() {
+            if !self.refuse_output() {
+                self.notify(crate::output_policy::REFUSED);
+            }
             return;
         }
-        let Some((i, _)) = self.active_ids() else { return };
+        let Some((i, id)) = self.active_ids() else { return };
+        if self.session.get(id).is_some_and(|doc| !doc.allows_printing()) {
+            self.notify(crate::identity::localized(
+                "このPDFは印刷が許可されていないため、印刷できません。",
+                "This PDF does not allow printing, so it was not printed.",
+            ));
+            return;
+        }
         let (printers, printers_loading) = match self.printer_source.clone() {
             // The list from the last time the dialog opened, until the fresh one arrives.
             #[cfg(not(target_arch = "wasm32"))]
@@ -487,11 +517,16 @@ impl PdfCraftApp {
     /// a preset path returns `true` once the save picker is showing; the file is written on a
     /// later frame, when the user has chosen where.
     pub fn print_now(&mut self) -> bool {
-        if self.refuse_output() {
+        if !self.print_permitted() {
+            if !self.refuse_output() {
+                self.notify(crate::output_policy::REFUSED);
+            }
             return false;
         }
-        // What's typed in a form field is part of what's printed (#166).
-        if !self.commit_form_typing() {
+        // A view-only session must not apply a form edit on the way to the printer.
+        // Confirmed text is already in the working file; text still being typed is copied
+        // below and is not committed, so undo stays as it was.
+        if !self.session.view_only() && !self.commit_form_typing() {
             return false;
         }
         let Some((_, id)) = self.active_ids() else { return false };
@@ -505,7 +540,14 @@ impl PdfCraftApp {
             }
         };
         let name = doc.name.clone();
-        let bytes = match self.session.print_pdf(id, &settings) {
+        let pending = match self.pending_print_text() {
+            Ok(pending) => pending,
+            Err(message) => {
+                self.notify(message);
+                return false;
+            }
+        };
+        let bytes = match self.session.print_pdf_with_pending_text(id, &settings, pending.as_ref()) {
             Ok(b) => b,
             Err(e) => {
                 self.notify_error(e);
@@ -634,11 +676,39 @@ impl PdfCraftApp {
         }
     }
 
+    /// Text still being typed, for a print copy. Empty text prints the working file as it is.
+    /// Text this build cannot draw is an error, and the draft stays open.
+    fn pending_print_text(&self) -> Result<Option<pdfcraft_engine::PendingPrintText>, String> {
+        let Some(view) = self.active.and_then(|i| self.views.get(i)) else { return Ok(None) };
+        match view.content.print_pending() {
+            Ok(pending) => Ok(pending),
+            Err(c) => {
+                let message = if matches!(u32::from(c), 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
+                    crate::identity::localized(
+                        "このビルドの日本語フォントでは、この文字をPDFに書き込めません。入力内容はそのままです。",
+                        "This build's Japanese font cannot write this character into the PDF. The text you typed is still here.",
+                    )
+                } else {
+                    format!(
+                        "{} {}",
+                        crate::content_ui::undrawable_message(c),
+                        crate::identity::localized("入力内容はそのままです。", "The text you typed is still here.")
+                    )
+                };
+                Err(message)
+            }
+        }
+    }
+
     /// Print ▸ Save as PDF on the desktop: write to `save_override` (tests and automation), or
     /// ask where and write on a later frame. Returns `true` once written, or once the save picker
-    /// is showing.
+    /// is showing. While file output is blocked, the imposed PDF is a new file and does not
+    /// replace the original or mark the document saved.
     #[cfg(not(target_arch = "wasm32"))]
     fn save_print_pdf(&mut self, name: &str, bytes: Vec<u8>) -> bool {
+        if crate::output_policy::blocked() {
+            return self.save_imposed_pdf(name, bytes);
+        }
         let write = move |app: &mut Self, path: std::path::PathBuf| match crate::editing::write_atomically(&path.to_string_lossy(), &bytes) {
             Ok(()) => {
                 app.notify_fmt("Saved the print-ready PDF to {path}", &[("path", &path.display().to_string())]);
@@ -655,6 +725,47 @@ impl PdfCraftApp {
                 let stem = name.trim_end_matches(".pdf").trim_end_matches(".PDF");
                 let dialog = rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{stem} (print).pdf"));
                 self.ask_one(crate::pickers::Ask::Save(dialog), None, move |app, path| {
+                    write(app, path);
+                })
+            }
+        }
+    }
+
+    /// The imposed PDF as a new file. An existing path, including the original, is left alone,
+    /// and the open document's saved-copy mark is not updated.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_imposed_pdf(&mut self, name: &str, bytes: Vec<u8>) -> bool {
+        if !self.print_file_permitted() {
+            self.notify(crate::identity::localized(
+                "印刷用PDFの保存は許可されていません。プリンターへの印刷とは別です。",
+                "Saving the print-ready PDF is not allowed. Printing to a printer is separate from this save.",
+            ));
+            return false;
+        }
+        let bytes = std::sync::Arc::new(bytes);
+        let write = move |app: &mut Self, path: std::path::PathBuf| {
+            let original = app.active_ids().and_then(|(_, id)| app.session.get(id)).and_then(|doc| doc.path.clone());
+            let original = original.as_deref().map(std::path::Path::new);
+            match pdfcraft_platform::save_path::write_new_file(original, &path, bytes.as_slice()) {
+                Ok(()) => {
+                    app.notify(crate::identity::localized(
+                        "印刷用のPDFを新しいファイルとして保存しました。原本は変更していません。",
+                        "Saved the print-ready PDF as a new file. The original was not changed.",
+                    ));
+                    true
+                }
+                Err(error) => {
+                    app.notify(crate::editing::save_copy_message(&error));
+                    false
+                }
+            }
+        };
+        match self.save_override.clone() {
+            Some(path) => write(self, path.into()),
+            None => {
+                let stem = name.trim_end_matches(".pdf").trim_end_matches(".PDF");
+                let dialog = rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{stem} (print).pdf"));
+                self.ask_one(crate::pickers::Ask::PrintPdf(dialog), None, move |app, path| {
                     write(app, path);
                 })
             }

@@ -3733,7 +3733,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some(e) = crate::fill_sign::type_box(ui.ctx(), view, info, &author) {
         view.pending_edit = Some(e);
     }
-    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added, place_text);
+    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, !matches!(app.dialog, Some(crate::Dialog::Print)));
     if typed.is_some() {
         view.pending_edit = typed;
     }

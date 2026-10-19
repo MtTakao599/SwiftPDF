@@ -1,5 +1,5 @@
 //! SwiftPDF's simple interface: its Home (the eight things people come to do with a PDF, of
-//! which this view-only version opens files and says the rest are coming, and the recent files,
+//! which this view-only version opens files, prints when that is granted, and says the rest are coming, and the recent files,
 //! including ones that moved or were deleted) and the bar over a document.
 
 use std::collections::HashMap;
@@ -9,7 +9,8 @@ use egui::{Align, Align2, Color32, CornerRadius, Layout, Rect, Sense, Stroke, ve
 use crate::theme::{self, Tokens};
 use crate::{PdfCraftApp, RECENT_MAX, icons, widgets};
 
-/// The Home buttons: label and icon. Only 開く does something; the rest run nothing at all.
+/// The Home buttons: label and icon. 開く opens a PDF. 印刷 opens the print dialog when
+/// printing is granted. The rest run nothing at all.
 pub(crate) const ACTIONS: [(&str, &str); 8] = [
     ("開く", "folder-open"),
     ("結合", "files"),
@@ -76,9 +77,11 @@ fn actions(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, width: f32) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             for &(label, icon) in row {
-                let ready = label == "開く";
+                let ready = label == "開く" || (label == "印刷" && app.command_allowed("print.dialog"));
                 if action_card(ui, t, vec2(card_width, CARD_HEIGHT), label, icon, ready).clicked() {
-                    if ready {
+                    if label == "印刷" && ready {
+                        app.print_from_simple();
+                    } else if label == "開く" && ready {
                         app.execute("file.open");
                     } else {
                         app.notify(format!("「{label}」は準備中です。"));
@@ -245,8 +248,8 @@ fn viewer_bar_height(ui: &egui::Ui, labels: &[&str]) -> f32 {
     if rows <= 1.0 { 40.0 } else { 4.0 + rows * 36.0 }
 }
 
-/// The simple interface's bar over a document: finding text and the document's properties (the
-/// rail beside the page has the pages, bookmarks, zoom and turning).
+/// The simple interface's bar over a document: finding text, the document's properties and,
+/// when printing is granted, the same print dialog as the detailed bar.
 pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     if app.active.is_none() {
         return;
@@ -258,6 +261,9 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     }
     if app.command_allowed("edit.text") {
         labels.push(text_label);
+    }
+    if app.command_allowed("print.dialog") {
+        labels.push("印刷");
     }
     let height = viewer_bar_height(ui, &labels);
     let t = Tokens::get(ui.ctx());
@@ -283,8 +289,26 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         app.execute("edit.text");
                     }
                 }
+                if app.command_allowed("print.dialog") && widgets::ghost_button(ui, "printer", "印刷").clicked() {
+                    app.execute("print.dialog");
+                }
             });
         });
+}
+
+impl PdfCraftApp {
+    /// Home ▸ 印刷, and the same command as the document bar and Ctrl+P.
+    /// With no PDF open, it only says so. A PDF open behind Home is shown, then printed.
+    pub(crate) fn print_from_simple(&mut self) {
+        if self.active.is_none() {
+            if self.views.is_empty() {
+                self.notify(crate::identity::localized("印刷するPDFが開いていません。", "No PDF is open to print."));
+                return;
+            }
+            self.active = Some(self.views.len() - 1);
+        }
+        self.execute("print.dialog");
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -106,6 +106,11 @@ impl PdfCraftApp {
         if matches!(id, "edit.text" | "edit.undo" | "edit.redo") && self.session.allows(pdfcraft_engine::Capability::EditText) {
             return true;
         }
+        // Printing. It is not on the reading list: it runs only when [`pdfcraft_engine::Capability::Print`]
+        // was granted, and the output block stays on for every other file.
+        if id == "print.dialog" && self.session.allows(pdfcraft_engine::Capability::Print) && crate::output_policy::print_allowed() {
+            return true;
+        }
         allowed_in_view_only(id)
     }
 

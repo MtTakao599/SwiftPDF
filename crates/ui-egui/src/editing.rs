@@ -1164,7 +1164,7 @@ impl PdfCraftApp {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn save_copy_message(error: &pdfcraft_platform::save_path::NewFileError) -> String {
+pub(crate) fn save_copy_message(error: &pdfcraft_platform::save_path::NewFileError) -> String {
     match error {
         pdfcraft_platform::save_path::NewFileError::SameAsOriginal => crate::identity::localized(
             "保存先が原本と同じファイルです。原本は変更しません。",

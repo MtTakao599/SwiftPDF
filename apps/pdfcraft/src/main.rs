@@ -354,10 +354,12 @@ fn app_creator<'a>(
         started.set(true);
         let mut app = PdfCraftApp::new();
         // SwiftPDF stays view-only. v0.2.0 grants a copy to a new path. v0.3.0 also grants
-        // adding text. Nothing turns view-only off. In-place save, print and export stay refused.
+        // adding text. v0.4.0 grants printing. Nothing turns view-only off. In-place save and
+        // export stay refused.
         app.set_view_only(true);
         app.grant_save_as();
         app.grant_edit_text();
+        app.grant_print();
         // First start (or settings from before Units existed): the region's unit.
         app.units = pdfcraft_ui_egui::units::Unit::system();
         #[cfg(target_os = "linux")]

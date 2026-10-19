@@ -99,6 +99,34 @@ pub struct ContentView {
 }
 
 impl ContentView {
+    /// Text still being typed, for a print copy. `Err` is a character this build cannot draw;
+    /// the draft is left as it is. Empty text is `Ok(None)`.
+    pub(crate) fn print_pending(&self) -> Result<Option<pdfcraft_engine::PendingPrintText>, char> {
+        let Some(draft) = &self.draft else { return Ok(None) };
+        if draft.text.trim().is_empty() {
+            return Ok(None);
+        }
+        if let Some(c) = undrawable(draft, &self.undrawable) {
+            return Err(c);
+        }
+        Ok(pending_print_text(draft))
+    }
+}
+
+/// The draft as text to draw on a print copy, using the same box [`finish`] would commit.
+pub(crate) fn pending_print_text(draft: &TextDraft) -> Option<pdfcraft_engine::PendingPrintText> {
+    let text = draft.text.trim_end().to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(pdfcraft_engine::PendingPrintText {
+        page: draft.page,
+        replace: draft.index,
+        text: AddedText { rect: draft.rect, text, ..draft.style.clone() },
+    })
+}
+
+impl ContentView {
     pub(crate) fn finish_draft(&mut self, added: &[Added]) -> Option<Edit> {
         self.draft.take().and_then(|d| finish(self, d, added))
     }
@@ -568,7 +596,14 @@ pub(crate) fn confirms_text_entry(done_clicked: bool, lost_focus: bool, pointer_
 /// The in-place text editor, with Done and Discard beside it. Returns the edit once the text is
 /// committed (a click away, or Done), and whether Done finished adding text. Discard or Escape
 /// throws the draft away. `labelled` shows 確定 and キャンセル for the view-only text tool.
-pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, added: &[Added], labelled: bool) -> (Option<Edit>, bool) {
+pub(crate) fn editor(
+    ctx: &egui::Context,
+    view: &mut DocView,
+    info: &DocInfo,
+    added: &[Added],
+    labelled: bool,
+    commit_on_focus_loss: bool,
+) -> (Option<Edit>, bool) {
     let Some(page) = view.content.draft.as_ref().map(|d| d.page) else {
         view.content.draft_grab = None;
         return (None, false);
@@ -706,7 +741,10 @@ pub(crate) fn editor(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, ad
                 .input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())));
             // Enter confirms an IME conversion or inserts a line. It is not a way to finish.
             cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
-            commit = confirms_text_entry(done, resp.lost_focus() && !view.objects.hold_editor, on_buttons || hold_focus, ime_composing);
+            // The print dialog takes focus. That is not a click away, so the draft stays
+            // uncommitted and printing it does not add an undo step.
+            let away = commit_on_focus_loss && resp.lost_focus() && !view.objects.hold_editor;
+            commit = confirms_text_entry(done, away, on_buttons || hold_focus, ime_composing);
         });
         // Page text is drawn with the standard fonts; anything else would be saved as `?` (#125).
         undrawable = self::undrawable(t, memo);

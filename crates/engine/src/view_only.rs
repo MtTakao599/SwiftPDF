@@ -17,6 +17,9 @@
 //!   [`Capability::EditText`] is also separate. With it, only added text may be applied, undone
 //!   and redone ([`Session::allows_added_text`]). Forms, pages, comments, stamps and in-place
 //!   save stay refused. Edited bytes for a new file come from [`Session::save_edited_copy_bytes`].
+//!   [`Capability::Print`] is also separate. With it, [`Session::print_pdf`] returns a print-ready
+//!   PDF and does not write, mark the document saved, or change undo. A document that forbids
+//!   printing is still refused. Without the grant, the print-ready PDF is refused.
 //!
 //! Reading stays as it is: opening (with a password too) and reloading, rendering, text, search,
 //! forms and signature validation as displayed, layers, hiding comments, reading colours, and
@@ -731,5 +734,106 @@ mod tests {
         }
         assert_eq!(crop(&copy_page, reopened[0].rect, 300.0, 2.0), first_ink, "the saved PDF redrew the first string");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_only_print_is_refused_until_granted_and_then_leaves_the_document() {
+        let (mut s, id) = view_only_session(1);
+        let settings = crate::print::Settings { pages: vec![0], ..Default::default() };
+        assert_eq!(s.print_pdf(id, &settings), Err(EditError::ViewOnly));
+        s.grant(Capability::Print);
+        assert!(s.view_only());
+        assert!(!s.allows(Capability::SaveAs));
+        assert!(!s.allows(Capability::EditText));
+        assert!(!s.allows(Capability::Stamp));
+        assert!(!s.allows(Capability::Organize));
+        let before = s.get(id).unwrap().bytes.clone();
+        let generation = s.get(id).unwrap().edit_generation();
+        let printed = s.print_pdf(id, &settings).unwrap();
+        assert!(printed.starts_with(b"%PDF"));
+        assert!(text_of(printed).contains("Page 1"));
+        let doc = s.get(id).unwrap();
+        assert!(Arc::ptr_eq(&doc.bytes, &before));
+        assert_eq!(doc.edit_generation(), generation);
+        assert!(doc.can_undo().is_none() && doc.can_redo().is_none());
+        assert!(!doc.dirty);
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![0] }), Err(EditError::ViewOnly));
+    }
+
+    #[test]
+    fn view_only_print_draws_uncommitted_text_without_an_undo_step() {
+        let (mut s, id) = view_only_session(1);
+        s.grant(Capability::Print);
+        s.grant(Capability::EditText);
+        let settings = crate::print::Settings { pages: vec![0], ..Default::default() };
+        let before = s.get(id).unwrap().bytes.clone();
+        let generation = s.get(id).unwrap().edit_generation();
+        let sample = crate::AddedText { text: "日本語".into(), rect: [40.0, 200.0, 260.0, 260.0], size: 16.0, ..crate::AddedText::default() };
+        let pending = crate::PendingPrintText { page: 0, replace: None, text: sample.clone() };
+        if crate::first_undrawable(&sample).is_none() {
+            let printed = s.print_pdf_with_pending_text(id, &settings, Some(&pending)).unwrap();
+            assert!(printed.windows(5).any(|window| window == b"Type3"), "the Japanese face stays a Type3 font");
+            let shown = text_of(printed);
+            assert!(shown.contains("日本語"), "{shown}");
+        } else {
+            assert!(s.print_pdf_with_pending_text(id, &settings, Some(&pending)).is_err(), "undrawable text is not silently dropped");
+        }
+        let latin = crate::PendingPrintText {
+            page: 0,
+            replace: None,
+            text: crate::AddedText { text: "Printed note".into(), rect: [40.0, 80.0, 260.0, 140.0], size: 16.0, ..crate::AddedText::default() },
+        };
+        let printed = s.print_pdf_with_pending_text(id, &settings, Some(&latin)).unwrap();
+        assert!(text_of(printed).contains("Printed note"));
+        let doc = s.get(id).unwrap();
+        assert!(Arc::ptr_eq(&doc.bytes, &before));
+        assert_eq!(doc.edit_generation(), generation);
+        assert!(doc.can_undo().is_none() && doc.can_redo().is_none() && !doc.dirty);
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+    }
+
+    #[test]
+    fn view_only_print_keeps_a_signed_file_and_honours_a_print_ban() {
+        use crate::{Changes, Printing, Protection};
+        let mut signer = Session::new().with_clock(|| 1_800_000_000);
+        let id = signer.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let signed = signer.sign(id, &digital_id(), SignOptions { rect: None, ..SignOptions::default() }).unwrap();
+        let mut s = Session::new().with_view_only(true);
+        s.grant(Capability::Print);
+        let id = s.open("signed.pdf", None, signed.clone(), None).unwrap();
+        let settings = crate::print::Settings { pages: vec![0], ..Default::default() };
+        let printed = s.print_pdf(id, &settings).unwrap();
+        assert!(printed.starts_with(b"%PDF"));
+        assert!(std::sync::Arc::ptr_eq(&s.get(id).unwrap().bytes, &signed));
+        assert!(s.get(id).unwrap().is_signed());
+        assert!(s.get(id).unwrap().can_undo().is_none());
+
+        let mut author = Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        author
+            .apply(
+                id,
+                Edit::Protect(Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::None,
+                    changes: Changes::None,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.save_bytes(id).unwrap();
+        let mut reader = Session::new().with_view_only(true);
+        reader.grant(Capability::Print);
+        let id = reader.open("locked.pdf", None, locked.clone(), None).unwrap();
+        assert_eq!(reader.print_pdf(id, &settings), Err(EditError::NotPermitted("printing")));
+        assert!(std::sync::Arc::ptr_eq(&reader.get(id).unwrap().bytes, &locked));
+        assert_eq!(reader.unlock(id, "owner"), Err(EditError::ViewOnly));
+    }
+
+    fn text_of(bytes: Vec<u8>) -> String {
+        let mut s = Session::new();
+        let id = s.open("printed.pdf", None, Arc::new(bytes), None).unwrap();
+        page_text(&s, id, 0)
     }
 }

@@ -7936,8 +7936,8 @@ milestone = "M10"
 status = "shipped"
 commands = ["print.dialog"]
 tools = ["doc_print", "printers"]
-evidence = ["crates/ui-egui/tests/print.rs::print_dialog_lays_out_sheets_and_saves_a_pdf", "crates/engine/src/tests.rs::printing_lays_out_sheets_that_render", "crates/ui-egui/src/web_print.rs::a_job_draws_every_sheet_at_its_planned_resolution_then_builds_the_page", "crates/ui-egui/src/web_print.rs::the_print_page_turns_sideways_sheets_names_other_sizes_and_ends_without_a_blank_page"]
-notes = "⌘P; settings and live sheet preview; on the web the same dialog prints through the browser's print dialog"
+evidence = ["crates/ui-egui/tests/print.rs::print_dialog_lays_out_sheets_and_saves_a_pdf", "crates/engine/src/tests.rs::printing_lays_out_sheets_that_render", "crates/ui-egui/src/web_print.rs::a_job_draws_every_sheet_at_its_planned_resolution_then_builds_the_page", "crates/ui-egui/src/web_print.rs::the_print_page_turns_sideways_sheets_names_other_sizes_and_ends_without_a_blank_page", "crates/ui-egui/tests/swift_print.rs::the_print_dialog_previews_and_changes_printer_paper_orientation_and_range", "crates/ui-egui/tests/swift_print.rs::unsaved_text_is_printed_without_touching_the_original_or_undo", "crates/engine/src/view_only.rs::view_only_print_is_refused_until_granted_and_then_leaves_the_document"]
+notes = "⌘P; settings and live sheet preview; on the web the same dialog prints through the browser's print dialog. SwiftPDF's view-only app grants Capability::Print, so Ctrl+P, the detailed print button and simple-mode 印刷 open this dialog; in-place save and export stay refused. Saving the imposed PDF writes a new file and does not replace the original. An operating-system virtual PDF printer is a spooler job, not this save, and the app does not control where that driver writes."
 
 [[feature]]
 id = "print.printer-selection"

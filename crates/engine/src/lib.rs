@@ -2905,6 +2905,58 @@ impl From<pdfcraft_sign::SignError> for EditError {
     }
 }
 
+/// Text still being typed, drawn onto a copy when printing.
+///
+/// [`Session::print_pdf_with_pending_text`] applies it only to that copy. The open document,
+/// its undo history and the file on disk are not changed, and this cannot carry any other edit.
+#[derive(Clone, Debug)]
+pub struct PendingPrintText {
+    pub page: usize,
+    /// `None` adds the text. `Some(index)` replaces that added item on the copy.
+    pub replace: Option<usize>,
+    pub text: AddedText,
+}
+
+/// The working file as its own document, so printing can change the copy.
+fn opened_cos(doc: &Document) -> Result<pdfcraft_cos::Document, EditError> {
+    match doc.editor.as_ref() {
+        Some(editor) => Ok(editor.cos.clone()),
+        None => pdfcraft_cos::Document::open_with_password(doc.bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Write(e.to_string())),
+    }
+}
+
+/// Draw uncommitted added text onto `cos`. Nothing else is applied.
+fn bake_pending_text(cos: &mut pdfcraft_cos::Document, pending: &PendingPrintText) -> Result<(), EditError> {
+    let content = AddedContent::Text(pending.text.clone());
+    match pending.replace {
+        Some(index) => pdfcraft_edit::update_content(cos, pending.page, index, &content)?,
+        None => {
+            pdfcraft_edit::add_content(cos, pending.page, &content)?;
+        }
+    }
+    Ok(())
+}
+
+/// Print as image: the pages used become pictures first, then those pictures are imposed.
+fn impose_raster(doc: &Document, settings: &print::Settings, raster: &print::Raster) -> Result<Vec<u8>, EditError> {
+    let mut distinct: Vec<usize> = Vec::new();
+    for &page in &settings.pages {
+        if !distinct.contains(&page) {
+            distinct.push(page);
+        }
+    }
+    let hide_comments = matches!(settings.content, print::Content::Document | print::Content::FormFieldsOnly);
+    let bytes = print_raster::rasterize(doc, &distinct, raster, hide_comments).map_err(EditError::Print)?;
+    let pictures = pdfcraft_cos::Document::open(Arc::new(bytes)).map_err(|e| EditError::Print(e.to_string()))?;
+    let remapped = print::Settings {
+        pages: settings.pages.iter().map(|page| distinct.iter().position(|found| found == page).unwrap_or(0)).collect(),
+        content: print::Content::Document,
+        raster: None,
+        ..settings.clone()
+    };
+    pdfcraft_print::impose(&pictures, &remapped).map_err(|e| EditError::Print(e.to_string()))
+}
+
 #[derive(Default)]
 pub struct Session {
     docs: Vec<Document>,
@@ -3633,6 +3685,18 @@ impl Session {
 
     fn doc_mut(&mut self, id: DocId) -> Result<&mut Document, EditError> {
         self.docs.iter_mut().find(|d| d.id == id).ok_or(EditError::NoDocument)
+    }
+
+    /// Whether uncommitted added text may be drawn onto a print copy. It does not allow the
+    /// edit itself: the open document stays unchanged.
+    fn pending_text_printable(&self, doc: &Document) -> bool {
+        if doc.editor.is_none() || doc.read_only_reason.is_some() {
+            return false;
+        }
+        if doc.permissions().is_some_and(|p| !p.modify()) {
+            return false;
+        }
+        !self.view_only || self.allows(Capability::EditText)
     }
 
     /// Whether added text may be placed on `id`: view-only stays on, [`Capability::EditText`] is
@@ -4465,38 +4529,54 @@ impl Session {
     }
 
     /// The print-ready PDF for `settings` (sheets laid out for the paper; see `pdfcraft-print`).
+    ///
+    /// A view-only session returns this only when [`Capability::Print`] is granted. The open
+    /// document is not written, marked saved, or given an undo step. A document whose own
+    /// security forbids printing is refused either way.
     pub fn print_pdf(&self, id: DocId, settings: &print::Settings) -> Result<Vec<u8>, EditError> {
-        self.check_not_view_only()?;
+        self.print_pdf_with_pending_text(id, settings, None)
+    }
+
+    /// [`Self::print_pdf`], also drawing `pending` onto a copy of the working file.
+    ///
+    /// `pending` is text still being typed. It is applied only to that copy, so the open
+    /// document, its undo history and the file on disk stay as they were. It is refused when
+    /// the document does not allow content changes, and it cannot apply any other kind of edit.
+    pub fn print_pdf_with_pending_text(
+        &self,
+        id: DocId,
+        settings: &print::Settings,
+        pending: Option<&PendingPrintText>,
+    ) -> Result<Vec<u8>, EditError> {
+        if self.view_only && !self.allows(Capability::Print) {
+            return Err(EditError::ViewOnly);
+        }
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         if !doc.allows_printing() {
             return Err(EditError::NotPermitted("printing"));
         }
-        // Print as image: the pages used become pictures first, then the picture document is
-        // imposed in their place (its page k is the k-th distinct source page used).
-        if let Some(raster) = &settings.raster {
-            let mut distinct: Vec<usize> = Vec::new();
-            for &p in &settings.pages {
-                if !distinct.contains(&p) {
-                    distinct.push(p);
-                }
-            }
-            let hide_comments = matches!(settings.content, print::Content::Document | print::Content::FormFieldsOnly);
-            let bytes = print_raster::rasterize(doc, &distinct, raster, hide_comments).map_err(EditError::Print)?;
-            let pictures = pdfcraft_cos::Document::open(Arc::new(bytes)).map_err(|e| EditError::Print(e.to_string()))?;
-            let remapped = print::Settings {
-                pages: settings.pages.iter().map(|p| distinct.iter().position(|d| d == p).unwrap_or(0)).collect(),
-                content: print::Content::Document,
-                raster: None,
-                ..settings.clone()
-            };
-            return pdfcraft_print::impose(&pictures, &remapped).map_err(|e| EditError::Print(e.to_string()));
+        if pending.is_some() && !self.pending_text_printable(doc) {
+            return Err(EditError::NotPermitted("changing this document"));
         }
-        let cos = match doc.editor.as_ref() {
-            Some(e) => e.cos.clone(),
-            None => {
-                pdfcraft_cos::Document::open_with_password(doc.bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Write(e.to_string()))?
+        if let Some(raster) = &settings.raster {
+            if pending.is_some() {
+                let mut cos = opened_cos(doc)?;
+                if let Some(pending) = pending {
+                    bake_pending_text(&mut cos, pending)?;
+                }
+                let password = doc.password.clone();
+                let written = pdfcraft_cos::write_full(&cos, &pdfcraft_cos::SaveOptions::default()).map_err(|e| EditError::Print(e.to_string()))?;
+                let mut temp = Session::new();
+                let tid = temp.open("print.pdf", None, Arc::new(written), password.as_deref()).map_err(|e| EditError::Print(e.to_string()))?;
+                let temp_doc = temp.get(tid).ok_or(EditError::NoDocument)?;
+                return impose_raster(temp_doc, settings, raster);
             }
-        };
+            return impose_raster(doc, settings, raster);
+        }
+        let mut cos = opened_cos(doc)?;
+        if let Some(pending) = pending {
+            bake_pending_text(&mut cos, pending)?;
+        }
         pdfcraft_print::impose(&cos, settings).map_err(|e| EditError::Print(e.to_string()))
     }
 
