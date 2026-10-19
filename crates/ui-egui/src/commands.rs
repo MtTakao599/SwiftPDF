@@ -765,6 +765,17 @@ impl PdfCraftApp {
                 }
             }
         }
+        // Redo is Ctrl+Shift+Z in the menu. Windows and Linux also use Ctrl+Y; macOS keeps
+        // Cmd+Shift+Z. A focused text editor keeps its own Ctrl+Y.
+        #[cfg(not(target_os = "macos"))]
+        if !typing && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y))) {
+            if form_typing {
+                self.deferred_commands.push(("edit.redo", active.map(|(_, id)| id)));
+                ctx.request_repaint();
+            } else {
+                self.execute("edit.redo");
+            }
+        }
     }
 }
 

@@ -463,18 +463,51 @@ fn owned_stamp_opacity(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
     );
 }
 
+/// The stamp armed from the palette, when this document may receive one.
+fn armed_stamp_name(app: &PdfCraftApp) -> Option<String> {
+    if !app.active_ids().is_some_and(|(_, id)| app.session.allows_stamp(id)) {
+        return None;
+    }
+    match app.quick_tool {
+        QuickTool::CustomStamp(i) => app.custom_stamps.get(i).map(|stamp| stamp.name.clone()),
+        QuickTool::ChairmanSeal(i) => app.seal_store.library.seals.get(i).map(|seal| seal.name.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn stamp_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let Some(index) = app.active else { return };
-    if app.views.get(index).is_none_or(|view| view.stamp_place.is_none()) {
-        owned_stamp_opacity(app, ui, index);
+    if app.views.get(index).is_some_and(|view| view.stamp_place.is_some()) {
+        place_bar(app, ui, index);
         return;
     }
+    if let Some(name) = armed_stamp_name(app) {
+        let t = Tokens::get(ui.ctx());
+        egui::Panel::top("stamp_arm_bar").exact_size(44.0).frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(10, 4))).show(
+            ui,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("配置中: {name}"));
+                    ui.label("ページをクリックすると仮置きします。");
+                    if widgets::pill_button(ui, "キャンセル", false).clicked() {
+                        app.quick_tool = QuickTool::Select;
+                    }
+                });
+            },
+        );
+        return;
+    }
+    owned_stamp_opacity(app, ui, index);
+}
+
+fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
     let t = Tokens::get(ui.ctx());
+    let name = app.views[index].stamp_place.as_ref().map(|place| place.name.clone()).unwrap_or_default();
     egui::Panel::top("stamp_place_bar").exact_size(44.0).frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(10, 4))).show(
         ui,
         |ui| {
             ui.horizontal(|ui| {
-                ui.label("スタンプの位置");
+                ui.label(format!("配置中: {name}"));
                 let mut opacity = app.views[index].stamp_place.as_ref().map(|place| place.opacity).unwrap_or(1.0);
                 if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("透明度")).changed()
                     && let Some(place) = app.views[index].stamp_place.as_mut()
@@ -486,6 +519,7 @@ pub(crate) fn stamp_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 }
                 if widgets::pill_button(ui, "キャンセル", false).clicked() {
                     app.views[index].stamp_place = None;
+                    app.quick_tool = QuickTool::Select;
                 }
             });
         },
@@ -626,6 +660,7 @@ impl PdfCraftApp {
         if let Some(view) = self.views.get_mut(index) {
             view.stamp_place = None;
         }
+        self.quick_tool = QuickTool::Select;
     }
 
     pub(crate) fn delete_selected_seal(&mut self) {
@@ -662,18 +697,22 @@ impl PdfCraftApp {
 
     /// After undo or redo, keep the chairman-seal log aligned with whether that seal is still in
     /// the working document. A failed log write puts the document back.
-    pub(crate) fn note_seal_history_step(&mut self, id: pdfcraft_engine::DocId, undo: bool, label: &str) {
+    ///
+    /// `false` means that write failed and the document change was rolled back (or could not be).
+    /// The caller must not announce the undo or redo as successful. A general stamp, which has no
+    /// seal-log row, returns `true` and keeps the document change.
+    pub(crate) fn note_seal_history_step(&mut self, id: pdfcraft_engine::DocId, undo: bool, label: &str) -> bool {
         let deletion = match label {
             "Add stamp" => false,
             "Delete comment" => true,
-            _ => return,
+            _ => return true,
         };
         let present = self.session.present_owned_stamps(id);
         let Some(use_index) = self.seal_uses.iter().rposition(|use_| {
             let here = present.iter().any(|refer| refer.num == use_.num && refer.generation == use_.generation);
             if deletion { use_.active != undo && here == undo } else { use_.active == undo && here != undo }
         }) else {
-            return;
+            return true;
         };
         // Adding: undo removes it (`undone`), redo puts it back (`redone`).
         // Deleting: undo puts it back (`removal-undone`), redo takes it off again (`removed`).
@@ -698,10 +737,11 @@ impl PdfCraftApp {
             } else {
                 self.notify("使用履歴を記録できず、文書の状態も戻せませんでした。保存や印刷の前に内容を確認してください。");
             }
-            return;
+            return false;
         }
         if let Some(use_) = self.seal_uses.get_mut(use_index) {
             use_.active = if deletion { undo } else { !undo };
         }
+        true
     }
 }

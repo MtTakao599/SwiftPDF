@@ -3295,7 +3295,14 @@ impl eframe::App for PdfCraftApp {
         }
         content_ui::text_entry_strip(self, ui);
         stamps_ui::stamp_bar(self, ui);
-        if simple && self.active.is_some() && self.left_open && self.left == LeftPanel::Tool("stamp") {
+        // The simple interface has no tool dock. Read mode draws the document directly too, so the
+        // stamp palette has to sit beside it there as well. A detailed workspace that is not Read
+        // draws the same palette in the tool dock, and only that palette while view-only.
+        let stamp_beside = self.active.is_some()
+            && self.left_open
+            && self.left == LeftPanel::Tool("stamp")
+            && (simple || self.reads_directly() && self.active_ids().is_some_and(|(_, id)| self.session.allows_stamp(id)));
+        if stamp_beside {
             egui::Panel::left("simple_stamps")
                 .resizable(true)
                 .default_size(240.0)

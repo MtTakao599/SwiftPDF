@@ -15,8 +15,23 @@ fn hue(g: &ToolGroup) -> Color32 {
 }
 
 pub fn left_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
-    // View-only hides the tool catalogue (the dock drops the pane too). The code stays.
+    // View-only hides the tool catalogue (the dock drops the pane too). The stamp palette is the
+    // one exception, and only while this document may take an image stamp.
     if app.session.view_only() {
+        if view_only_stamp_panel(app) {
+            let t = Tokens::get(ui.ctx());
+            egui::Frame::NONE
+                .fill(t.panel)
+                .inner_margin(egui::Margin { left: 14, right: 10, top: 12, bottom: 10 })
+                .stroke(Stroke::new(1.0, t.divider))
+                .show(ui, |ui| {
+                    if widgets::ghost_button(ui, "x", "閉じる").clicked() {
+                        app.left = LeftPanel::AllTools;
+                        app.left_open = false;
+                    }
+                    stamp_palette(app, ui, &t);
+                });
+        }
         return;
     }
     let t = Tokens::get(ui.ctx());
@@ -303,6 +318,11 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
     if let Some(cmd) = run {
         app.run_command(cmd);
     }
+}
+
+/// Whether the view-only session is showing the stamp palette, and nothing else from the catalogue.
+pub(crate) fn view_only_stamp_panel(app: &PdfCraftApp) -> bool {
+    app.left == LeftPanel::Tool("stamp") && app.active_ids().is_some_and(|(_, id)| app.session.allows_stamp(id))
 }
 
 /// The stamp palette, for the simple interface's own panel as well as the tool dock.

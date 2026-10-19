@@ -26,8 +26,10 @@ const TEXT_TAG: u64 = 1 << 62;
 /// A page rendered for the organize grid at the size it is drawn there.
 const GRID_TAG: u64 = 1 << 61;
 /// Preview rasters tagged with this bit are converted to luminance on receipt, matching the
-/// monochrome print requested by Print ▸ Print in grayscale.
-const GRAYSCALE_TAG: u64 = 1 << 60;
+/// monochrome print requested by Print ▸ Print in grayscale. It is not [`PRINT_TAG`]: every
+/// print preview sets that bit so the renderer ignores Replace Document Colors, and sharing
+/// it turned every colour preview into grayscale even when Print in grayscale was off.
+const GRAYSCALE_TAG: u64 = 1 << 59;
 /// The tag of a raster that is out of date (shown until its replacement arrives).
 const STALE_TAG: u64 = u64::MAX;
 /// Pages whose raster would exceed this many device pixels on a side are drawn in tiles.
@@ -1818,11 +1820,7 @@ impl DocView {
                 self.comments.page_rendered(page);
             }
         } else if r.request.tag & PRINT_TAG != 0 {
-            let tex = ctx.load_texture(
-                format!("print-{:?}-{page}", self.id),
-                if r.request.tag & GRAYSCALE_TAG != 0 { grayscale(img) } else { img },
-                TextureOptions::LINEAR,
-            );
+            let tex = ctx.load_texture(format!("print-{:?}-{page}", self.id), print_preview_image(r.request.tag, img), TextureOptions::LINEAR);
             self.print_pages.insert(page, (r.request.tag, tex));
         } else if r.request.tag & GRID_TAG != 0 {
             let tex = ctx.load_texture(format!("grid-{:?}-{page}", self.id), img, TextureOptions::LINEAR);
@@ -1976,7 +1974,7 @@ impl DocView {
             if self.errors.contains_key(&page) || !scale.is_finite() || scale <= 0.0 {
                 continue;
             }
-            let tag = scale_tag(scale) | PRINT_TAG | if self.grayscale { GRAYSCALE_TAG } else { 0 };
+            let tag = print_preview_tag(scale, self.grayscale);
             let fresh = self.print_pages.get(&page).is_some_and(|(have, _)| *have == tag);
             if !fresh {
                 self.frame_queue.push(RenderRequest { page, kind: RequestKind::Pixels, tile: None, scale, tag, preview: false });
@@ -1999,6 +1997,17 @@ fn annotation_hover_text(a: &pdfcraft_render::Annotation) -> Option<String> {
 /// The request tag for a raster at `scale`: equal tags mean the same scale (to 1/65536).
 fn scale_tag(scale: f32) -> u64 {
     (f64::from(scale) * 65536.0).round() as u64
+}
+
+/// Tag for a print-preview raster. [`PRINT_TAG`] is always set. [`GRAYSCALE_TAG`] is set only
+/// when Print in grayscale is on.
+fn print_preview_tag(scale: f32, grayscale: bool) -> u64 {
+    scale_tag(scale) | PRINT_TAG | if grayscale { GRAYSCALE_TAG } else { 0 }
+}
+
+/// The image uploaded for a print preview. Luminance conversion happens only for [`GRAYSCALE_TAG`].
+fn print_preview_image(tag: u64, img: egui::ColorImage) -> egui::ColorImage {
+    if tag & GRAYSCALE_TAG != 0 { grayscale(img) } else { img }
 }
 
 /// The scale of a raster tagged by [`scale_tag`].
@@ -3822,7 +3831,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     } else {
         view.links.selected = None;
     }
-    if stamp_placed {
+    // A rubber stamp is one click, then back to selecting. An image stamp's preview stays armed
+    // until キャンセル or 確定, so this must not clear CustomStamp or ChairmanSeal.
+    if stamp_placed && view.stamp_place.is_none() {
         tool = QuickTool::Select;
     }
     // The full editor's Done returns to Select (#74). SwiftPDF's text tool stays in AddText
@@ -4499,11 +4510,15 @@ fn notice_bar(ui: &mut egui::Ui, t: &Tokens, icon: &str, icon_color: Color32, te
 fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     // Commenting, drawing, filling and editing have nothing to do while the session is view-only.
-    // Select and Hand stay. Added text stays only while that one capability is granted.
-    // The tools themselves are unchanged for a session that can edit.
+    // Select and Hand stay. Added text stays only while that one capability is granted. A
+    // registered image stamp stays while stamping is granted, so the palette click is not undone
+    // before the next frame. The tools themselves are unchanged for a session that can edit.
     let added_text = matches!(app.quick_tool, QuickTool::AddText) && app.active_ids().is_some_and(|(_, id)| app.session.allows_added_text(id));
+    let image_stamp = matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_))
+        && app.active_ids().is_some_and(|(_, id)| app.session.allows_stamp(id));
     if app.session.view_only()
         && !added_text
+        && !image_stamp
         && !matches!(app.quick_tool, QuickTool::Select | QuickTool::Hand | QuickTool::MarqueeZoom | QuickTool::ColumnSelect)
     {
         app.quick_tool = QuickTool::Select;
@@ -5321,6 +5336,43 @@ mod tests {
         // Unmultiply RGB first, so a translucent colour keeps its paper-relative luminance.
         let translucent = gray.pixels[1];
         assert_eq!(translucent.to_array(), [42, 42, 42, 128]);
+    }
+
+    #[test]
+    fn print_preview_keeps_colour_when_grayscale_is_off() {
+        assert_eq!(PRINT_TAG & GRAYSCALE_TAG, 0, "the print tag must not also mean grayscale");
+        assert_eq!(THUMB_TAG & GRAYSCALE_TAG, 0);
+        assert_eq!(TEXT_TAG & GRAYSCALE_TAG, 0);
+        assert_eq!(GRID_TAG & GRAYSCALE_TAG, 0);
+        assert_eq!(scale_tag(64.0) & (PRINT_TAG | GRAYSCALE_TAG), 0);
+
+        let info = thumbnail_info(1);
+        let mut view = DocView::new(DocId(1), &info, ViewDefaults::default());
+        view.queue_print_previews(&[(0, 2.0)]);
+        let tag = view.frame_queue[0].tag;
+        assert_eq!(tag, print_preview_tag(2.0, false));
+        assert_eq!(tag & PRINT_TAG, PRINT_TAG);
+        assert_eq!(tag & GRAYSCALE_TAG, 0, "grayscale off must not tag the preview for luminance");
+        // Opaque red, opaque blue, and a translucent red stamp pixel.
+        let colour = egui::ColorImage::new(
+            [3, 1],
+            vec![Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 0, 255), Color32::from_rgba_premultiplied(128, 0, 0, 128)],
+        );
+        let kept = print_preview_image(tag, colour.clone());
+        assert_eq!(kept.pixels[0], Color32::from_rgb(255, 0, 0));
+        assert_eq!(kept.pixels[1], Color32::from_rgb(0, 0, 255));
+        assert_eq!(kept.pixels[2], Color32::from_rgba_premultiplied(128, 0, 0, 128));
+
+        view.set_print_grayscale(true);
+        view.queue_print_previews(&[(0, 2.0)]);
+        let mono = view.frame_queue.iter().find(|r| r.tag & GRAYSCALE_TAG != 0).expect("grayscale on tags the preview").tag;
+        assert_eq!(mono, print_preview_tag(2.0, true));
+        let gray = print_preview_image(mono, colour);
+        assert_eq!(gray.pixels[0].to_array(), [76, 76, 76, 255]);
+        assert_eq!(gray.pixels[1].to_array(), [29, 29, 29, 255]);
+        assert_eq!(gray.pixels[2].a(), 128);
+        assert_eq!(gray.pixels[2].r(), gray.pixels[2].g());
+        assert_eq!(gray.pixels[2].g(), gray.pixels[2].b());
     }
 
     #[test]

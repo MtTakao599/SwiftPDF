@@ -396,10 +396,10 @@ pub fn show(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui) {
         // Availability is a render projection: the saved group, selection and width survive Home.
         let _ = rendered.apply(Action::Close { panel: Panel::Inspector });
     }
-    if app.session.view_only() && rendered.contains(&Panel::Tools) {
+    if app.session.view_only() && rendered.contains(&Panel::Tools) && !crate::panels::view_only_stamp_panel(app) {
         // The tool catalogue edits. Hide it for this frame only: the saved layout still has it,
         // so it returns when the session can edit again. The inspector (pages, bookmarks, search)
-        // stays.
+        // stays. The stamp palette is the exception, and it draws only that palette.
         let _ = rendered.apply(Action::Close { panel: Panel::Tools });
     }
     let output = DockArea::new(egui::Id::new("pdfcraft-docking")).show_with_limits(

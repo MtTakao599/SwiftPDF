@@ -426,3 +426,20 @@ fn an_empty_printer_list_says_none_were_found() {
     h.get_by_label_contains("No printers were found");
     assert!(!h.get_by_role_and_label(Role::Button, "Save as PDF").accesskit_node().is_disabled());
 }
+
+/// Simple and detailed use the same print dialog. Colour is the default in both; nothing is sent
+/// to a printer.
+#[test]
+fn both_ui_modes_open_the_print_dialog_in_colour() {
+    for mode in [pdfcraft_ui_egui::UiMode::Simple, pdfcraft_ui_egui::UiMode::Detailed] {
+        let mut h = harness();
+        h.state_mut().set_ui_mode(mode);
+        h.run_steps(2);
+        assert!(h.state_mut().execute("print.dialog"), "{mode:?}");
+        h.run_steps(2);
+        assert_eq!(h.state().dialog, Some(Dialog::Print), "{mode:?}");
+        assert!(!h.state().print_draft.grayscale, "{mode:?}: Print in grayscale starts off");
+        h.get_by_label("Print in grayscale");
+        assert_eq!(h.state().dialog, Some(Dialog::Print), "{mode:?}: opening the dialog does not send a job");
+    }
+}

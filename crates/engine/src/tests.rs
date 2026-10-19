@@ -5682,6 +5682,122 @@ fn printing_as_image_sends_pictures_instead_of_pages() {
     assert!(img.pixels().all(|p| p[0] == p[1] && p[1] == p[2]), "every pixel grey");
 }
 
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+fn rgba_png(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(w, h, image::Rgba(px)).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    png
+}
+
+/// Un-premultiplied channels, so a translucent stamp is judged by its colour, not its coverage.
+fn chroma(px: &[u8]) -> Option<[u16; 3]> {
+    let a = px.get(3).copied().unwrap_or(0);
+    if a < 20 {
+        return None;
+    }
+    let scale = |c: u8| u16::from(c) * 255 / u16::from(a);
+    Some([scale(px[0]), scale(px[1]), scale(px[2])])
+}
+
+fn has_red(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).filter_map(chroma).any(|[r, g, b]| r > 180 && r > g.saturating_add(40) && r > b.saturating_add(40))
+}
+
+fn has_blue(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).filter_map(chroma).any(|[r, g, b]| b > 180 && b > r.saturating_add(40) && b > g.saturating_add(40))
+}
+
+fn page_rgba(bytes: &[u8], tag: u64) -> Vec<u8> {
+    let mut renderer = pdfcraft_render::PageRenderer::new(Arc::new(bytes.to_vec()), Default::default());
+    let out = renderer.render(pdfcraft_render::RenderRequest {
+        page: 0,
+        kind: pdfcraft_render::RequestKind::Pixels,
+        tile: None,
+        scale: 2.0,
+        tag,
+        preview: false,
+    });
+    assert!(out.error.is_none(), "{:?}", out.error);
+    out.rgba.to_vec()
+}
+
+/// A red translucent PNG stamp and blue Japanese Type 3 text stay coloured on the page, in the
+/// print-ready PDF, under the print-preview render tag, and in a saved copy. Grayscale print-as-image
+/// still flattens them. The caller's original bytes are not rewritten, and a print ban is still refused.
+#[test]
+fn print_keeps_a_red_stamp_and_blue_japanese_text_in_colour() {
+    if pdfcraft_fonts::document_japanese_font().is_none() {
+        eprintln!("skipped: craft-fonts not embedded");
+        return;
+    }
+    let original = fixture(1);
+    let original_sha = sha256(&original);
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("fixture.pdf", None, Arc::new(original.clone()), None).unwrap();
+    let file = MarkFile { name: "red.png".into(), bytes: Arc::new(rgba_png(16, 16, [255, 0, 0, 128])), page: 0 };
+    s.apply(id, Edit::AddCustomStamp { page: 0, rect: [20.0, 200.0, 80.0, 260.0], name: "Red".into(), file, author: "Ada".into(), opacity: 1.0 })
+        .unwrap();
+    s.apply(
+        id,
+        Edit::AddText {
+            page: 0,
+            text: AddedText {
+                rect: [10.0, 40.0, 180.0, 80.0], text: "青い文字".into(), size: 24.0, color: [0.0, 0.0, 1.0], ..AddedText::default()
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(sha256(&original), original_sha, "editing must not rewrite the caller's original bytes");
+    assert_eq!(s.get(id).unwrap().can_undo(), Some("Add text"));
+
+    let screen = page_rgba(&s.get(id).unwrap().bytes, 0);
+    assert!(has_red(&screen), "the normal page raster keeps the red stamp");
+    assert!(has_blue(&screen), "the normal page raster keeps the blue Japanese text");
+    let preview = page_rgba(&s.get(id).unwrap().bytes, pdfcraft_render::PRINT_TAG);
+    assert!(has_red(&preview) && has_blue(&preview), "a print-preview render keeps both colours");
+
+    let settings = print::Settings { pages: vec![0], content: print::Content::DocumentAndMarkups, ..Default::default() };
+    let printed = s.print_pdf(id, &settings).unwrap();
+    let sheet = page_rgba(&printed, 0);
+    assert!(has_red(&sheet), "the print-ready PDF keeps the red stamp");
+    assert!(has_blue(&sheet), "the print-ready PDF keeps the blue Japanese text");
+    let grey = s.print_pdf(id, &print::Settings { raster: Some(print::Raster { dpi: 72.0, grayscale: true }), ..settings }).unwrap();
+    let grey_px = page_rgba(&grey, 0);
+    assert!(!has_red(&grey_px) && !has_blue(&grey_px), "print as image in grayscale stays grey");
+
+    let saved = s.save_bytes(id).unwrap();
+    assert_ne!(sha256(&saved), original_sha);
+    assert_eq!(sha256(&original), original_sha);
+    let mut again = Session::new();
+    let saved_id = again.open("saved.pdf", None, saved, None).unwrap();
+    let saved_px = page_rgba(&again.get(saved_id).unwrap().bytes, 0);
+    assert!(has_red(&saved_px) && has_blue(&saved_px), "the saved PDF keeps both colours");
+
+    s.undo(id).unwrap();
+    assert!(!has_blue(&page_rgba(&s.get(id).unwrap().bytes, 0)), "undo removes the blue text");
+    assert!(has_red(&page_rgba(&s.get(id).unwrap().bytes, 0)), "undo of the text leaves the stamp");
+    s.undo(id).unwrap();
+    let cleared = page_rgba(&s.get(id).unwrap().bytes, 0);
+    assert!(!has_red(&cleared) && !has_blue(&cleared));
+    s.redo(id).unwrap();
+    s.redo(id).unwrap();
+    let restored = page_rgba(&s.get(id).unwrap().bytes, 0);
+    assert!(has_red(&restored) && has_blue(&restored), "redo restores both colours");
+
+    let locked =
+        Protection { open_password: Some("pw".into()), permissions_password: Some("owner".into()), printing: Printing::None, ..Default::default() };
+    let (mut banned, banned_id) = session_with(1);
+    banned.apply(banned_id, Edit::Protect(locked)).unwrap();
+    let saved = banned.save_bytes(banned_id).unwrap();
+    let mut reader = Session::new();
+    let opened = reader.open("locked.pdf", None, saved, Some("pw")).unwrap();
+    assert_eq!(reader.print_pdf(opened, &print::Settings { pages: vec![0], ..Default::default() }), Err(EditError::NotPermitted("printing")));
+}
+
 /// A one-page PDF: a JPEG logo (DCTDecode) at the top and a big text title below it.
 fn jpeg_cover_pdf(logo_y: i32) -> Vec<u8> {
     let mut jpeg = Vec::new();

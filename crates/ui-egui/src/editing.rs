@@ -246,13 +246,20 @@ impl PdfCraftApp {
         let result = if undo { self.session.undo(id) } else { self.session.redo(id) };
         match result {
             Ok(label) => {
-                if matches!(label.as_str(), "Add stamp" | "Delete comment") {
-                    self.note_seal_history_step(id, undo, label.as_str());
-                }
+                let kept = if matches!(label.as_str(), "Add stamp" | "Delete comment") {
+                    self.note_seal_history_step(id, undo, label.as_str())
+                } else {
+                    true
+                };
                 if let Some(doc) = self.session.get(id) {
                     self.views[i].document_changed(&doc.info);
                 }
                 self.views[i].comments.selected = None;
+                // A failed seal-log write has already put the document back and said so.
+                // Announcing the undo or redo here would hide that.
+                if !kept {
+                    return;
+                }
                 let label = crate::i18n::edit_label(&label);
                 if undo {
                     self.notify_fmt("Undid {label}", &[("label", &label)]);
