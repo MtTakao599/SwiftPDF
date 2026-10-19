@@ -537,6 +537,9 @@ pub(crate) struct PageCx<'a> {
     pub redact_mark: ([f64; 3], f64),
     /// The document allows commenting.
     pub allowed: bool,
+    /// This annotation may be moved, resized or deleted even when [`Self::allowed`] is false.
+    /// Used for a stamp placed in this view-only session. Other comments stay refused.
+    pub may_change: &'a dyn Fn(usize) -> bool,
     /// Comments are hidden (Hide all comments): nothing to select.
     pub hidden: bool,
 }
@@ -658,7 +661,7 @@ fn resizable(a: &Annotation) -> bool {
 
 const HANDLES: [(i8, i8); 8] = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)];
 
-fn handle_pos(r: Rect, (hx, hy): (i8, i8)) -> Pos2 {
+pub(crate) fn handle_pos(r: Rect, (hx, hy): (i8, i8)) -> Pos2 {
     let x = match hx {
         -1 => r.left(),
         0 => r.center().x,
@@ -1025,10 +1028,12 @@ fn select_input(
     let cv = &mut view.comments;
     let selected = cv.selected.filter(|(p, _)| *p == cx.page).and_then(|(_, i)| cx.get(i));
     // Handles of a selected, resizable comment.
+    let owned_stamp = |index: usize| !cx.allowed && (cx.may_change)(index);
     let handle_at = |p: Pos2| -> Option<(i8, i8)> {
-        let a = selected.filter(|a| cx.allowed && resizable(a))?;
+        let a = selected.filter(|a| ((cx.may_change)(a.index)) && resizable(a))?;
         let r = cx.screen_rect(a);
-        HANDLES.into_iter().find(|h| handle_pos(r, *h).distance(p) <= 7.0)
+        let lock = owned_stamp(a.index);
+        HANDLES.into_iter().filter(|h| !lock || (h.0 != 0 && h.1 != 0)).find(|h| handle_pos(r, *h).distance(p) <= 7.0)
     };
     let mut consumed = false;
     if let Some(p) = pointer {
@@ -1040,7 +1045,7 @@ fn select_input(
                 _ => egui::CursorIcon::ResizeNeSw,
             });
         } else if let Some(a) = cx.hit(p) {
-            let movable = cx.allowed && !is_markup(&a.subtype);
+            let movable = (cx.may_change)(a.index) && !is_markup(&a.subtype);
             ui.ctx().set_cursor_icon(if movable { egui::CursorIcon::Move } else { egui::CursorIcon::PointingHand });
         }
     }
@@ -1053,9 +1058,11 @@ fn select_input(
             let turned = !cx.xf.rot.is_multiple_of(180);
             let aspect_ratio = view.signature_drag.aspect_ratio(cx.page, a.index).map(|ratio| if turned { ratio.recip() } else { ratio });
             // A drawn signature keeps its shape from the corners, as image signatures do.
+            // A session stamp keeps its shape from the corners without Shift.
             let aspect_ratio = aspect_ratio.or_else(|| {
                 let r = cx.screen_rect(a);
-                (a.fill_sign && a.subtype == "Ink" && r.height() > 0.0).then(|| r.width() / r.height())
+                let lock = owned_stamp(a.index) || (a.fill_sign && a.subtype == "Ink");
+                (lock && r.height() > 0.0).then(|| r.width() / r.height())
             });
             cv.gesture = Some(Gesture::Resize { page: cx.page, index: a.index, handle: h, from: o, aspect_ratio });
             consumed = true;
@@ -1064,7 +1071,7 @@ fn select_input(
         {
             cv.selected = Some((cx.page, a.index));
             cv.reveal = true;
-            if cx.allowed {
+            if (cx.may_change)(a.index) {
                 cv.gesture = Some(Gesture::Move { page: cx.page, index: a.index, from: o });
             }
             consumed = true;
@@ -1209,8 +1216,12 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, cx: &PageCx<'_>
         let shift = ui.input(|i| i.modifiers.shift);
         let r = cx.adjusted_rect(a, cv.gesture.as_ref(), pointer, shift, view.pending_edit.as_ref()).expand(2.0);
         painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, SELECT_BLUE), egui::StrokeKind::Middle);
-        if cx.allowed && resizable(a) {
+        if (cx.may_change)(a.index) && resizable(a) {
+            let lock = !cx.allowed && (cx.may_change)(a.index);
             for h in HANDLES {
+                if lock && (h.0 == 0 || h.1 == 0) {
+                    continue;
+                }
                 let c = handle_pos(r, h);
                 painter.circle(c, 4.5, Color32::WHITE, Stroke::new(1.0, SELECT_BLUE));
             }
@@ -1344,7 +1355,18 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
         // Scrolled away: keep the draft until the page is back.
         return None;
     };
-    let cx = PageCx { page, xf: &xf, info, tool: QuickTool::Select, prefs, allowed: true, hidden: false, redact_mark: ([0.89, 0.13, 0.13], 1.0) };
+    let yes = |_: usize| true;
+    let cx = PageCx {
+        page,
+        xf: &xf,
+        info,
+        tool: QuickTool::Select,
+        prefs,
+        allowed: true,
+        may_change: &yes,
+        hidden: false,
+        redact_mark: ([0.89, 0.13, 0.13], 1.0),
+    };
     let anchor = cx.to_screen(c.at);
     let t = Tokens::get(ctx);
     let mut post = false;
@@ -1554,7 +1576,7 @@ pub(crate) fn page_rotation(info: &DocInfo, page: usize) -> i64 {
 }
 
 /// Delete / Escape handling for comments (only while no text field has focus).
-pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool, allowed: bool) {
+pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool, allowed: bool, owned_stamp: bool) {
     if !ctx.input(|i| i.pointer.any_down()) {
         view.comments.cancelled_drag = false;
     }
@@ -1569,7 +1591,7 @@ pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool
             *tool = QuickTool::Select;
         }
     }
-    if allowed
+    if (allowed || owned_stamp)
         && let Some((page, index)) = cv.selected
         && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
     {
@@ -1579,7 +1601,14 @@ pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool
 }
 
 /// Items of the canvas context menu for the selected comment (or the page).
-pub(crate) fn context_menu(ui: &mut egui::Ui, view: &mut DocView, info: &DocInfo, prefs: &CommentPrefs, allowed: bool) -> Option<CanvasAction> {
+pub(crate) fn context_menu(
+    ui: &mut egui::Ui,
+    view: &mut DocView,
+    info: &DocInfo,
+    prefs: &CommentPrefs,
+    allowed: bool,
+    owned_stamp: bool,
+) -> Option<CanvasAction> {
     let mut action = None;
     let selected = view.comments.selected.and_then(|(p, i)| info.annotations.iter().find(|a| a.page == p && a.index == i && a.in_reply_to.is_none()));
     match selected {
@@ -1635,7 +1664,7 @@ pub(crate) fn context_menu(ui: &mut egui::Ui, view: &mut DocView, info: &DocInfo
                 ui.close();
             }
             ui.separator();
-            if ui.add_enabled(allowed && !a.locked, egui::Button::new(tl!("Delete"))).clicked() {
+            if ui.add_enabled((allowed || owned_stamp) && !a.locked, egui::Button::new(tl!("Delete"))).clicked() {
                 view.comments.selected = None;
                 action = Some(CanvasAction::Edit(Box::new(Edit::DeleteAnnotation { page, index })));
                 ui.close();

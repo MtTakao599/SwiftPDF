@@ -484,6 +484,8 @@ pub struct DocView {
     select_anchor: Option<usize>,
     /// An edit requested by the view (organize toolbar, keys), applied by the app this frame.
     pub pending_edit: Option<Edit>,
+    /// A stamp positioned on the page and not yet confirmed. Absent from the document and from undo.
+    pub stamp_place: Option<crate::stamps_ui::StampPlace>,
     /// Edit text: the lines per page (with the document generation they were read at), and the
     /// line being edited.
     pub(crate) edit_lines: HashMap<usize, (u64, Vec<pdfcraft_engine::TextBlock>)>,
@@ -747,6 +749,7 @@ impl DocView {
             select_anchor: None,
             organize_range: Default::default(),
             pending_edit: None,
+            stamp_place: None,
             edit_lines: HashMap::new(),
             line_editor: None,
             pending_text_open: None,
@@ -2297,6 +2300,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         return;
     }
     let place_text = app.session.allows_added_text(app.views[index].id);
+    let doc_id = app.views[index].id;
     let Some(doc) = app.session.get(app.views[index].id) else { return };
     let info = &doc.info;
     if info.pages.is_empty() {
@@ -2340,6 +2344,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     }
     // No dialog, close prompt or palette over the page: only then does page input count.
     let unobstructed = !app.modal_open() && !app.palette_open;
+    let stamp_block = app.stamp_refusal(index);
+    let seal_locked = app.seal_store.locked();
     let view = &mut app.views[index];
     if view.organize {
         organize_grid(view, info, doc.allows_assembly(), doc.dirty, unobstructed, ui, &t);
@@ -2602,6 +2608,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         | QuickTool::EditText
         | QuickTool::Stamp(_)
         | QuickTool::CustomStamp(_)
+        | QuickTool::ChairmanSeal(_)
         | QuickTool::Link
         | QuickTool::SignArea { .. }
         | QuickTool::MarqueeZoom
@@ -2633,6 +2640,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         QuickTool::CustomStamp(i) => app.custom_stamps.get(i).cloned(),
         _ => None,
     };
+    let chairman_seal = match app.quick_tool {
+        QuickTool::ChairmanSeal(i) => app.seal_store.library.seals.get(i).cloned(),
+        _ => None,
+    };
+    let stamp_grant = app.session.view_only() && app.session.allows(pdfcraft_engine::Capability::Stamp);
     let mut open_signature = false;
     let mut hover_text: Option<(Pos2, String)> = None;
     let mut badge_hover: Option<(Pos2, String)> = None;
@@ -2890,7 +2902,15 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(0.5, t.border.gamma_multiply(0.8)), egui::StrokeKind::Outside);
 
             // Comments: tools, selection, moving and resizing come before text selection.
-            let pcx = comments::PageCx { page: i, xf: &xf, info, tool, prefs, allowed, hidden: comments_hidden, redact_mark };
+            let owned_stamps: Vec<usize> = info
+                .annotations
+                .iter()
+                .filter(|a| a.page == i && a.subtype == "Stamp" && app.session.owns_stamp(doc_id, i, a.index))
+                .map(|a| a.index)
+                .collect();
+            let may_change = |ann: usize| allowed || owned_stamps.contains(&ann);
+            let pcx =
+                comments::PageCx { page: i, xf: &xf, info, tool, prefs, allowed, may_change: &may_change, hidden: comments_hidden, redact_mark };
             if let QuickTool::Measure(measure_tool) = tool {
                 crate::measure_ui::page_input(ui, &resp, doc, view, &pcx, measure_tool, units);
             }
@@ -2937,8 +2957,50 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                         name: cs.name.clone(),
                         file: pdfcraft_engine::MarkFile { name: cs.file.clone(), bytes: cs.data.clone(), page: cs.page },
                         author: author.clone(),
+                        opacity: 1.0,
                     });
                     stamp_placed = true;
+                }
+            }
+            let draft_click = crate::stamps_ui::page_draft(painter, view, info, i, &xf);
+            if stamp_grant
+                && !draft_click
+                && let Some(p) = ui.input(|inp| inp.pointer.hover_pos()).filter(|p| xf.rect.contains(*p))
+            {
+                let chosen = custom_stamp.as_ref().map(|cs| (cs.name.clone(), cs.file.clone(), cs.data.clone(), cs.page, false)).or_else(|| {
+                    chairman_seal.as_ref().map(|seal| (seal.name.clone(), seal.file.clone(), std::sync::Arc::new(seal.data.clone()), 0, true))
+                });
+                if let Some((name, file, data, source_page, chairman)) = chosen {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    if resp.clicked() {
+                        if let Some(why) = stamp_block.clone() {
+                            refused = Some(why);
+                        } else if chairman && seal_locked {
+                            refused = Some("印影ファイルを復号できないため、理事長印は使えません。".into());
+                        } else {
+                            let (vx, vy) = xf.screen_to_view(p);
+                            let u = info.pages[i].view_to_user(vx, vy);
+                            let pixels = crate::seal_store::preview_rgba(&data);
+                            let rect = crate::stamps_ui::place_at(
+                                &info.pages[i],
+                                [f64::from(u[0]), f64::from(u[1])],
+                                pixels.as_ref().map(|(w, h, _)| (*w, *h)),
+                            );
+                            view.stamp_place = Some(crate::stamps_ui::StampPlace {
+                                page: i,
+                                rect,
+                                name,
+                                file,
+                                data,
+                                source_page,
+                                opacity: 1.0,
+                                chairman,
+                                pixels,
+                                drag: None,
+                            });
+                            stamp_placed = true;
+                        }
+                    }
                 }
             }
             // Over a mark already placed, the Fill & Sign tool picks it up (comments, below).
@@ -3575,7 +3637,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     ui.separator();
                 }
             }
-            canvas_action = comments::context_menu(ui, view, info, prefs, allowed).or(copy_image);
+            let owned_selected = view.comments.selected.is_some_and(|(page, ann)| app.session.owns_stamp(doc_id, page, ann));
+            canvas_action = comments::context_menu(ui, view, info, prefs, allowed, owned_selected).or(copy_image);
         });
         (wanted, visible_now)
     });
@@ -3733,7 +3796,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some(e) = crate::fill_sign::type_box(ui.ctx(), view, info, &author) {
         view.pending_edit = Some(e);
     }
-    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, !matches!(app.dialog, Some(crate::Dialog::Print)));
+    let stamp_ui = matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_)) || view.stamp_place.is_some();
+    let (typed, text_done) =
+        crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, !matches!(app.dialog, Some(crate::Dialog::Print)) && !stamp_ui);
     if typed.is_some() {
         view.pending_edit = typed;
     }
@@ -3744,7 +3809,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     // One crop, then back to selecting (as Acrobat does).
     let cropped = view.pending_edit.as_ref().is_some_and(|e| matches!(e, pdfcraft_engine::Edit::SetPageBox { .. }));
     let mut tool = app.quick_tool;
-    comments::keys(ui.ctx(), view, &mut tool, allowed);
+    let owned_selected = view.comments.selected.is_some_and(|(page, ann)| app.session.owns_stamp(doc_id, page, ann));
+    comments::keys(ui.ctx(), view, &mut tool, allowed, owned_selected);
     if preparing {
         crate::prepare::keys(ui.ctx(), view);
     }

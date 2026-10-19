@@ -983,6 +983,22 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                 close = save || cancel;
                 return;
             }
+            Dialog::ConfirmSeal => {
+                let (save, cancel) = crate::stamps_ui::confirm_seal_body(ui, app);
+                if save {
+                    app.commit_stamp_place();
+                }
+                close = save || cancel;
+                return;
+            }
+            Dialog::DeleteSeal => {
+                let (save, cancel) = crate::stamps_ui::delete_seal_body(ui, app);
+                if save {
+                    app.delete_selected_seal();
+                }
+                close = save || cancel;
+                return;
+            }
             Dialog::PdfA => {
                 close = crate::standards_ui::body(ui, app, &t);
                 return;

@@ -4112,8 +4112,8 @@ milestone = "M5"
 status = "shipped"
 commands = ["comment.stamp"]
 tools = ["stamp_custom"]
-evidence = ["crates/ui-egui/tests/stamps.rs::creating_placing_and_keeping_custom_stamps", "crates/automation/tests/automation.rs::stamps_through_tools", "crates/engine/src/tests.rs::explicit_image_stamps_keep_displayed_orientation_on_rotated_pages", "crates/engine/src/tests.rs::pdf_page_stamps_keep_displayed_orientation_on_rotated_pages"]
-notes = "Create custom stamp from a PDF page or an image (category and name), kept in the app's settings; placed at natural size (at most 200 pt) keeping its shape; resizable (appearance redrawn from /PCPicture); delete from the palette. Natural-size and explicit-rectangle images, and PDF-page stamps, read upright on a rotated page (#1398)"
+evidence = ["crates/ui-egui/tests/stamps.rs::creating_placing_and_keeping_custom_stamps", "crates/automation/tests/automation.rs::stamps_through_tools", "crates/engine/src/tests.rs::explicit_image_stamps_keep_displayed_orientation_on_rotated_pages", "crates/engine/src/tests.rs::pdf_page_stamps_keep_displayed_orientation_on_rotated_pages", "crates/engine/src/view_only.rs::view_only_stamps_are_only_the_ones_this_session_places"]
+notes = "Create custom stamp from a PDF page or an image (category and name), kept in the app's settings; placed at natural size (at most 200 pt) keeping its shape; resizable (appearance redrawn from /PCPicture); delete from the palette. Natural-size and explicit-rectangle images, and PDF-page stamps, read upright on a rotated page (#1398). SwiftPDF's view-only grant places only a custom image this session added, and chairman seals stored as DPAPI ciphertext outside settings. It does not enable the English rubber stamps, stamp rotation, or a changeable date seal. A PDF that already contains a signature is refused."
 
 [[feature]]
 id = "comment.stamps-manage"

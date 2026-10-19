@@ -52,6 +52,26 @@ impl PdfCraftApp {
     pub fn apply_edit(&mut self, edit: Edit) -> bool {
         let Some((i, id)) = self.active_ids() else { return false };
         let label = edit.label();
+        let removed_seal = if let Edit::DeleteAnnotation { page, index } = &edit {
+            self.session
+                .owned_stamp_ref(id, *page, *index)
+                .and_then(|refer| self.seal_uses.iter().position(|use_| use_.active && use_.num == refer.num && use_.generation == refer.generation))
+        } else {
+            None
+        };
+        if let Some(use_index) = removed_seal {
+            let event = crate::seal_store::SealEvent {
+                at: crate::seal_store::utc_now(),
+                file: self.seal_uses[use_index].file_name.clone(),
+                page: self.seal_uses[use_index].page,
+                seal: self.seal_uses[use_index].name.clone(),
+                event: "removed".into(),
+            };
+            if let Err(error) = self.seal_store.append_event(event) {
+                self.notify(format!("使用履歴を記録できないため、印影は削除しませんでした。{error}"));
+                return false;
+            }
+        }
         let (form_before, page_count_before, had_xfa) = if let Some(d) = self.session.get(id) {
             (Some(std::sync::Arc::clone(&d.form)), d.info.pages.len(), d.xfa.is_some())
         } else {
@@ -170,10 +190,27 @@ impl PdfCraftApp {
                 }
                 let out = self.session.take_js_output(id);
                 self.handle_js(id, out);
+                if let Some(use_index) = removed_seal
+                    && let Some(use_) = self.seal_uses.get_mut(use_index)
+                {
+                    use_.active = false;
+                }
                 true
             }
             Err(e) => {
-                let message = if matches!(edit, Edit::MoveObjects { .. }) { crate::object_ui::move_error(&e) } else { e.to_string() };
+                if removed_seal.is_some()
+                    && let Err(error) = self.seal_store.pop_event()
+                {
+                    self.notify(format!("印影は削除されていません。使用履歴の取り消しに失敗しました。{error}"));
+                    return false;
+                }
+                let message = if matches!(e, pdfcraft_engine::EditError::NotPermitted("stamps on a signed document")) {
+                    "電子署名がある PDF にはスタンプを押せません".into()
+                } else if matches!(edit, Edit::MoveObjects { .. }) {
+                    crate::object_ui::move_error(&e)
+                } else {
+                    e.to_string()
+                };
                 self.notify_fmt("{label} failed: {e}", &[("label", &crate::i18n::edit_label(&label)), ("e", &message)]);
                 false
             }
@@ -209,6 +246,9 @@ impl PdfCraftApp {
         let result = if undo { self.session.undo(id) } else { self.session.redo(id) };
         match result {
             Ok(label) => {
+                if matches!(label.as_str(), "Add stamp" | "Delete comment") {
+                    self.note_seal_history_step(id, undo, label.as_str());
+                }
                 if let Some(doc) = self.session.get(id) {
                     self.views[i].document_changed(&doc.info);
                 }
@@ -1052,7 +1092,7 @@ impl PdfCraftApp {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
-                    let en = format!("Couldn't save the edited PDF. The text you added is still here. {error}");
+                    let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
                     self.notify(crate::identity::localized(&ja, &en));
                     return false;
                 }

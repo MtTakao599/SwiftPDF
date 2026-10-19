@@ -305,17 +305,27 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
     }
 }
 
+/// The stamp palette, for the simple interface's own panel as well as the tool dock.
+pub(crate) fn stamp_tools(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+    stamp_palette(app, ui, &t);
+}
+
 /// Add a stamp: Dynamic, Sign Here and Standard Business stamps; click one, then click on the
-/// page to place it.
+/// page to place it. A view-only session shows only custom images and chairman seals.
 fn stamp_palette(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     use pdfcraft_engine::{StampGroup, StampKind};
     ui.label(egui::RichText::new(tl!("Choose a stamp, then click on the page to place it.")).small().color(t.text_faint));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let rubber = !app.session.view_only();
         for (group, title) in [
             (StampGroup::Dynamic, tl!("Dynamic")),
             (StampGroup::SignHere, tl!("Sign Here")),
             (StampGroup::StandardBusiness, tl!("Standard Business")),
         ] {
+            if !rubber {
+                continue;
+            }
             widgets::section_title(ui, title);
             for kind in StampKind::ALL.into_iter().filter(|k| k.group() == group) {
                 let active = app.quick_tool == crate::QuickTool::Stamp(kind);

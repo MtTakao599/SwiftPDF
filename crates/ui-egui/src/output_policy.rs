@@ -93,6 +93,12 @@ impl PdfCraftApp {
         set_print_allowed(true);
     }
 
+    /// Grant image stamps placed in this session. View-only stays on. Other comments, forms,
+    /// pages, in-place save and export stay refused.
+    pub fn grant_stamp(&mut self) {
+        self.session.grant(pdfcraft_engine::Capability::Stamp);
+    }
+
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so
     /// nothing is prepared and no file dialog opens.
     pub(crate) fn refuse_output(&mut self) -> bool {

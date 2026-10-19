@@ -70,6 +70,7 @@ fn custom_image_stamp_keeps_displayed_orientation_on_rotated_pages() {
                     name: "Original quadrants".into(),
                     file: MarkFile { name: "quadrants.png".into(), bytes: bytes.clone(), page: 0 },
                     author: "Test".into(),
+                    opacity: 1.0,
                 },
             )
             .unwrap();
@@ -311,6 +312,7 @@ fn explicit_image_stamps_keep_displayed_orientation_on_rotated_pages() {
                     name: "Original quadrants".into(),
                     file: MarkFile { name: "quadrants.png".into(), bytes: bytes.clone(), page: 0 },
                     author: "Test".into(),
+                    opacity: 1.0,
                 },
             )
             .unwrap();
@@ -338,6 +340,7 @@ fn pdf_page_stamps_keep_displayed_orientation_on_rotated_pages() {
                     name: "Half red".into(),
                     file: MarkFile { name: "half.pdf".into(), bytes: bytes.clone(), page: 0 },
                     author: "Test".into(),
+                    opacity: 1.0,
                 },
             )
             .unwrap();

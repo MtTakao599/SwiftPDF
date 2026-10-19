@@ -120,7 +120,8 @@ mod tests {
         // A click places the stamp at its natural size: 30 x 20 pt as stored, 20 x 30 pt upright.
         // Named "Signature" so `signature_image` finds its picture.
         let file = MarkFile { name: "photo.jpg".into(), bytes: std::sync::Arc::new(phone_jpeg(6, 144)), page: 0 };
-        let stamp = Edit::AddCustomStamp { page: 0, rect: [100.0, 100.0, 100.0, 100.0], name: "Signature".into(), file, author: "Ada".into() };
+        let stamp =
+            Edit::AddCustomStamp { page: 0, rect: [100.0, 100.0, 100.0, 100.0], name: "Signature".into(), file, author: "Ada".into(), opacity: 1.0 };
         session.apply(id, stamp).unwrap();
         let cos = &session.get(id).unwrap().editor.as_ref().unwrap().cos;
         let picture = pdfcraft_annot::signature_image(cos, 0, 0).unwrap().unwrap();

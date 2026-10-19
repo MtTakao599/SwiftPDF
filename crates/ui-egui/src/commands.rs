@@ -88,6 +88,12 @@ impl PdfCraftApp {
         if spec.id == "edit.text" && self.active_ids().is_some_and(|(_, id)| self.session.allows_added_text(id)) {
             return true;
         }
+        // Image stamps likewise. `allows_annotation` is false for every view-only document, which
+        // is this app's mode and not the PDF's security. The PDF's own comment permission, and a
+        // signature, are still checked by [`pdfcraft_engine::Session::allows_stamp`].
+        if spec.id == "comment.stamp" && self.active_ids().is_some_and(|(_, id)| self.session.allows_stamp(id)) {
+            return true;
+        }
         // Undo and Redo act on the Combine files list while its tab shows.
         if self.combine_showing() && matches!(spec.needs, commands::Needs::Undo | commands::Needs::Redo) {
             return self.combine_can_undo(spec.needs == commands::Needs::Undo);
@@ -151,6 +157,10 @@ impl PdfCraftApp {
                     }
                 }
                 commands::Needs::Unlock if self.active.is_some() => tl!("This document has no restrictions to lift").to_string(),
+                commands::Needs::Annotate if spec.id == "comment.stamp" && self.active.is_some() => self
+                    .active
+                    .and_then(|index| self.stamp_refusal(index))
+                    .unwrap_or_else(|| tl!("The document's security settings don't allow this change").to_string()),
                 commands::Needs::Assembly | commands::Needs::Modification | commands::Needs::Annotate if self.active.is_some() => {
                     tl!("The document's security settings don't allow this change").to_string()
                 }
@@ -874,5 +884,115 @@ mod tests {
         assert_eq!(tab_after(Some(7), 3, true), Some(0), "a stale index starts over");
         assert_eq!(tab_after(None, 0, true), None);
         assert_eq!(tab_after(Some(0), 0, false), None);
+    }
+
+    /// One page, no encryption. Document Properties reports no security.
+    fn plain_pdf() -> Vec<u8> {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>",
+            "<< /Type /Page /Parent 2 0 R >>",
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, obj) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{obj}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+        out
+    }
+
+    fn toast(app: &PdfCraftApp) -> String {
+        app.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default()
+    }
+
+    /// View-only is not a PDF restriction. An unsecured file must open the stamp tool.
+    #[test]
+    fn an_unsecured_pdf_opens_the_stamp_tool_without_a_security_refusal() {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.open_bytes("plain.pdf", None, plain_pdf()).unwrap();
+        let id = app.views[0].id;
+        let doc = app.session.get(id).unwrap();
+        assert!(app.session.view_only());
+        assert!(!doc.editable(), "view-only stays on");
+        assert!(doc.security_summary().is_none(), "the file has no security handler");
+        assert!(!doc.allows_annotation(), "general commenting stays tied to a fully editable document");
+        assert!(app.command_allowed("comment.stamp"));
+        assert!(!app.command_allowed("comment.note"));
+        assert!(!app.command_allowed("file.save"));
+        let spec = pdfcraft_engine::commands::command("comment.stamp").unwrap();
+        assert!(app.command_enabled(spec), "the stamp command must not inherit the annotation ban from view-only");
+        assert!(app.execute("comment.stamp"), "{}", toast(&app));
+        assert!(!toast(&app).contains("security settings"), "{}", toast(&app));
+        assert_eq!(app.left, crate::LeftPanel::Tool("stamp"));
+        assert!(app.session.get(id).unwrap().info.annotations.is_empty(), "opening the tool places nothing");
+        assert!(!app.execute("comment.note"));
+        assert_eq!(toast(&app), crate::command_policy::REFUSED);
+        assert!(!app.execute("page.delete"));
+        assert_eq!(toast(&app), crate::command_policy::REFUSED);
+    }
+
+    fn locked_pdf() -> Vec<u8> {
+        use pdfcraft_engine::{Changes, Printing, Protection};
+        let mut author = pdfcraft_engine::Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("plain.pdf", None, std::sync::Arc::new(plain_pdf()), None).unwrap();
+        author
+            .apply(
+                id,
+                pdfcraft_engine::Edit::Protect(Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::High,
+                    changes: Changes::None,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        author.save_bytes(id).unwrap().as_ref().clone()
+    }
+
+    fn signed_pdf() -> Vec<u8> {
+        let p12 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap();
+        let identity = pdfcraft_engine::sign::pkcs12::open(&p12, "test").unwrap();
+        let mut signer = pdfcraft_engine::Session::new().with_clock(|| 1_800_000_000);
+        let id = signer.open("plain.pdf", None, std::sync::Arc::new(plain_pdf()), None).unwrap();
+        signer.sign(id, &identity, pdfcraft_engine::SignOptions { rect: None, ..pdfcraft_engine::SignOptions::default() }).unwrap().as_ref().clone()
+    }
+
+    fn stamp_app(bytes: Vec<u8>) -> PdfCraftApp {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.open_bytes("sample.pdf", None, bytes).unwrap();
+        app
+    }
+
+    #[test]
+    fn a_comment_ban_and_a_signature_still_refuse_the_stamp_tool() {
+        let mut banned = stamp_app(locked_pdf());
+        let id = banned.views[0].id;
+        assert!(!banned.session.allows_stamp(id));
+        assert!(!banned.session.get(id).unwrap().editable());
+        assert!(!banned.execute("comment.stamp"));
+        assert!(toast(&banned).contains("注釈"), "{}", toast(&banned));
+        assert!(banned.session.get(id).unwrap().info.annotations.is_empty());
+
+        let mut signed = stamp_app(signed_pdf());
+        let id = signed.views[0].id;
+        assert!(signed.session.get(id).unwrap().is_signed());
+        assert!(!signed.session.allows_stamp(id));
+        assert!(!signed.execute("comment.stamp"));
+        assert!(toast(&signed).contains("電子署名"), "{}", toast(&signed));
+        assert!(signed.session.get(id).unwrap().info.annotations.is_empty());
+        assert!(!signed.command_allowed("comment.note"));
     }
 }

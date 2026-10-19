@@ -354,12 +354,18 @@ fn app_creator<'a>(
         started.set(true);
         let mut app = PdfCraftApp::new();
         // SwiftPDF stays view-only. v0.2.0 grants a copy to a new path. v0.3.0 also grants
-        // adding text. v0.4.0 grants printing. Nothing turns view-only off. In-place save and
-        // export stay refused.
+        // adding text. v0.4.0 grants printing. v0.5.0 grants image stamps placed in this
+        // session. Nothing turns view-only off. In-place save and export stay refused.
         app.set_view_only(true);
         app.grant_save_as();
         app.grant_edit_text();
         app.grant_print();
+        app.grant_stamp();
+        // Chairman seals live in this folder (LOCALAPPDATA\SwiftPDF, or Data beside a portable
+        // exe). They are DPAPI ciphertext, not an entry in app.ron.
+        if let Some(dir) = settings_dir() {
+            app.set_seal_store(dir.join("seals.bin"));
+        }
         // First start (or settings from before Units existed): the region's unit.
         app.units = pdfcraft_ui_egui::units::Unit::system();
         #[cfg(target_os = "linux")]

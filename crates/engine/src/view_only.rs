@@ -15,11 +15,17 @@
 //!   refused too. With it, that method returns the opened bytes only; it still does not allow
 //!   [`Session::save_bytes`], a rewrite, or any other capability.
 //!   [`Capability::EditText`] is also separate. With it, only added text may be applied, undone
-//!   and redone ([`Session::allows_added_text`]). Forms, pages, comments, stamps and in-place
-//!   save stay refused. Edited bytes for a new file come from [`Session::save_edited_copy_bytes`].
+//!   and redone ([`Session::allows_added_text`]). Forms, pages, comments and in-place save stay
+//!   refused. Edited bytes for a new file come from [`Session::save_edited_copy_bytes`].
 //!   [`Capability::Print`] is also separate. With it, [`Session::print_pdf`] returns a print-ready
 //!   PDF and does not write, mark the document saved, or change undo. A document that forbids
 //!   printing is still refused. Without the grant, the print-ready PDF is refused.
+//!   [`Capability::Stamp`] is also separate. With it, only a custom-image stamp placed in this
+//!   session, and a later move, resize, opacity change or deletion of that same stamp, may be
+//!   applied, undone and redone. It does not turn view-only off, and it does not allow rubber
+//!   stamps, other comments, forms or pages. A document that already has a signature, or whose
+//!   signature state cannot be read, is refused. A document that forbids comments is still
+//!   refused. Stamps that were already in the file are not editable.
 //!
 //! Reading stays as it is: opening (with a password too) and reloading, rendering, text, search,
 //! forms and signature validation as displayed, layers, hiding comments, reading colours, and
@@ -829,6 +835,151 @@ mod tests {
         assert_eq!(reader.print_pdf(id, &settings), Err(EditError::NotPermitted("printing")));
         assert!(std::sync::Arc::ptr_eq(&reader.get(id).unwrap().bytes, &locked));
         assert_eq!(reader.unlock(id, "owner"), Err(EditError::ViewOnly));
+    }
+
+    fn stamp_edit(page: usize, rect: [f64; 4], opacity: f64) -> Edit {
+        Edit::AddCustomStamp {
+            page,
+            rect,
+            name: "Probe".into(),
+            file: crate::MarkFile { name: "probe.png".into(), bytes: std::sync::Arc::new(pdfcraft_xfa::fixtures::tiny_png()), page: 0 },
+            author: "Test".into(),
+            opacity,
+        }
+    }
+
+    #[test]
+    fn view_only_stamps_are_only_the_ones_this_session_places() {
+        use crate::{Changes, Printing, Protection, print::Content};
+        let (mut s, id) = view_only_session(2);
+        let original = s.opened_bytes(id).unwrap();
+        let original_hash = sha256(&original);
+        assert_eq!(s.apply(id, stamp_edit(0, [40.0, 40.0, 100.0, 100.0], 0.5)), Err(EditError::ViewOnly));
+        s.grant(Capability::Stamp);
+        assert!(s.view_only());
+        assert!(!s.get(id).unwrap().editable());
+        assert!(!s.get(id).unwrap().allows_annotation());
+        assert!(s.allows_stamp(id), "no security handler still allows a session stamp");
+        assert!(!s.allows(Capability::Organize));
+        s.apply(id, stamp_edit(0, [40.0, 40.0, 100.0, 100.0], 0.5)).unwrap();
+        s.apply(id, stamp_edit(1, [20.0, 20.0, 80.0, 80.0], 1.0)).unwrap();
+        let doc = s.get(id).unwrap();
+        assert_eq!(doc.info.annotations.len(), 2);
+        assert!(doc.info.annotations.iter().all(|a| a.subtype == "Stamp"));
+        assert!(doc.bytes.windows(5).any(|window| window == b"SMask"));
+        assert!(doc.bytes.windows(3).any(|window| window == b"/CA"));
+        assert!(s.owns_stamp(id, 0, 0));
+        assert!(s.owns_stamp(id, 1, 0));
+        assert!(!s.owns_stamp(id, 0, 1));
+        assert_eq!(s.opened_bytes(id).unwrap().as_ref(), original.as_ref());
+        assert_eq!(sha256(s.opened_bytes(id).unwrap().as_ref()), original_hash);
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![0] }), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::SetAnnotationContents { page: 0, index: 0, text: "no".into() }), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::MoveAnnotation { page: 0, index: 1, dx: 4.0, dy: 0.0 }), Err(EditError::NotPermitted("this annotation")));
+        s.apply(id, Edit::MoveAnnotation { page: 0, index: 0, dx: 10.0, dy: 0.0 }).unwrap();
+        s.apply(id, Edit::ResizeAnnotation { page: 0, index: 0, rect: [50.0, 40.0, 140.0, 130.0] }).unwrap();
+        s.apply(id, Edit::StyleAnnotation { page: 0, index: 0, color: None, opacity: Some(0.25), width: None, endings: None }).unwrap();
+        assert_eq!(
+            s.apply(id, Edit::StyleAnnotation { page: 0, index: 0, color: Some([1.0, 0.0, 0.0]), opacity: Some(0.5), width: None, endings: None }),
+            Err(EditError::NotPermitted("this annotation"))
+        );
+        assert_eq!(s.undo(id).unwrap().as_str(), "Change comment properties");
+        assert_eq!(s.undo(id).unwrap().as_str(), "Resize comment");
+        assert_eq!(s.undo(id).unwrap().as_str(), "Move comment");
+        assert!(s.owns_stamp(id, 0, 0));
+        s.undo(id).unwrap();
+        assert_eq!(s.get(id).unwrap().info.annotations.len(), 1);
+        s.redo(id).unwrap();
+        assert!(s.owns_stamp(id, 0, 0));
+        s.grant(Capability::SaveAs);
+        let saved = s.save_edited_copy_bytes(id).unwrap();
+        assert!(saved.windows(5).any(|window| window == b"SMask"));
+        assert_eq!(s.opened_bytes(id).unwrap().as_ref(), original.as_ref());
+        s.grant(Capability::Print);
+        let markups =
+            s.print_pdf(id, &crate::print::Settings { pages: vec![0], content: Content::DocumentAndMarkups, ..Default::default() }).unwrap();
+        let stamps = s.print_pdf(id, &crate::print::Settings { pages: vec![0], content: Content::DocumentAndStamps, ..Default::default() }).unwrap();
+        let bare = s.print_pdf(id, &crate::print::Settings { pages: vec![0], content: Content::Document, ..Default::default() }).unwrap();
+        assert_ne!(markups, bare);
+        assert_ne!(stamps, bare);
+        assert!(s.get(id).unwrap().can_undo().is_some());
+        assert_eq!(sha256(s.opened_bytes(id).unwrap().as_ref()), original_hash);
+
+        let mut maker = Session::new().with_clock(|| 1_700_000_000);
+        let made = maker.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        maker.apply(made, stamp_edit(0, [30.0, 30.0, 90.0, 90.0], 1.0)).unwrap();
+        let prior = maker.save_bytes(made).unwrap();
+        let mut later = Session::new().with_view_only(true);
+        later.grant(Capability::Stamp);
+        let id = later.open("prior.pdf", None, prior, None).unwrap();
+        assert!(!later.owns_stamp(id, 0, 0));
+        assert_eq!(later.apply(id, Edit::MoveAnnotation { page: 0, index: 0, dx: 5.0, dy: 0.0 }), Err(EditError::NotPermitted("this annotation")));
+        assert_eq!(later.undo(id), Err(EditError::ViewOnly));
+        maker.set_view_only(true);
+        maker.grant(Capability::Stamp);
+        assert!(!maker.owns_stamp(made, 0, 0));
+        assert_eq!(maker.undo(made), Err(EditError::NotPermitted("this annotation")));
+        assert_eq!(maker.apply(made, Edit::DeleteAnnotation { page: 0, index: 0 }), Err(EditError::NotPermitted("this annotation")));
+
+        let mut author = Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        author
+            .apply(
+                id,
+                Edit::Protect(Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::High,
+                    changes: Changes::None,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.save_bytes(id).unwrap();
+        let mut banned = Session::new().with_view_only(true);
+        banned.grant(Capability::Stamp);
+        let id = banned.open("banned.pdf", None, locked, None).unwrap();
+        assert!(!banned.allows_stamp(id));
+        assert_eq!(banned.apply(id, stamp_edit(0, [40.0, 40.0, 80.0, 80.0], 1.0)), Err(EditError::NotPermitted("comments")));
+
+        let mut signer = Session::new().with_clock(|| 1_800_000_000);
+        let id = signer.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let signed = signer.sign(id, &digital_id(), SignOptions { rect: None, ..SignOptions::default() }).unwrap();
+        let mut signed_session = Session::new().with_view_only(true);
+        signed_session.grant(Capability::Stamp);
+        signed_session.grant(Capability::Print);
+        signed_session.grant(Capability::SaveAs);
+        let id = signed_session.open("signed.pdf", None, signed.clone(), None).unwrap();
+        assert!(!signed_session.allows_stamp(id));
+        assert_eq!(
+            signed_session.apply(id, stamp_edit(0, [40.0, 40.0, 80.0, 80.0], 1.0)),
+            Err(EditError::NotPermitted("stamps on a signed document"))
+        );
+        assert!(std::sync::Arc::ptr_eq(&signed_session.get(id).unwrap().bytes, &signed));
+        assert!(signed_session.get(id).unwrap().can_undo().is_none());
+        assert_eq!(signed_session.save_bytes(id), Err(EditError::ViewOnly));
+        let printed = signed_session.print_pdf(id, &crate::print::Settings { pages: vec![0], ..Default::default() }).unwrap();
+        assert!(printed.starts_with(b"%PDF"));
+        assert!(std::sync::Arc::ptr_eq(&signed_session.get(id).unwrap().bytes, &signed));
+
+        let mut broken = Session::new().with_view_only(true);
+        broken.grant(Capability::Stamp);
+        match broken.open("broken.pdf", None, Arc::new(b"%PDF-1.1\n%%EOF\n".to_vec()), None) {
+            Err(_) => {}
+            Ok(id) => {
+                let err = broken.apply(id, stamp_edit(0, [40.0, 40.0, 80.0, 80.0], 1.0)).unwrap_err();
+                assert!(matches!(err, EditError::ReadOnly(_) | EditError::NotPermitted("stamps on a signed document")), "{err:?}");
+            }
+        }
+
+        let images = Session::new();
+        let scan = images.create_from_images(&[("scan.png".into(), pdfcraft_xfa::fixtures::tiny_png())]).unwrap();
+        let mut scanned = Session::new().with_view_only(true);
+        scanned.grant(Capability::Stamp);
+        let id = scanned.open("scan.pdf", None, scan, None).unwrap();
+        scanned.apply(id, stamp_edit(0, [4.0, 4.0, 20.0, 20.0], 1.0)).unwrap();
+        assert_eq!(scanned.get(id).unwrap().info.annotations.len(), 1);
+        assert!(scanned.owns_stamp(id, 0, 0));
     }
 
     fn text_of(bytes: Vec<u8>) -> String {

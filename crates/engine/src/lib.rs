@@ -317,6 +317,13 @@ struct Editor {
     appearances: AppearanceCache,
     /// The text blocks last computed for one page, reused while the document is unchanged.
     text_blocks: TextBlocksCache,
+    /// Custom-image stamps this view-only session added. Object ids stay here across undo, so
+    /// redoing the add still addresses the same stamp. A stamp already in the file is absent.
+    owned_stamps: Vec<pdfcraft_cos::ObjRef>,
+    /// Stamp edits applied in this view-only session and not yet undone.
+    stamp_depth: u32,
+    /// Stamp edits undone in this view-only session and not yet redone or replaced.
+    stamp_redo: u32,
 }
 
 /// One page's text blocks ([`pdfcraft_edit::text_blocks`]) and the unmodified document state they
@@ -1347,12 +1354,14 @@ pub enum Edit {
     AddAnnotation(NewAnnotation),
     /// A custom stamp from a picture file (a PDF page or an image) on `page`. A zero-size
     /// `rect` is a point: the stamp is centred there at its natural size (at most 200 pt).
+    /// `opacity` is 0 to 1; 1 is opaque.
     AddCustomStamp {
         page: usize,
         rect: [f64; 4],
         name: String,
         file: MarkFile,
         author: String,
+        opacity: f64,
     },
     /// Delete the comment at `index` in the page's `/Annots`, with its pop-up and replies.
     DeleteAnnotation {
@@ -2096,6 +2105,54 @@ fn is_added_text_label(label: &str) -> bool {
 }
 
 /// `edit` places new text, changes added text, or deletes an added text item.
+fn is_stamp_edit(edit: &Edit) -> bool {
+    matches!(
+        edit,
+        Edit::AddCustomStamp { .. }
+            | Edit::MoveAnnotation { .. }
+            | Edit::ResizeAnnotation { .. }
+            | Edit::StyleAnnotation { .. }
+            | Edit::DeleteAnnotation { .. }
+    )
+}
+
+fn is_owned_stamp_label(label: &str) -> bool {
+    matches!(label, "Add stamp" | "Move comment" | "Resize comment" | "Delete comment" | "Change comment properties")
+}
+
+fn stamp_obj_refs(cos: &pdfcraft_cos::Document) -> Vec<pdfcraft_cos::ObjRef> {
+    let Ok(pages) = pdfcraft_annot::page_refs(cos) else { return Vec::new() };
+    let mut out = Vec::new();
+    for pref in pages {
+        let page_obj = cos.get(pref);
+        let Some(dict) = page_obj.as_dict() else { continue };
+        let Some(annots) = dict.get(b"Annots").cloned() else { continue };
+        let resolved = cos.resolve(&annots);
+        let Some(arr) = resolved.as_array() else { continue };
+        for obj in arr {
+            let Some(refer) = obj.as_ref() else { continue };
+            if is_stamp_annot(cos, refer) {
+                out.push(refer);
+            }
+        }
+    }
+    out
+}
+
+fn annot_ref_at(cos: &pdfcraft_cos::Document, page: usize, index: usize) -> Option<pdfcraft_cos::ObjRef> {
+    let pages = pdfcraft_annot::page_refs(cos).ok()?;
+    let pref = *pages.get(page)?;
+    let page_obj = cos.get(pref);
+    let annots = page_obj.as_dict()?.get(b"Annots")?.clone();
+    let resolved = cos.resolve(&annots);
+    let arr = resolved.as_array()?;
+    arr.get(index).and_then(pdfcraft_cos::Object::as_ref)
+}
+
+fn is_stamp_annot(cos: &pdfcraft_cos::Document, refer: pdfcraft_cos::ObjRef) -> bool {
+    cos.get(refer).as_dict().and_then(|dict| dict.name(b"Subtype")) == Some(b"Stamp")
+}
+
 fn added_text_edit(doc: &Document, edit: &Edit) -> bool {
     match edit {
         Edit::AddText { .. } => true,
@@ -2369,7 +2426,10 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
         Edit::AddAnnotation(a) => {
             pdfcraft_annot::add_annotation(doc, a, &cx.meta())?;
         }
-        Edit::AddCustomStamp { page, rect, name, file, author } => {
+        Edit::AddCustomStamp { page, rect, name, file, author, opacity } => {
+            if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                return Err(EditError::Invalid("stamp opacity must be between 0 and 1".into()));
+            }
             let src = mark_source(doc, file)?;
             let (sw, sh) = (src.size.0.max(1.0), src.size.1.max(1.0));
             let natural = rect[2] == rect[0] && rect[3] == rect[1];
@@ -2382,7 +2442,8 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
                 *rect
             };
             let shape = Shape::CustomStamp { rect, name: name.clone(), picture: src.xobject, image: src.image, size: (sw, sh) };
-            let style = pdfcraft_annot::Style::default_for(&shape);
+            let mut style = pdfcraft_annot::Style::default_for(&shape);
+            style.opacity = *opacity;
             let new = NewAnnotation { page: *page, shape, style, contents: name.clone(), author: author.clone() };
             let index = pdfcraft_annot::add_annotation(doc, &new, &cx.meta())?;
             pdfcraft_annot::orient_image_stamp(doc, *page, index, rotation)?;
@@ -3620,6 +3681,9 @@ impl Session {
                         keys,
                         appearances: AppearanceCache::default(),
                         text_blocks: TextBlocksCache::default(),
+                        owned_stamps: Vec::new(),
+                        stamp_depth: 0,
+                        stamp_redo: 0,
                     }),
                     None,
                 )
@@ -3709,9 +3773,114 @@ impl Session {
         doc.editor.is_some() && doc.read_only_reason.is_none() && doc.permissions().is_none_or(|p| p.modify())
     }
 
+    /// Whether an image stamp may be placed on `id`. View-only stays on and the document stays
+    /// [`Document::editable`] false, so other comments stay refused. The PDF's own comment
+    /// permission still applies, and a signed file is refused.
+    pub fn allows_stamp(&self, id: DocId) -> bool {
+        if !self.view_only || !self.allows(Capability::Stamp) {
+            return false;
+        }
+        let Some(doc) = self.get(id) else { return false };
+        doc.editor.is_some()
+            && doc.read_only_reason.is_none()
+            && !doc.is_signed()
+            && doc.permissions().is_none_or(|permissions| permissions.annotate())
+    }
+
     /// View-only, with [`Capability::EditText`], and `edit` only places or changes added text.
     fn view_only_text_edit(&self, id: DocId, edit: &Edit) -> bool {
         self.view_only && self.allows(Capability::EditText) && self.get(id).is_some_and(|doc| added_text_edit(doc, edit))
+    }
+
+    /// A custom-image stamp this session placed, addressed by its page and `/Annots` index.
+    pub fn owns_stamp(&self, id: DocId, page: usize, index: usize) -> bool {
+        self.owned_stamp_ref(id, page, index).is_some()
+    }
+
+    /// The object id of a session stamp at `page` / `index`, when this session placed it.
+    pub fn owned_stamp_ref(&self, id: DocId, page: usize, index: usize) -> Option<pdfcraft_cos::ObjRef> {
+        let doc = self.get(id)?;
+        let editor = doc.editor.as_ref()?;
+        let refer = annot_ref_at(&editor.cos, page, index)?;
+        (editor.owned_stamps.contains(&refer) && is_stamp_annot(&editor.cos, refer)).then_some(refer)
+    }
+
+    /// The custom-image stamp most recently placed in this session, if it is still owned.
+    pub fn newest_owned_stamp(&self, id: DocId) -> Option<pdfcraft_cos::ObjRef> {
+        self.get(id)?.editor.as_ref()?.owned_stamps.last().copied()
+    }
+
+    /// Owned stamps that are still on a page. Undo keeps the id even after the stamp is gone.
+    pub fn present_owned_stamps(&self, id: DocId) -> Vec<pdfcraft_cos::ObjRef> {
+        let Some(editor) = self.get(id).and_then(|doc| doc.editor.as_ref()) else { return Vec::new() };
+        let live = stamp_obj_refs(&editor.cos);
+        editor.owned_stamps.iter().copied().filter(|refer| live.contains(refer)).collect()
+    }
+
+    /// View-only stamp edits pass; every other view-only edit is [`EditError::ViewOnly`].
+    /// A signed document, or one whose structure cannot be read, is refused before that.
+    fn allow_view_only_stamp(&self, id: DocId, edit: &Edit) -> Result<(), EditError> {
+        if !self.view_only {
+            return Ok(());
+        }
+        if !self.allows(Capability::Stamp) || !is_stamp_edit(edit) {
+            return self.check_not_view_only();
+        }
+        let Some(doc) = self.get(id) else { return Err(EditError::NoDocument) };
+        if doc.editor.is_none() || doc.read_only_reason.is_some() {
+            return Err(EditError::ReadOnly(
+                doc.read_only_reason.clone().unwrap_or_else(|| "the document structure could not be read for editing".into()),
+            ));
+        }
+        if doc.is_signed() {
+            return Err(EditError::NotPermitted("stamps on a signed document"));
+        }
+        match edit {
+            Edit::AddCustomStamp { opacity, .. } => {
+                if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                    return Err(EditError::Invalid("stamp opacity must be between 0 and 1".into()));
+                }
+                Ok(())
+            }
+            Edit::MoveAnnotation { page, index, .. } | Edit::ResizeAnnotation { page, index, .. } | Edit::DeleteAnnotation { page, index } => {
+                if self.owns_stamp(id, *page, *index) { Ok(()) } else { Err(EditError::NotPermitted("this annotation")) }
+            }
+            Edit::StyleAnnotation { page, index, color, opacity, width, endings } => {
+                if color.is_some() || width.is_some() || endings.is_some() {
+                    return Err(EditError::NotPermitted("this annotation"));
+                }
+                match opacity {
+                    Some(value) if value.is_finite() && (0.0..=1.0).contains(value) => {}
+                    Some(_) => return Err(EditError::Invalid("stamp opacity must be between 0 and 1".into())),
+                    None => return Err(EditError::NotPermitted("this annotation")),
+                }
+                if self.owns_stamp(id, *page, *index) { Ok(()) } else { Err(EditError::NotPermitted("this annotation")) }
+            }
+            _ => self.check_not_view_only(),
+        }
+    }
+
+    /// View-only undo or redo of a stamp edit this session itself applied.
+    fn allow_stamp_step(&self, id: DocId, redo: bool) -> Result<(), EditError> {
+        if !self.view_only {
+            return Ok(());
+        }
+        let Some(doc) = self.get(id) else { return Err(EditError::NoDocument) };
+        let label = if redo { doc.redo_label() } else { doc.undo_label() };
+        let stamp = label.is_some_and(|label| is_owned_stamp_label(label.as_str()));
+        if !self.allows(Capability::Stamp) || !stamp {
+            return self.check_not_view_only();
+        }
+        if doc.editor.is_none() || doc.read_only_reason.is_some() {
+            return Err(EditError::ReadOnly(
+                doc.read_only_reason.clone().unwrap_or_else(|| "the document structure could not be read for editing".into()),
+            ));
+        }
+        if doc.is_signed() {
+            return Err(EditError::NotPermitted("stamps on a signed document"));
+        }
+        let depth = doc.editor.as_ref().map(|editor| if redo { editor.stamp_redo } else { editor.stamp_depth }).unwrap_or(0);
+        if depth == 0 { Err(EditError::NotPermitted("this annotation")) } else { Ok(()) }
     }
 
     /// View-only undo or redo whose step is added text.
@@ -3724,24 +3893,30 @@ impl Session {
         label.is_some_and(|label| is_added_text_label(label.as_str()))
     }
 
-    /// The undo history is only added text, so the working bytes are that text and nothing else.
-    fn text_history_only(&self, doc: &Document) -> bool {
+    /// Undo and redo are only added text, session stamps, or both, matching the grants.
+    fn copy_history_ok(&self, doc: &Document, text: bool, stamp: bool) -> bool {
         let Some(editor) = doc.editor.as_ref() else { return false };
-        !editor.undo.is_empty() && editor.undo.iter().chain(editor.redo.iter()).all(|(label, ..)| is_added_text_label(label.as_str()))
+        !editor.undo.is_empty()
+            && editor.undo.iter().chain(editor.redo.iter()).all(|(label, ..)| {
+                let label = label.as_str();
+                (text && is_added_text_label(label)) || (stamp && is_owned_stamp_label(label))
+            })
     }
 
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     ///
     /// A view-only session still refuses every edit, except added text when
-    /// [`Capability::EditText`] is granted: new text, a change to that text, or deleting it.
-    /// The document's own permission to modify content still applies.
+    /// [`Capability::EditText`] is granted, and a custom-image stamp placed in this session when
+    /// [`Capability::Stamp`] is granted. The document's own permissions still apply. A signed
+    /// document refuses the stamp before the view-only error, so the reason stays visible.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
         if !self.view_only_text_edit(id, &edit) {
-            self.check_not_view_only()?;
+            self.allow_view_only_stamp(id, &edit)?;
         }
         let now = self.now();
         let today = self.today();
         let js_off = self.js_off;
+        let stamp_session = self.view_only && self.allows(Capability::Stamp);
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let name = doc.name.clone();
@@ -3915,6 +4090,19 @@ impl Session {
             note_warnings(&mut doc.xfa_warnings, &removed);
             note_warnings(&mut doc.info.warnings, &removed);
         }
+        if stamp_session
+            && is_stamp_edit(&edit)
+            && let Some(editor) = doc.editor.as_mut()
+        {
+            if matches!(edit, Edit::AddCustomStamp { .. }) {
+                let old = editor.undo.last().map(|(_, previous, _, _)| stamp_obj_refs(previous)).unwrap_or_default();
+                let added: Vec<pdfcraft_cos::ObjRef> =
+                    stamp_obj_refs(&editor.cos).into_iter().filter(|refer| !old.contains(refer) && !editor.owned_stamps.contains(refer)).collect();
+                editor.owned_stamps.extend(added);
+            }
+            editor.stamp_depth = editor.stamp_depth.saturating_add(1);
+            editor.stamp_redo = 0;
+        }
         note_warnings(&mut doc.xfa_warnings, &xfa_notes);
         let notes = doc.xfa_warnings.clone();
         note_warnings(&mut doc.info.warnings, &notes);
@@ -3932,8 +4120,9 @@ impl Session {
 
     pub fn undo(&mut self, id: DocId) -> Result<Label, EditError> {
         if !self.view_only_text_step(id, false) {
-            self.check_not_view_only()?;
+            self.allow_stamp_step(id, false)?;
         }
+        let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToUndo)?;
@@ -3941,6 +4130,11 @@ impl Session {
         let current = std::mem::replace(&mut editor.cos, prev);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.redo.push((label.clone(), current, current_keys, scope));
+        let stamp = view_only && is_owned_stamp_label(label.as_str());
+        if stamp {
+            editor.stamp_depth = editor.stamp_depth.saturating_sub(1);
+            editor.stamp_redo = editor.stamp_redo.saturating_add(1);
+        }
         Self::adopt_keys(doc);
         Self::refresh_scoped(doc, scope).inspect_err(|_| Self::show_released(doc))?;
         Self::sync_dirty(doc);
@@ -3950,8 +4144,9 @@ impl Session {
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {
         if !self.view_only_text_step(id, true) {
-            self.check_not_view_only()?;
+            self.allow_stamp_step(id, true)?;
         }
+        let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToRedo)?;
@@ -3959,6 +4154,11 @@ impl Session {
         let current = std::mem::replace(&mut editor.cos, next);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.undo.push((label.clone(), current, current_keys, scope));
+        let stamp = view_only && is_owned_stamp_label(label.as_str());
+        if stamp {
+            editor.stamp_redo = editor.stamp_redo.saturating_sub(1);
+            editor.stamp_depth = editor.stamp_depth.saturating_add(1);
+        }
         Self::adopt_keys(doc);
         Self::refresh_scoped(doc, scope).inspect_err(|_| Self::show_released(doc))?;
         Self::sync_dirty(doc);
@@ -4203,20 +4403,25 @@ impl Session {
         self.working_bytes(doc)
     }
 
-    /// Bytes of a document changed by added text, for a new file.
+    /// Bytes of a document changed by added text or a session stamp, for a new file.
     ///
-    /// Requires [`Capability::SaveAs`] and [`Capability::EditText`]. It does not write, does not
-    /// change the open document's path, and does not mark it saved. [`Self::save_copy_bytes`]
-    /// stays the opened file only. [`Self::save_bytes`] stays refused while view-only.
-    /// A copy already recorded with [`Self::note_saved_copy`] is still returned: the working
-    /// file differs from the opened file, even when closing would not ask again.
+    /// Requires [`Capability::SaveAs`] and [`Capability::EditText`] or [`Capability::Stamp`].
+    /// A stamp is included only when [`Capability::Stamp`] is granted, and added text only when
+    /// [`Capability::EditText`] is granted. It does not write, does not change the open
+    /// document's path, and does not mark it saved. [`Self::save_copy_bytes`] stays the opened
+    /// file only. [`Self::save_bytes`] stays refused while view-only. A copy already recorded
+    /// with [`Self::note_saved_copy`] is still returned: the working file differs from the opened
+    /// file, even when closing would not ask again.
     pub fn save_edited_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
-        if !self.allows(Capability::SaveAs) || !self.allows(Capability::EditText) {
+        let text = self.allows(Capability::EditText);
+        let stamp = self.allows(Capability::Stamp);
+        if !self.allows(Capability::SaveAs) || (!text && !stamp) {
             return Err(EditError::ViewOnly);
         }
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
-        if !differs_from_opened(doc) || !self.text_history_only(doc) {
-            return Err(EditError::Invalid("there is no added text to save".into()));
+        if !differs_from_opened(doc) || !self.copy_history_ok(doc, text, stamp) {
+            let message = if stamp { "there is no added text or stamp to save" } else { "there is no added text to save" };
+            return Err(EditError::Invalid(message.into()));
         }
         self.working_bytes(doc)
     }

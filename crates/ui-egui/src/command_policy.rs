@@ -102,8 +102,18 @@ impl PdfCraftApp {
         if id == "file.save_as" && self.session.allows(pdfcraft_engine::Capability::SaveAs) {
             return true;
         }
-        // Adding text, and undoing that text. The engine still refuses every other edit.
-        if matches!(id, "edit.text" | "edit.undo" | "edit.redo") && self.session.allows(pdfcraft_engine::Capability::EditText) {
+        // Adding text. The engine still refuses every other edit.
+        if id == "edit.text" && self.session.allows(pdfcraft_engine::Capability::EditText) {
+            return true;
+        }
+        // Undo and redo of added text or a session stamp. The engine still refuses any other step.
+        if matches!(id, "edit.undo" | "edit.redo")
+            && (self.session.allows(pdfcraft_engine::Capability::EditText) || self.session.allows(pdfcraft_engine::Capability::Stamp))
+        {
+            return true;
+        }
+        // Image stamps. Not on the reading list: only when [`pdfcraft_engine::Capability::Stamp`] is granted.
+        if id == "comment.stamp" && self.session.allows(pdfcraft_engine::Capability::Stamp) {
             return true;
         }
         // Printing. It is not on the reading list: it runs only when [`pdfcraft_engine::Capability::Print`]

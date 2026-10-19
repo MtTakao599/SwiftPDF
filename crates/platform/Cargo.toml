@@ -12,6 +12,11 @@ workspace = true
 # Hard-link identity for save-as. The standard library's Windows file index is unstable.
 same-file = "1.0.6"
 
+[target.'cfg(windows)'.dependencies]
+# Current-user DPAPI (CryptProtectData). Machine scope is not used: another Windows user on this
+# PC must not be able to decrypt a chairman seal.
+windows-dpapi = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # `write_atomically`: a volume that refuses F_FULLFSYNC gets a plain fsync.
 rustix = { version = "1", features = ["fs"] }

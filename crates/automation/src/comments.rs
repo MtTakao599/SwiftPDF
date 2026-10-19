@@ -667,6 +667,7 @@ impl Automation {
                 page: a.opt_int("file_page")?.unwrap_or(1).max(1) as usize - 1,
             },
             author: a.opt_str("author")?.unwrap_or(DEFAULT_AUTHOR).to_string(),
+            opacity: 1.0,
         };
         self.apply(a, edit)
     }

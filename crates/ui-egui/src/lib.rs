@@ -61,6 +61,7 @@ mod measure_ui;
 mod ocr_ui;
 mod optimize_ui;
 pub mod output_policy;
+mod seal_store;
 mod search_ui;
 mod sign_ui;
 mod stamps_ui;
@@ -278,6 +279,8 @@ pub enum QuickTool {
     Stamp(pdfcraft_engine::StampKind),
     /// A custom stamp from the library (its index).
     CustomStamp(usize),
+    /// A chairman seal from the encrypted library (its index).
+    ChairmanSeal(usize),
     /// Edit a PDF ▸ Link: draw link areas, select and edit links.
     Link,
     /// Use a certificate ▸ Digitally sign / Certify (visible): drag the signature's rectangle.
@@ -391,6 +394,10 @@ pub enum Dialog {
     PdfA,
     /// Custom stamps ▸ Create.
     CreateStamp,
+    /// Confirm a chairman seal before it is applied.
+    ConfirmSeal,
+    /// Confirm deletion of a chairman seal from the encrypted store.
+    DeleteSeal,
     /// Prepare for accessibility ▸ Add alternate text.
     AltText,
     /// PDF Optimizer ▸ Audit space usage (then back to the optimizer).
@@ -763,6 +770,10 @@ pub struct PdfCraftApp {
     /// The custom stamp library, and the stamp being created.
     pub custom_stamps: Vec<stamps_ui::CustomStamp>,
     pub stamp_draft: stamps_ui::StampDraft,
+    /// Chairman seals. Not part of [`Self::persist`].
+    pub seal_store: seal_store::SealStore,
+    pub seal_uses: Vec<seal_store::SealUse>,
+    pub seal_ack: bool,
     /// PDF Optimizer choices.
     pub optimize_draft: OptimizeDraft,
     /// The running optimization (Optimize PDF ▸ Advanced optimization).
@@ -1076,6 +1087,9 @@ impl PdfCraftApp {
             image_import: None,
             custom_stamps: Vec::new(),
             stamp_draft: Default::default(),
+            seal_store: seal_store::SealStore::empty(),
+            seal_uses: Vec::new(),
+            seal_ack: false,
             optimize_draft: OptimizeDraft::default(),
             optimize_run: None,
             progress_notice: None,
@@ -3280,6 +3294,20 @@ impl eframe::App for PdfCraftApp {
             chrome::mode_bar(self, ui);
         }
         content_ui::text_entry_strip(self, ui);
+        stamps_ui::stamp_bar(self, ui);
+        if simple && self.active.is_some() && self.left_open && self.left == LeftPanel::Tool("stamp") {
+            egui::Panel::left("simple_stamps")
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(200.0..=360.0)
+                .frame(egui::Frame::NONE.fill(theme::Tokens::get(&ctx).panel).inner_margin(8.0))
+                .show(ui, |ui| {
+                    if widgets::ghost_button(ui, "x", "閉じる").clicked() {
+                        self.left_open = false;
+                    }
+                    panels::stamp_tools(self, ui);
+                });
+        }
         if self.active.is_some() {
             chrome::right_rail(self, ui);
             // Read mode hides the tools, not the navigation panes: the rail stays visible

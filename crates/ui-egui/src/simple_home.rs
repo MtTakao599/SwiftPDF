@@ -77,10 +77,14 @@ fn actions(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, width: f32) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
             for &(label, icon) in row {
-                let ready = label == "開く" || (label == "印刷" && app.command_allowed("print.dialog"));
+                let ready = label == "開く"
+                    || (label == "印刷" && app.command_allowed("print.dialog"))
+                    || (label == "スタンプ" && app.command_allowed("comment.stamp"));
                 if action_card(ui, t, vec2(card_width, CARD_HEIGHT), label, icon, ready).clicked() {
                     if label == "印刷" && ready {
                         app.print_from_simple();
+                    } else if label == "スタンプ" && ready {
+                        app.stamp_from_simple();
                     } else if label == "開く" && ready {
                         app.execute("file.open");
                     } else {
@@ -265,6 +269,9 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     if app.command_allowed("print.dialog") {
         labels.push("印刷");
     }
+    if app.command_allowed("comment.stamp") {
+        labels.push("スタンプ");
+    }
     let height = viewer_bar_height(ui, &labels);
     let t = Tokens::get(ui.ctx());
     egui::Panel::top("simple_bar")
@@ -292,6 +299,9 @@ pub fn viewer_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 if app.command_allowed("print.dialog") && widgets::ghost_button(ui, "printer", "印刷").clicked() {
                     app.execute("print.dialog");
                 }
+                if app.command_allowed("comment.stamp") && widgets::ghost_button(ui, "stamp", "スタンプ").clicked() {
+                    app.execute("comment.stamp");
+                }
             });
         });
 }
@@ -308,6 +318,18 @@ impl PdfCraftApp {
             self.active = Some(self.views.len() - 1);
         }
         self.execute("print.dialog");
+    }
+
+    /// Home ▸ スタンプ. With no PDF open, it only says so.
+    pub(crate) fn stamp_from_simple(&mut self) {
+        if self.active.is_none() {
+            if self.views.is_empty() {
+                self.notify(crate::identity::localized("スタンプを押す PDF が開いていません。", "No PDF is open to stamp."));
+                return;
+            }
+            self.active = Some(self.views.len() - 1);
+        }
+        self.execute("comment.stamp");
     }
 }
 
