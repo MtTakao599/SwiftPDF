@@ -34,6 +34,32 @@ pub(crate) fn undrawable(d: &TextDraft, memo: &UndrawableMemo) -> Option<char> {
 /// anything that changes its layout does.
 pub(crate) type UndrawableMemo = std::cell::RefCell<Option<(AddedText, Option<char>)>>;
 
+/// Shown when a readable face has no hiragana, katakana, or kanji and the missing character is one
+/// of those letters.
+const NO_JAPANESE_FONT: &str = "このフォントは日本語に対応していません。日本語対応フォントを選択してください。";
+
+/// The warning for a catalogue face that cannot draw `missing`.
+///
+/// A face with no Japanese letters, and a missing Japanese letter, says the face does not support
+/// Japanese. A face that has any Japanese letters — even only some — names the missing character
+/// instead. An unreadable face, or a missing character that is not Japanese, also names that
+/// character. The missing character alone never decides the wording.
+pub(crate) fn catalog_missing_message(id: &str, missing: char) -> String {
+    let supports = pdfcraft_fonts::catalog::get(id).and_then(|face| face.supports_japanese());
+    glyph_gap_message(supports, missing)
+}
+
+/// `supports_japanese` is [`pdfcraft_fonts::catalog::Face::supports_japanese`]. `Some(false)` is the
+/// only “no Japanese” answer. `Some(true)` covers a full Japanese face and a face that has only
+/// some Japanese letters. `None` is unreadable, so the missing character is named.
+pub(crate) fn glyph_gap_message(supports_japanese: Option<bool>, missing: char) -> String {
+    if supports_japanese == Some(false) && pdfcraft_fonts::catalog::is_japanese_letter(missing) {
+        NO_JAPANESE_FONT.to_string()
+    } else {
+        format!("このフォントには『{missing}』の文字が収録されていません。別のフォントを選択してください。")
+    }
+}
+
 /// The warning shown for text with `c` in it.
 pub(crate) fn undrawable_message(c: char) -> String {
     crate::i18n::fmt(
@@ -749,7 +775,14 @@ pub(crate) fn editor(
         // Page text is drawn with the standard fonts; anything else would be saved as `?` (#125).
         undrawable = self::undrawable(t, memo);
         if let Some(c) = undrawable {
-            let message = if matches!(u32::from(c), 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
+            let chosen = t.style.font_id.as_deref().filter(|id| pdfcraft_engine::standard_family(id).is_none());
+            let message = if let Some(id) = chosen {
+                if pdfcraft_fonts::catalog::get(id).is_some_and(|face| face.available() && face.can_preview()) {
+                    catalog_missing_message(id, c)
+                } else {
+                    "指定フォントが利用できないため、別の書体へ替えずに編集を止めています。".into()
+                }
+            } else if matches!(u32::from(c), 0x3000..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
                 crate::identity::localized(
                     "このビルドの日本語フォントでは、この文字をPDFに書き込めません。",
                     "This build's Japanese font cannot write this character into the PDF.",
@@ -757,7 +790,7 @@ pub(crate) fn editor(
             } else {
                 undrawable_message(c)
             };
-            ui.label(egui::RichText::new(message).small().color(UNDRAWABLE));
+            ui.add(egui::Label::new(egui::RichText::new(message).small().color(UNDRAWABLE)).wrap_mode(egui::TextWrapMode::Wrap));
         }
     });
     view.content.editor_size = editor_size;
@@ -808,7 +841,9 @@ pub(crate) fn format_panel(ui: &mut egui::Ui, t: &Tokens, style: &AddedText) -> 
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("font-family").selected_text(s.family.label()).width(110.0).show_ui(ui, |ui| {
             for f in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
-                ui.selectable_value(&mut s.family, f, f.label());
+                if ui.selectable_value(&mut s.family, f, f.label()).changed() {
+                    s.font_id = None;
+                }
             }
         });
         // A list rather than a drag value: every change is an undo step.
@@ -848,8 +883,9 @@ pub(crate) fn format_panel(ui: &mut egui::Ui, t: &Tokens, style: &AddedText) -> 
 /// One compact row of typeface, size, style and colour. Colour opens a popup, so the bar does
 /// not grow a swatch grid over the page. Items wrap onto another short row when the window is
 /// narrow, instead of being clipped.
-fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>, f32) {
+fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>, f32, bool) {
     let mut s = style.clone();
+    let mut pick = false;
     let response = ui.horizontal_wrapped(|ui| {
         ui.set_min_height(28.0);
         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
@@ -858,11 +894,10 @@ fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>,
             "ページをクリックして入力します。変換中のEnterでは確定しません。入力中は青い枠を、確定後は文字をドラッグして移動できます。",
             "Click the page and type. Enter during IME conversion does not finish the text. Drag the blue frame to move the text while typing, or the text itself after Done.",
         ));
-        egui::ComboBox::from_id_salt("entry-font-family").selected_text(s.family.label()).width(110.0).show_ui(ui, |ui| {
-            for family in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
-                ui.selectable_value(&mut s.family, family, family.label());
-            }
-        });
+        ui.label(font_caption(&s)).on_hover_text(crate::identity::localized("選択中の書体", "Chosen typeface"));
+        if crate::widgets::pill_button(ui, "フォントを選択…", false).clicked() {
+            pick = true;
+        }
         egui::ComboBox::from_id_salt("entry-font-size").selected_text(format!("{} pt", s.size)).width(72.0).show_ui(ui, |ui| {
             for size in [8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
                 ui.selectable_value(&mut s.size, size, format!("{size} pt"));
@@ -873,6 +908,11 @@ fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>,
         }
         if ui.selectable_label(s.italic, egui::RichText::new("I").italics()).on_hover_text(tl!("Italic")).clicked() {
             s.italic = !s.italic;
+        }
+        if s.font_id.is_some() && s.italic {
+            ui.label(egui::RichText::new("この書体に斜体はありません。斜体は付きません。").small().color(Color32::from_rgb(176, 48, 48)));
+        } else if s.font_id.is_some() && s.bold && !catalog_has_bold(s.font_id.as_deref()) {
+            ui.label(egui::RichText::new("この書体に太字（ウェイト700）がないため、選んだ太さのまま描きます。").small().color(Color32::from_rgb(176, 48, 48)));
         }
         for (align, icon, tip) in [
             (TextAlign::Left, "align-left", tl!("Align left")),
@@ -894,7 +934,117 @@ fn entry_format_row(ui: &mut egui::Ui, style: &AddedText) -> (Option<AddedText>,
             s.color = color;
         }
     });
-    ((s != *style).then_some(s), response.response.rect.height())
+    ((s != *style).then_some(s), response.response.rect.height(), pick)
+}
+
+fn font_caption(style: &AddedText) -> String {
+    if let Some(id) = style.font_id.as_deref() {
+        return match pdfcraft_fonts::catalog::get(id) {
+            Some(face) if face.available() && face.can_preview() => face.display_name.to_string(),
+            _ => "指定フォントが利用できない".into(),
+        };
+    }
+    let mut name = style.family.label().to_string();
+    if style.bold {
+        name.push_str(" 太字");
+    }
+    if style.italic {
+        name.push_str(" 斜体");
+    }
+    name
+}
+
+fn catalog_has_bold(id: Option<&str>) -> bool {
+    let Some(id) = id else { return false };
+    let face = pdfcraft_fonts::catalog::get(id);
+    face.is_some_and(|face| face.weight == 700) || pdfcraft_fonts::catalog::bold_partner(id).is_some()
+}
+
+/// Open the shared font window for added text. The draft, its text and its place stay.
+pub(crate) fn open_text_font(app: &mut crate::PdfCraftApp, style: &AddedText, sample: &str) -> bool {
+    if app.dialog.is_some() {
+        return false;
+    }
+    let text: String = sample.chars().filter(|c| !c.is_control()).take(64).collect();
+    app.font_choice = None;
+    app.font_return = None;
+    app.date_font_row = None;
+    app.font_hold = false;
+    app.text_font = true;
+    app.font_picker = crate::font_picker::State::opening_for(
+        Some(pdfcraft_engine::current_font_id(style).as_str()),
+        pdfcraft_fonts::catalog::Offer { raster: false, text, standard: true },
+    );
+    app.dialog = Some(crate::Dialog::FontPicker);
+    true
+}
+
+/// Apply 決定 to the text being typed, or to the selected added text. Cancel leaves both.
+pub(crate) fn apply_text_font_choice(app: &mut crate::PdfCraftApp) {
+    let Some(choice) = app.font_choice.take() else {
+        refocus_text_draft(app);
+        return;
+    };
+    if let Some(index) = app.active
+        && app.views.get(index).is_some_and(|view| view.content.draft.is_some())
+    {
+        let sample = app.views[index].content.draft.as_ref().map(|draft| draft.text.clone()).unwrap_or_default();
+        if let Some(next) = chosen_style(app.views[index].content.draft.as_ref().map(|draft| draft.style.clone()).as_ref(), &choice, &sample)
+            && let Some(draft) = app.views[index].content.draft.as_mut()
+        {
+            draft.style = AddedText { text: draft.text.clone(), rect: draft.rect, ..next };
+            draft.focus = true;
+            app.text_style = AddedText { text: String::new(), rect: [0.0; 4], ..draft.style.clone() };
+        } else {
+            refocus_text_draft(app);
+        }
+        return;
+    }
+    let selected = app.active_ids().and_then(|(index, doc_id)| {
+        let (page, item) = app.views.get(index)?.content.selected?;
+        let doc = app.session.get(doc_id)?;
+        let added = doc.added().iter().filter(|added| added.page == page).nth(item)?;
+        match &added.content {
+            AddedContent::Text(text) => Some((page, item, text.clone())),
+            AddedContent::Image(_) => None,
+        }
+    });
+    if let Some((page, item, text)) = selected
+        && let Some(next) = chosen_style(Some(&text), &choice, &text.text)
+    {
+        app.text_style = AddedText { text: String::new(), rect: [0.0; 4], ..next.clone() };
+        app.apply_edit(Edit::UpdateContent { page, index: item, content: AddedContent::Text(next) });
+        return;
+    }
+    if let Some(next) = chosen_style(Some(&app.text_style), &choice, "") {
+        app.text_style = AddedText { text: String::new(), rect: [0.0; 4], ..next };
+    }
+}
+
+fn chosen_style(style: Option<&AddedText>, choice: &str, sample: &str) -> Option<AddedText> {
+    let text: String = sample.chars().filter(|c| !c.is_control()).take(64).collect();
+    let offer = pdfcraft_fonts::catalog::Offer { raster: false, text, standard: true };
+    let face = pdfcraft_fonts::catalog::get(choice).filter(|face| pdfcraft_fonts::catalog::face_offered(face, &offer))?;
+    let mut next = style.cloned().unwrap_or_default();
+    if let Some((family, bold)) = pdfcraft_engine::standard_family(choice) {
+        next.family = family;
+        next.bold = bold;
+        next.font_id = None;
+    } else {
+        next.font_id = Some(choice.to_string());
+        next.bold = face.weight == 700;
+    }
+    Some(next)
+}
+
+fn refocus_text_draft(app: &mut crate::PdfCraftApp) {
+    if let Some(draft) = app.active.and_then(|index| app.views.get_mut(index)).and_then(|view| view.content.draft.as_mut()) {
+        draft.focus = true;
+    }
+}
+
+pub(crate) fn text_font_button(ui: &mut egui::Ui) -> bool {
+    widgets::pill_button(ui, "フォントを選択…", false).clicked()
 }
 
 /// The view-only text tool: where to click, the preview's size and colour, and that Enter
@@ -926,7 +1076,7 @@ pub(crate) fn text_entry_strip(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui) 
                 }
             });
             let style = draft.clone().or_else(|| selected.as_ref().map(|(_, _, text)| text.clone())).unwrap_or_else(|| app.text_style.clone());
-            let (row, used) = entry_format_row(ui, &style);
+            let (row, used, pick) = entry_format_row(ui, &style);
             let next = (used + 8.0).clamp(36.0, 96.0);
             if (next - height).abs() > 1.0 {
                 ui.data_mut(|data| data.insert_temp(height_id, next));
@@ -942,6 +1092,15 @@ pub(crate) fn text_entry_strip(app: &mut crate::PdfCraftApp, ui: &mut egui::Ui) 
                     app.apply_edit(Edit::UpdateContent { page, index: item, content: AddedContent::Text(next.clone()) });
                 }
                 app.text_style = AddedText { text: String::new(), rect: [0.0; 4], ..next };
+            }
+            if pick {
+                let sample = app
+                    .active
+                    .and_then(|index| app.views.get(index))
+                    .and_then(|view| view.content.draft.as_ref().map(|draft| draft.text.clone()))
+                    .or_else(|| selected.as_ref().map(|(_, _, text)| text.text.clone()))
+                    .unwrap_or_default();
+                open_text_font(app, &style, &sample);
             }
         });
 }
@@ -1210,6 +1369,16 @@ mod tests {
 
     use super::*;
 
+    struct PolicyRestore((bool, bool, bool));
+
+    impl Drop for PolicyRestore {
+        fn drop(&mut self) {
+            crate::output_policy::set_blocked(self.0.0);
+            crate::output_policy::set_save_as_allowed(self.0.1);
+            crate::output_policy::set_print_allowed(self.0.2);
+        }
+    }
+
     /// The image a flip button leaves behind, as the panel returns it.
     fn flipped(tooltip: &str) -> pdfcraft_engine::AddedImage {
         let img = pdfcraft_engine::AddedImage::new([0.0, 0.0, 100.0, 50.0], pdfcraft_cos::ObjRef::new(7, 0));
@@ -1286,5 +1455,143 @@ mod tests {
         assert!(super::confirms_text_entry(true, false, false, false), "Done finishes once conversion has ended");
         assert!(super::confirms_text_entry(false, true, false, false), "clicking away finishes");
         assert!(!super::confirms_text_entry(false, true, true, false), "the confirm buttons are not a click away");
+    }
+
+    fn added(id: &str, text: &str) -> pdfcraft_engine::AddedText {
+        pdfcraft_engine::AddedText { text: text.to_string(), font_id: Some(id.to_string()), ..pdfcraft_engine::AddedText::default() }
+    }
+
+    fn notice(id: &str, text: &str) -> Option<String> {
+        pdfcraft_engine::first_undrawable(&added(id, text)).map(|c| super::catalog_missing_message(id, c))
+    }
+
+    /// A Japanese letter the face does not contain. The search stays small and stops at the first miss.
+    fn absent_japanese(id: &str) -> Option<char> {
+        let face = pdfcraft_fonts::catalog::get(id)?;
+        (0x3400u32..=0x3410)
+            .chain(0x20000u32..=0x20020)
+            .filter_map(char::from_u32)
+            .find(|c| pdfcraft_fonts::catalog::is_japanese_letter(*c) && !face.has_glyph(*c))
+    }
+
+    fn absent_other(id: &str) -> Option<char> {
+        let face = pdfcraft_fonts::catalog::get(id)?;
+        ['ก', '☺', 'ℵ', 'Ω'].into_iter().find(|c| !pdfcraft_fonts::catalog::is_japanese_letter(*c) && !face.has_glyph(*c))
+    }
+
+    #[test]
+    fn a_latin_face_warns_that_it_has_no_japanese_and_a_japanese_face_names_the_glyph() {
+        let no_japanese = "このフォントは日本語に対応していません。日本語対応フォントを選択してください。";
+        assert_eq!(notice("bundled:inter:regular", "あ").as_deref(), Some(no_japanese));
+        assert_eq!(notice("bundled:inter:regular", "東京").as_deref(), Some(no_japanese));
+        assert_eq!(notice("bundled:jetbrains-mono:regular", "あ").as_deref(), Some(no_japanese));
+        assert_eq!(notice("bundled:inter:medium", "ア").as_deref(), Some(no_japanese));
+
+        let gothic = "craft:biz-udp-gothic:regular";
+        let face = pdfcraft_fonts::catalog::get(gothic).unwrap();
+        assert!(face.program().is_some(), "this build embeds the Japanese faces");
+        let missing = absent_japanese(gothic).unwrap();
+        let named = notice(gothic, &missing.to_string()).unwrap();
+        assert_eq!(named, format!("このフォントには『{missing}』の文字が収録されていません。別のフォントを選択してください。"));
+        assert!(!named.contains("日本語に対応していません"));
+
+        let other = absent_other("bundled:inter:regular").unwrap();
+        let latin_gap = super::catalog_missing_message("bundled:inter:regular", other);
+        assert_eq!(latin_gap, format!("このフォントには『{other}』の文字が収録されていません。別のフォントを選択してください。"));
+        assert!(!latin_gap.contains("日本語に対応していません"));
+
+        assert!(notice(gothic, "東京").is_none(), "a Japanese face that can draw the text shows no warning");
+        assert!(notice(gothic, "あ").is_none());
+
+        // A face that already has some Japanese letters is not called unsupported, even when the
+        // missing character is あ. An unreadable face is not called unsupported either. A Latin
+        // gap on a face with no Japanese is also named as that character. Easy and detailed mode
+        // both call this function from the shared text editor.
+        let partial = super::glyph_gap_message(Some(true), 'あ');
+        assert!(partial.contains('あ') && !partial.contains("日本語に対応していません"));
+        let unreadable = super::glyph_gap_message(None, '東');
+        assert!(unreadable.contains('東') && !unreadable.contains("日本語に対応していません"));
+        assert_eq!(super::glyph_gap_message(Some(false), 'あ'), no_japanese);
+        assert_eq!(super::glyph_gap_message(Some(false), 'ア'), no_japanese);
+        assert_eq!(super::glyph_gap_message(Some(false), '漢'), no_japanese);
+        let latin = super::glyph_gap_message(Some(false), 'Q');
+        assert!(latin.contains('Q') && !latin.contains("日本語に対応していません"));
+
+        let mut draft = TextDraft {
+            page: 0,
+            index: None,
+            rect: [0.0; 4],
+            text: "東京テラス".to_string(),
+            style: added("bundled:inter:regular", ""),
+            focus: true,
+        };
+        draft.style.text.clear();
+        let kept = draft.text.clone();
+        let memo = UndrawableMemo::default();
+        assert_eq!(undrawable(&draft, &memo), Some('東'));
+        assert_eq!(draft.text, kept);
+        assert_eq!(super::catalog_missing_message("bundled:inter:regular", '東'), no_japanese);
+    }
+
+    #[test]
+    fn a_font_choice_changes_only_the_face_and_cancel_keeps_the_draft() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let mut app = crate::PdfCraftApp::new();
+        let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap().to_vec();
+        app.set_view_only(true);
+        app.grant_edit_text();
+        app.open_bytes("blank.pdf", None, bytes).unwrap();
+        app.quick_tool = crate::QuickTool::AddText;
+        app.dialog = None;
+        let index = app.active.expect("blank document");
+        app.views[index].content.draft = Some(TextDraft {
+            page: 0,
+            index: None,
+            rect: [40.0, 40.0, 180.0, 80.0],
+            text: "下書きABC".into(),
+            style: AddedText { size: 16.0, color: [0.2, 0.0, 0.0], ..AddedText::default() },
+            focus: true,
+        });
+        let style = app.views[index].content.draft.as_ref().unwrap().style.clone();
+        assert!(open_text_font(&mut app, &style, "下書きABC"));
+        assert!(matches!(app.dialog, Some(crate::Dialog::FontPicker)));
+        apply_text_font_choice(&mut app);
+        app.dialog = None;
+        let draft = app.views[index].content.draft.as_ref().unwrap();
+        assert_eq!(draft.text, "下書きABC");
+        assert!(draft.style.font_id.is_none());
+        assert_eq!(draft.style.size, 16.0);
+        assert!((draft.style.color[0] - 0.2).abs() < 1e-9);
+
+        let style = draft.style.clone();
+        assert!(open_text_font(&mut app, &style, "下書きABC"));
+        app.font_choice = Some("bundled:inter:regular".into());
+        apply_text_font_choice(&mut app);
+        app.dialog = None;
+        assert!(app.views[index].content.draft.as_ref().unwrap().style.font_id.is_none(), "Inter cannot draw 下書き");
+        assert_eq!(app.views[index].content.draft.as_ref().unwrap().text, "下書きABC");
+
+        app.views[index].content.draft.as_mut().unwrap().text = "ABC".into();
+        let style = app.views[index].content.draft.as_ref().unwrap().style.clone();
+        assert!(open_text_font(&mut app, &style, "ABC"));
+        app.font_choice = Some("bundled:inter:semibold".into());
+        apply_text_font_choice(&mut app);
+        app.dialog = None;
+        let draft = app.views[index].content.draft.as_ref().unwrap();
+        assert_eq!(draft.style.font_id.as_deref(), Some("bundled:inter:semibold"));
+        assert!(!draft.style.bold);
+        assert_eq!(draft.text, "ABC");
+        assert_eq!(draft.style.size, 16.0);
+
+        let style = draft.style.clone();
+        assert!(open_text_font(&mut app, &style, "ABC"));
+        app.font_choice = Some("standard:times:bold".into());
+        apply_text_font_choice(&mut app);
+        let draft = app.views[index].content.draft.as_ref().unwrap();
+        assert!(draft.style.font_id.is_none());
+        assert_eq!(draft.style.family, FontFamily::Times);
+        assert!(draft.style.bold);
+        assert_eq!(draft.text, "ABC");
     }
 }

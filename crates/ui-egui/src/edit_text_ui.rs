@@ -309,12 +309,40 @@ fn look_of(b: &pdfcraft_engine::TextBlock) -> pdfcraft_engine::AddedText {
 }
 
 pub(crate) fn editor_font(look: &pdfcraft_engine::AddedText, size: f32) -> FontId {
+    if let Some(family) = added_face_family(look) {
+        return FontId::new(size, family);
+    }
     let family = match (look.family, look.bold) {
         (pdfcraft_engine::FontFamily::Courier, _) => FontFamily::Monospace,
         (_, true) => FontFamily::Name("semibold".into()),
         (_, false) => FontFamily::Proportional,
     };
     FontId::new(size, family)
+}
+
+/// The editor face for a catalogue id: that face alone, so a missing glyph is not silently
+/// taken from another family.
+fn added_face_family(look: &pdfcraft_engine::AddedText) -> Option<FontFamily> {
+    let id = look.font_id.as_deref()?;
+    let draw = if look.bold {
+        pdfcraft_fonts::catalog::bold_partner(id).unwrap_or(id)
+    } else if pdfcraft_fonts::catalog::get(id).is_some_and(|face| face.weight == 700) {
+        pdfcraft_fonts::catalog::regular_partner(id).unwrap_or(id)
+    } else {
+        id
+    };
+    let face = pdfcraft_fonts::catalog::get(draw)?;
+    if !face.can_preview() {
+        return None;
+    }
+    let name = match draw {
+        "bundled:inter:regular" => "added-inter",
+        "bundled:inter:medium" => "added-inter-medium",
+        "bundled:inter:semibold" => "added-inter-semibold",
+        "bundled:jetbrains-mono:regular" => "added-jetbrains",
+        _ => return Some(FontFamily::Name(format!("{} {}", face.family, face.style).into())),
+    };
+    Some(FontFamily::Name(name.into()))
 }
 
 fn color32(color: [f64; 3]) -> Color32 {

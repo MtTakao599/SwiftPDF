@@ -145,11 +145,17 @@ pub fn japanese_glyph(ch: char) -> Result<GlyphOutline, GlyphError> {
 /// The bounded outline and advance from the explicitly selected craft-fonts face.
 /// Uses the same complexity and missing-glyph checks as [`japanese_glyph`].
 pub fn japanese_glyph_from(face: &crate::CraftFont, ch: char) -> Result<GlyphOutline, GlyphError> {
-    let Ok(font) = FontRef::new(face.bytes) else { return Err(GlyphError::Missing) };
+    program_glyph(face.bytes, ch)
+}
+
+/// One glyph of `bytes`, in ems. `.notdef` and a missing character are [`GlyphError::Missing`].
+/// Nothing is taken from another face.
+pub fn program_glyph(bytes: &[u8], ch: char) -> Result<GlyphOutline, GlyphError> {
+    let Ok(font) = FontRef::new(bytes) else { return Err(GlyphError::Missing) };
     let loc = LocationRef::default();
     let metrics = font.metrics(Size::unscaled(), loc);
     let scale = 1.0 / metrics.units_per_em.max(1) as f64;
-    let Some(gid) = font.charmap().map(ch) else { return Err(GlyphError::Missing) };
+    let Some(gid) = font.charmap().map(ch).filter(|gid| gid.to_u32() != 0) else { return Err(GlyphError::Missing) };
     let advances = font.glyph_metrics(Size::unscaled(), loc);
     let width = advances.advance_width(gid).unwrap_or(0.0) as f64 * scale;
     if !width.is_finite() || width <= 0.0 || width > 2.0 {

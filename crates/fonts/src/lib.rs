@@ -1,12 +1,14 @@
 //! pdfcraft-fonts — font metrics and encodings for generated appearances (L2).
 //!
-//! Standard-14 advance widths are exact (`Std14`, ISO 32000-2 Annex D). What remains approximate
-//! is everything that needs a font *program*: this crate reads font dictionaries, never embedded
-//! programs, so it has no glyph outlines for document fonts and cannot subset or re-embed. That
-//! is phase F 4.2 in docs/plan/execution-plan.md.
+//! Standard-14 advance widths are exact (`Std14`, ISO 32000-2 Annex D). A font already embedded
+//! in a PDF is still read from its dictionary, not from that program, so those faces have no
+//! outlines here and cannot be subset or re-embedded. [`catalog`] is separate: it previews and
+//! can later embed only the faces it lists. That dictionary limit is phase F 4.2 in
+//! docs/plan/execution-plan.md.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod catalog;
 mod craft;
 pub mod embedding;
 mod encodings;
@@ -23,7 +25,8 @@ pub use craft::{
     ui_telugu_fonts, ui_thai_fonts,
 };
 pub use script::{
-    GlyphError, GlyphOutline, INTER_REGULAR, MAX_SIGNATURE_CHARS, ScriptOutline, japanese_glyph, japanese_glyph_from, script_missing, script_outline,
+    GlyphError, GlyphOutline, INTER_REGULAR, MAX_SIGNATURE_CHARS, ScriptOutline, japanese_glyph, japanese_glyph_from, program_glyph, script_missing,
+    script_outline,
 };
 pub use shaping::{
     ShapedCluster, ShapedScript, arabic_glyph, arabic_has, hebrew_has, shape_arabic, shape_hebrew, shape_thai, shaped_glyph, thai_has,

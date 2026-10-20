@@ -116,6 +116,9 @@ pub struct AddedText {
     pub size: f64,
     pub color: [f64; 3],
     pub align: Align,
+    /// A catalogue font id. Absent for the three standard families, including every older file.
+    /// The font program is not stored here; the page keeps the used glyphs.
+    pub font_id: Option<String>,
 }
 
 impl Default for AddedText {
@@ -129,6 +132,7 @@ impl Default for AddedText {
             size: 12.0,
             color: [0.0; 3],
             align: Align::Left,
+            font_id: None,
         }
     }
 }
@@ -257,7 +261,9 @@ fn wrapped(t: &AddedText) -> Vec<(String, bool)> {
         // paragraph's; a space between Latin words is drawn in the item's font, a few hundredths
         // of an em apart.
         let measure = |s: &str| {
-            if !rtl_script && !thai && s.chars().any(needs_japanese_glyph) {
+            if catalog_bytes(t).is_some() {
+                s.chars().map(|c| glyph_width(t, c)).sum()
+            } else if !rtl_script && !thai && s.chars().any(needs_japanese_glyph) {
                 s.chars().map(|c| glyph_width(t, c)).sum()
             } else if rtl_script || thai {
                 shaped_width(t, s, rtl)
@@ -331,8 +337,16 @@ fn is_hebrew(c: char) -> bool {
 }
 
 /// A character the standard fonts do not encode and the Arabic, Hebrew and Thai faces do not take.
+/// Direction marks are not glyphs: the shaper drops them, so they are not missing Japanese.
 fn needs_japanese_glyph(c: char) -> bool {
-    c != '\n' && c != '\r' && c != '\t' && pdfcraft_fonts::win_ansi_byte(c).is_none() && !is_arabic(c) && !is_hebrew(c) && !is_thai(c)
+    c != '\n'
+        && c != '\r'
+        && c != '\t'
+        && !is_bidi_control(c)
+        && pdfcraft_fonts::win_ansi_byte(c).is_none()
+        && !is_arabic(c)
+        && !is_hebrew(c)
+        && !is_thai(c)
 }
 
 /// Whether the Japanese Type 3 face that would draw `t` has an outline for `c`.
@@ -342,9 +356,76 @@ fn japanese_glyph_available(t: &AddedText, c: char) -> bool {
         .any(|face| pdfcraft_fonts::japanese_glyph_from(face, c).is_ok())
 }
 
+/// The standard-14 catalogue id, as the existing family and bold flag. Italic stays on the checkbox.
+pub fn standard_family(id: &str) -> Option<(Family, bool)> {
+    match id {
+        "standard:helvetica:regular" => Some((Family::Helvetica, false)),
+        "standard:helvetica:bold" => Some((Family::Helvetica, true)),
+        "standard:times:regular" => Some((Family::Times, false)),
+        "standard:times:bold" => Some((Family::Times, true)),
+        "standard:courier:regular" => Some((Family::Courier, false)),
+        "standard:courier:bold" => Some((Family::Courier, true)),
+        _ => None,
+    }
+}
+
+/// The catalogue id the font window should highlight for this item.
+pub fn current_font_id(t: &AddedText) -> String {
+    if let Some(id) = t.font_id.as_deref() {
+        return id.to_string();
+    }
+    match (t.family, t.bold) {
+        (Family::Times, true) => "standard:times:bold",
+        (Family::Times, false) => "standard:times:regular",
+        (Family::Courier, true) => "standard:courier:bold",
+        (Family::Courier, false) => "standard:courier:regular",
+        (Family::Helvetica, true) => "standard:helvetica:bold",
+        (Family::Helvetica, false) => "standard:helvetica:regular",
+    }
+    .to_string()
+}
+
+/// The catalogue face that draws `t`, after the bold checkbox. `None` for the three
+/// standard families and for an id this build cannot draw.
+fn catalog_face(t: &AddedText) -> Option<&'static pdfcraft_fonts::catalog::Face> {
+    let id = t.font_id.as_deref()?;
+    if standard_family(id).is_some() {
+        return None;
+    }
+    let draw = if t.bold {
+        pdfcraft_fonts::catalog::bold_partner(id).unwrap_or(id)
+    } else if pdfcraft_fonts::catalog::get(id).is_some_and(|face| face.weight == 700) {
+        pdfcraft_fonts::catalog::regular_partner(id).unwrap_or(id)
+    } else {
+        id
+    };
+    let face = pdfcraft_fonts::catalog::get(draw)?;
+    if !face.available() || !face.can_preview() || face.program().is_none() {
+        return None;
+    }
+    // Medium and semibold are not bold faces. A checked bold box without a weight-700 partner
+    // keeps this face, so the page and the editor stay on the same outlines.
+    Some(face)
+}
+
+/// Bytes of [`catalog_face`].
+fn catalog_bytes(t: &AddedText) -> Option<&'static [u8]> {
+    catalog_face(t).and_then(|face| face.program())
+}
+
 /// Width of one character: the standard font when it has the character, otherwise one em
-/// (the Japanese face's usual advance, used before the outline is read).
+/// (the Japanese face's usual advance, used before the outline is read). A catalogue face
+/// uses that face's own advance for every character.
 fn glyph_width(t: &AddedText, c: char) -> f64 {
+    if let Some(bytes) = catalog_bytes(t) {
+        if c == '\t' {
+            return t.size;
+        }
+        if c.is_whitespace() {
+            return pdfcraft_fonts::program_glyph(bytes, ' ').map(|g| g.width).unwrap_or(0.33) * t.size;
+        }
+        return pdfcraft_fonts::program_glyph(bytes, c).map(|g| g.width).unwrap_or(1.0) * t.size;
+    }
     if c == '\t' || pdfcraft_fonts::win_ansi_byte(c).is_some() { t.family.width(&c.to_string(), t.size, t.bold, t.italic) } else { t.size }
 }
 
@@ -352,6 +433,14 @@ fn glyph_width(t: &AddedText, c: char) -> f64 {
 /// with the craft-fonts Arabic (#125), Hebrew (#128) or Japanese Type 3 face, or a character
 /// that face can't draw. Page-content tools refuse such text; the Add-text editor keeps it open.
 pub fn first_undrawable(t: &AddedText) -> Option<char> {
+    if let Some(id) = t.font_id.as_deref()
+        && standard_family(id).is_none()
+    {
+        let Some(bytes) = catalog_bytes(t) else {
+            return t.text.chars().find(|c| !c.is_whitespace());
+        };
+        return t.text.chars().find(|c| !c.is_control() && !c.is_whitespace() && pdfcraft_fonts::program_glyph(bytes, *c).is_err());
+    }
     if t.text.chars().any(is_thai) {
         if let Some(c) = t.text.chars().find(|c| is_thai(*c) && !pdfcraft_fonts::thai_has(*c)) {
             return Some(c);
@@ -371,14 +460,17 @@ pub fn first_undrawable(t: &AddedText) -> Option<char> {
     if !shaped_by_a_face(t) {
         // Japanese that the fallback face can draw is not left to the standard font. Anything
         // else outside WinAnsi still cannot be written.
+        // Added text splits on LF only. A CR stays inside the line, and a Japanese face that
+        // happens to map U+000D must not turn that into a drawn glyph.
         return t.text.split('\n').find_map(|line| {
             line.chars().find(|c| {
-                pdfcraft_fonts::win_ansi_byte(*c).is_none()
-                    && *c != '\t'
-                    && !is_arabic(*c)
-                    && !is_hebrew(*c)
-                    && !is_thai(*c)
-                    && !japanese_glyph_available(t, *c)
+                *c == '\r'
+                    || (pdfcraft_fonts::win_ansi_byte(*c).is_none()
+                        && *c != '\t'
+                        && !is_arabic(*c)
+                        && !is_hebrew(*c)
+                        && !is_thai(*c)
+                        && !japanese_glyph_available(t, *c))
             })
         });
     }
@@ -540,6 +632,9 @@ pub fn text_rect(t: &AddedText) -> [f64; 4] {
 
 /// The widest explicit line before wrapping, measured with the PDF writing fonts.
 pub fn text_width(t: &AddedText) -> f64 {
+    if catalog_bytes(t).is_some() {
+        return t.text.split('\n').map(|line| line.chars().map(|c| glyph_width(t, c)).sum()).fold(0.0, f64::max);
+    }
     t.text.split('\n').map(|line| shaped_width(t, line, unicode_bidi::get_base_direction(line) == unicode_bidi::Direction::Rtl)).fold(0.0, f64::max)
 }
 
@@ -848,6 +943,164 @@ fn draw_japanese(doc: &mut Document, t: &AddedText, standard_font: &str, fonts: 
     Ok(())
 }
 
+/// Draw every character of `t` from its catalogue face. Latin is not switched to a standard font.
+fn draw_catalog(doc: &mut Document, t: &AddedText, taken: &Dict, fonts: &mut Dict, out: &mut Vec<u8>) -> Result<(), EditError> {
+    let face = catalog_face(t).ok_or_else(|| EditError::Invalid("the chosen font cannot be drawn".into()))?;
+    let bytes = face.program().ok_or_else(|| EditError::Invalid("the chosen font has no outlines".into()))?;
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    for ch in t.text.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            continue;
+        }
+        if seen.insert(ch) {
+            order.push(ch);
+        }
+    }
+    if order.len() > 960 {
+        return Err(EditError::Invalid("too many different characters for one text box".into()));
+    }
+    let mut glyphs = Vec::with_capacity(order.len());
+    for ch in order {
+        let glyph = pdfcraft_fonts::program_glyph(bytes, ch)
+            .map_err(|_| EditError::Invalid(format!("the chosen font has no glyph for U+{:04X}", u32::from(ch))))?;
+        glyphs.push((ch, glyph));
+    }
+    let mut taken_names: HashSet<Vec<u8>> = taken.iter().map(|(name, _)| name.clone()).collect();
+    let mut names = Vec::new();
+    let mut codes: HashMap<char, (usize, u8)> = HashMap::new();
+    for (chunk_index, chunk) in glyphs.chunks(GLYPHS_PER_FONT).enumerate() {
+        let font = catalog_type3(doc, chunk, face.family);
+        let mut name = format!("PCFc{}", font.num);
+        let mut suffix = 0usize;
+        while taken_names.contains(name.as_bytes()) {
+            suffix = suffix.saturating_add(1);
+            name = format!("PCFc{}_{suffix}", font.num);
+        }
+        taken_names.insert(name.clone().into_bytes());
+        fonts.set(name.clone().into_bytes(), Object::Ref(font));
+        for (i, (ch, _)) in chunk.iter().enumerate() {
+            let code = u8::try_from(i.saturating_add(1)).unwrap_or(1);
+            codes.insert(*ch, (chunk_index, code));
+        }
+        names.push(name);
+    }
+    let r = text_rect(t);
+    let [cr, cg, cb] = t.color.map(|v| v.clamp(0.0, 1.0));
+    out.extend(format!("BT {} {} {} rg\n", n(cr), n(cg), n(cb)).bytes());
+    let laid = lines(t);
+    for (i, line) in laid.iter().enumerate() {
+        let width: f64 = line.chars().map(|c| glyph_width(t, c)).sum();
+        let spaces = line.matches(' ').count();
+        let gap = if t.align == Align::Justify && i + 1 < laid.len() && spaces > 0 { ((r[2] - r[0]) - width).max(0.0) / spaces as f64 } else { 0.0 };
+        let x = match t.align {
+            Align::Left | Align::Justify => r[0],
+            Align::Center => r[0] + ((r[2] - r[0]) - width) / 2.0,
+            Align::Right => r[2] - width,
+        };
+        let y = r[3] - (i as f64 * 1.2 + 0.95) * t.size;
+        let logical: String = line.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        out.extend(format!("/Span <</ActualText <FEFF{logical}>>> BDC\n").bytes());
+        let mut pen = x;
+        let mut current: Option<usize> = None;
+        for ch in line.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            if let Some((index, code)) = codes.get(&ch)
+                && let Some(name) = names.get(*index)
+            {
+                if current != Some(*index) {
+                    out.extend(format!("/{name} {} Tf ", n(t.size)).bytes());
+                    current = Some(*index);
+                }
+                out.extend(format!("1 0 0 1 {} {} Tm ", n(pen), n(y)).bytes());
+                out.extend(literal(&[*code]));
+                out.extend_from_slice(b" Tj\n");
+            }
+            pen += glyph_width(t, ch) + if ch == ' ' { gap } else { 0.0 };
+        }
+        out.extend_from_slice(b"EMC\n");
+    }
+    out.extend_from_slice(b"ET\n");
+    Ok(())
+}
+
+fn catalog_type3(doc: &mut Document, glyphs: &[(char, pdfcraft_fonts::GlyphOutline)], family: &str) -> ObjRef {
+    let mut charprocs = Dict::new();
+    let mut differences = vec![Object::Int(1)];
+    let mut widths = Vec::with_capacity(glyphs.len());
+    let mut bbox = [0.0f64; 4];
+    let mut to_unicode = Vec::new();
+    for (i, (ch, glyph)) in glyphs.iter().enumerate() {
+        let code = i.saturating_add(1);
+        let scale = 1000.0;
+        let b = if glyph.contours.is_empty() { [0.0; 4] } else { glyph.bbox };
+        let mut proc = format!(
+            "{} 0 {} {} {} {} d1\n",
+            n(glyph.width * scale),
+            n((b[0] * scale).floor()),
+            n((b[1] * scale).floor()),
+            n((b[2] * scale).ceil()),
+            n((b[3] * scale).ceil())
+        )
+        .into_bytes();
+        for contour in &glyph.contours {
+            let Some(first) = contour.first() else { continue };
+            proc.extend(format!("{} {} m\n", n(first[0] * scale), n(first[1] * scale)).bytes());
+            for p in contour.iter().skip(1) {
+                proc.extend(format!("{} {} l\n", n(p[0] * scale), n(p[1] * scale)).bytes());
+            }
+            proc.extend_from_slice(b"h\n");
+        }
+        if !glyph.contours.is_empty() {
+            proc.extend_from_slice(b"f\n");
+        }
+        bbox = [bbox[0].min(b[0] * scale), bbox[1].min(b[1] * scale), bbox[2].max(b[2] * scale), bbox[3].max(b[3] * scale)];
+        let glyph_name = format!("g{code:02X}");
+        charprocs.set(glyph_name.clone().into_bytes(), Object::Ref(doc.add(Object::Stream(Stream::flate(Dict::new(), &proc)))));
+        differences.push(Object::name(&glyph_name));
+        widths.push(Object::Real((glyph.width * scale).round()));
+        let mut units = [0u16; 2];
+        let hex: String = ch.encode_utf16(&mut units).iter().map(|u| format!("{u:04X}")).collect();
+        to_unicode.push(format!("<{code:02X}> <{hex}>\n"));
+    }
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n1 begincodespacerange\n<01> <FF>\nendcodespacerange\n",
+    );
+    for block in to_unicode.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n{}endbfchar\n", block.len(), block.concat()));
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    let cmap = doc.add(Object::Stream(Stream::flate(Dict::new(), cmap.as_bytes())));
+    let mut descriptor = Dict::new();
+    descriptor.set(b"Type".to_vec(), Object::name("FontDescriptor"));
+    descriptor.set(b"FontName".to_vec(), Object::name(&family.replace(' ', "")));
+    descriptor.set(b"FontFamily".to_vec(), Object::String(PdfString::literal(family.as_bytes().to_vec())));
+    descriptor.set(b"Flags".to_vec(), Object::Int(4));
+    descriptor.set(b"ItalicAngle".to_vec(), Object::Int(0));
+    let mut encoding = Dict::new();
+    encoding.set(b"Type".to_vec(), Object::name("Encoding"));
+    encoding.set(b"Differences".to_vec(), Object::Array(differences));
+    let mut font = Dict::new();
+    font.set(b"Type".to_vec(), Object::name("Font"));
+    font.set(b"Subtype".to_vec(), Object::name("Type3"));
+    font.set(b"FontDescriptor".to_vec(), Object::Ref(doc.add(Object::Dict(descriptor))));
+    font.set(b"FontBBox".to_vec(), Object::Array(bbox.iter().copied().map(Object::Real).collect()));
+    font.set(
+        b"FontMatrix".to_vec(),
+        Object::Array(vec![Object::Real(0.001), Object::Int(0), Object::Int(0), Object::Real(0.001), Object::Int(0), Object::Int(0)]),
+    );
+    let last = glyphs.len().max(1) as i64;
+    font.set(b"FirstChar".to_vec(), Object::Int(1));
+    font.set(b"LastChar".to_vec(), Object::Int(last));
+    font.set(b"Widths".to_vec(), Object::Array(widths));
+    font.set(b"Encoding".to_vec(), Object::Dict(encoding));
+    font.set(b"CharProcs".to_vec(), Object::Dict(charprocs));
+    font.set(b"ToUnicode".to_vec(), Object::Ref(cmap));
+    doc.add(Object::Dict(font))
+}
+
 fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict, existing: bool) -> Result<(Vec<u8>, Dict), EditError> {
     let mut res = Dict::new();
     let mut out = format!(
@@ -862,6 +1115,13 @@ fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict, existing:
     .into_bytes();
     match c {
         Content::Text(t) => {
+            if catalog_bytes(t).is_some() {
+                let mut fonts = Dict::new();
+                draw_catalog(doc, t, taken, &mut fonts, &mut out)?;
+                res.set(b"Font".to_vec(), Object::Dict(fonts));
+                out.extend_from_slice(b"Q\n");
+                return Ok((out, res));
+            }
             let base = t.family.base_font(t.bold, t.italic);
             let name = font_name(base);
             let mut font = Dict::new();
@@ -954,6 +1214,9 @@ fn params(c: &Content) -> Dict {
             d.set(b"Kind".to_vec(), Object::name("Text"));
             d.set(b"Text".to_vec(), PdfString::text(&t.text));
             d.set(b"Font".to_vec(), Object::name(t.family.base_font(t.bold, t.italic)));
+            if let Some(id) = t.font_id.as_deref().filter(|id| !id.is_empty()) {
+                d.set(b"PCFontId".to_vec(), Object::String(PdfString::literal(id.as_bytes().to_vec())));
+            }
             d.set(b"Size".to_vec(), Object::Real(t.size));
             d.set(b"Color".to_vec(), arr(&t.color));
             d.set(
@@ -988,6 +1251,14 @@ fn params(c: &Content) -> Dict {
     d
 }
 
+fn font_id_of(doc: &Document, d: &Dict) -> Option<String> {
+    let object = d.get(b"PCFontId")?;
+    let resolved = doc.resolve(object);
+    let text = resolved.as_string()?.to_text();
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).take(128).collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn parse(doc: &Document, d: &Dict) -> Option<Content> {
     let r = nums(doc, d.get(b"Rect"));
     let rect: [f64; 4] = r.try_into().ok()?;
@@ -1009,6 +1280,7 @@ fn parse(doc: &Document, d: &Dict) -> Option<Content> {
                     Some(3) => Align::Justify,
                     _ => Align::Left,
                 },
+                font_id: font_id_of(doc, d),
             }))
         }
         b"Image" => {

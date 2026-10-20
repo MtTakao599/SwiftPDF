@@ -54,6 +54,7 @@ mod credits;
 mod crop;
 mod drag_pointer;
 mod export_ui;
+mod font_picker;
 pub mod identity;
 mod js_ui;
 mod marks_ui;
@@ -64,6 +65,7 @@ pub mod output_policy;
 mod seal_store;
 mod search_ui;
 mod sign_ui;
+mod stamp_preset;
 mod stamps_ui;
 mod standards_ui;
 mod zoom_menu;
@@ -281,6 +283,8 @@ pub enum QuickTool {
     CustomStamp(usize),
     /// A chairman seal from the encrypted library (its index).
     ChairmanSeal(usize),
+    /// A date stamp from the settings library (its index). Not a chairman seal.
+    DateStamp(usize),
     /// Edit a PDF ▸ Link: draw link areas, select and edit links.
     Link,
     /// Use a certificate ▸ Digitally sign / Certify (visible): drag the signature's rectangle.
@@ -398,6 +402,10 @@ pub enum Dialog {
     ConfirmSeal,
     /// Confirm deletion of a chairman seal from the encrypted store.
     DeleteSeal,
+    /// Register or edit a date stamp. It is stored with ordinary stamps, not chairman seals.
+    DateStamp,
+    /// Shared font window. Confirming stores an id; it does not change text or stamps.
+    FontPicker,
     /// Prepare for accessibility ▸ Add alternate text.
     AltText,
     /// PDF Optimizer ▸ Audit space usage (then back to the optimizer).
@@ -770,6 +778,24 @@ pub struct PdfCraftApp {
     /// The custom stamp library, and the stamp being created.
     pub custom_stamps: Vec<stamps_ui::CustomStamp>,
     pub stamp_draft: stamps_ui::StampDraft,
+    /// Date stamps. Ordinary settings, not chairman seals.
+    pub date_stamps: Vec<stamp_preset::DateStamp>,
+    pub date_draft: stamps_ui::DateDraft,
+    /// The shared font window's fields. Confirming writes [`Self::font_choice`] and does not
+    /// change a document.
+    pub font_picker: font_picker::State,
+    /// The id from the last 決定, until [`Self::take_font_choice`].
+    pub font_choice: Option<String>,
+    /// The dialog to reopen after the font window, when a date stamp opened it.
+    pub(crate) font_return: Option<Dialog>,
+    /// Which date-stamp row the font window is editing.
+    pub(crate) date_font_row: Option<stamp_preset::DateFontRow>,
+    /// The date-stamp dialog asked to show the font window on this frame.
+    pub(crate) font_hold: bool,
+    /// The font window was opened from added text. Closing it returns to that text.
+    pub(crate) text_font: bool,
+    /// The registration dialog's 試し置き asked to explain the next click.
+    pub stamp_try: bool,
     /// Chairman seals. Not part of [`Self::persist`].
     pub seal_store: seal_store::SealStore,
     pub seal_uses: Vec<seal_store::SealUse>,
@@ -1087,6 +1113,15 @@ impl PdfCraftApp {
             image_import: None,
             custom_stamps: Vec::new(),
             stamp_draft: Default::default(),
+            date_stamps: Vec::new(),
+            date_draft: Default::default(),
+            font_picker: Default::default(),
+            font_choice: None,
+            font_return: None,
+            date_font_row: None,
+            font_hold: false,
+            text_font: false,
+            stamp_try: false,
             seal_store: seal_store::SealStore::empty(),
             seal_uses: Vec::new(),
             seal_ack: false,
@@ -2225,6 +2260,28 @@ impl PdfCraftApp {
         self.ui_mode
     }
 
+    /// Open the shared font window. `current` is highlighted. [`Self::take_font_choice`] is the
+    /// id after 決定, and stays empty after cancel or Escape. A dialog that is already open is
+    /// left as it is.
+    pub fn open_font_picker(&mut self, current: Option<&str>) -> bool {
+        if self.dialog.is_some() {
+            return false;
+        }
+        self.font_choice = None;
+        self.font_return = None;
+        self.date_font_row = None;
+        self.font_hold = false;
+        self.text_font = false;
+        self.font_picker = font_picker::State::opening(current);
+        self.dialog = Some(Dialog::FontPicker);
+        true
+    }
+
+    /// The font id chosen with 決定, if the caller has not read it yet.
+    pub fn take_font_choice(&mut self) -> Option<String> {
+        self.font_choice.take()
+    }
+
     /// Switch between the simple and detailed interface. Tabs, documents, their views and
     /// view-only stay as they are; leaving the simple Home for the detailed interface shows the
     /// document shown last again, if it is still open.
@@ -2430,6 +2487,7 @@ impl PdfCraftApp {
         // Set outside json! above, which is at serde_json's macro recursion limit.
         v["hide_empty_highlight_hover"] = serde_json::Value::Bool(self.comment_prefs.hide_empty_highlight_hover);
         v["ui_mode"] = serde_json::Value::String(self.ui_mode.as_str().into());
+        v["date_stamps"] = stamp_preset::encode_dates(&self.date_stamps);
         v.to_string()
     }
 
@@ -2591,6 +2649,7 @@ impl PdfCraftApp {
             self.digital_ids = ids;
         }
         self.custom_stamps = stamps_ui::decode(&v["custom_stamps"]);
+        self.date_stamps = stamp_preset::decode_dates(&v["date_stamps"]);
         self.custom_actions = actions_ui::decode(&v["actions"]);
         if let Some(on) = v["javascript"].as_bool() {
             self.session.set_javascript(on);
@@ -2835,6 +2894,13 @@ impl PdfCraftApp {
                             return Err(format!("there are {} custom stamps", self.custom_stamps.len()));
                         }
                         QuickTool::CustomStamp(i)
+                    }
+                    date if date.starts_with("date-stamp-") => {
+                        let i: usize = date[11..].parse().map_err(|_| format!("bad stamp {date}"))?;
+                        if i >= self.date_stamps.len() {
+                            return Err(format!("there are {} date stamps", self.date_stamps.len()));
+                        }
+                        QuickTool::DateStamp(i)
                     }
                     stamp if stamp.starts_with("stamp-") => QuickTool::Stamp(
                         pdfcraft_engine::StampKind::ALL

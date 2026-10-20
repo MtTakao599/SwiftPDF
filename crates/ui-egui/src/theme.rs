@@ -402,6 +402,22 @@ fn font_definitions_for_platform(prefer_hans: bool, platform: FontPolicyPlatform
         }
     }
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].clone();
+    for face in pdfcraft_fonts::CRAFT_FONTS.iter() {
+        let name = face.name();
+        if fonts.font_data.contains_key(&name) {
+            fonts.families.insert(FontFamily::Name(name.clone().into()), vec![name]);
+        }
+    }
+    for (id, primary) in [
+        ("added-inter", "Inter"),
+        ("added-inter-medium", "Inter-Medium"),
+        ("added-inter-semibold", "Inter-SemiBold"),
+        ("added-jetbrains", "JetBrainsMono"),
+    ] {
+        if fonts.font_data.contains_key(primary) {
+            fonts.families.insert(FontFamily::Name(id.into()), vec![primary.to_owned()]);
+        }
+    }
     for (fam, primary) in [("medium", "Inter-Medium"), ("semibold", "Inter-SemiBold")] {
         let mut stack = vec![primary.to_owned()];
         stack.extend(fallback.iter().cloned());

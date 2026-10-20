@@ -76,6 +76,7 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let mut compare_now = false;
     let mut images_now = false;
     let mut stamp_now = false;
+    let mut date_now = false;
     let mut alt_now = false;
     let t = Tokens::get(ctx);
     let mut close = false;
@@ -86,6 +87,8 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
             Dialog::Print => 820.0,
             Dialog::FieldProps | Dialog::BulkFieldProps => 600.0,
             Dialog::About => 780.0,
+            Dialog::FontPicker => 720.0,
+            Dialog::DateStamp => 680.0,
             _ => 520.0,
         });
         match dialog {
@@ -983,6 +986,16 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                 close = save || cancel;
                 return;
             }
+            Dialog::DateStamp => {
+                let (save, cancel) = crate::stamps_ui::date_body(ui, app, &t);
+                date_now = save;
+                close = save || cancel;
+                return;
+            }
+            Dialog::FontPicker => {
+                close = crate::font_picker::body(ui, &mut app.font_picker, &mut app.font_choice, &t);
+                return;
+            }
             Dialog::ConfirmSeal => {
                 let (save, cancel) = crate::stamps_ui::confirm_seal_body(ui, app);
                 if save {
@@ -1460,7 +1473,24 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     }
     // Protect / Remove security replace the Properties dialog.
     let replaces = link_command.is_some_and(|c| c.starts_with("protect.")) || open_revision.is_some();
-    if modal.should_close() || close || replaces {
+    let hold = std::mem::take(&mut app.font_hold);
+    let return_to_date = (modal.should_close() || close) && dialog == Dialog::FontPicker && app.font_return == Some(Dialog::DateStamp);
+    if hold {
+        app.dialog = Some(Dialog::FontPicker);
+    } else if return_to_date {
+        app.font_return = None;
+        crate::stamps_ui::apply_date_font_choice(app);
+        app.dialog = Some(Dialog::DateStamp);
+    } else if app.text_font && dialog == Dialog::FontPicker && (modal.should_close() || close) {
+        app.text_font = false;
+        app.font_return = None;
+        app.date_font_row = None;
+        crate::content_ui::apply_text_font_choice(app);
+        app.dialog = None;
+    } else if modal.should_close() || close || replaces {
+        app.font_return = None;
+        app.date_font_row = None;
+        app.text_font = false;
         app.dialog = None;
         app.props_draft = None;
         app.view_draft = None;
@@ -1479,6 +1509,9 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     }
     if stamp_now {
         app.save_custom_stamp();
+    }
+    if date_now {
+        app.save_date_stamp();
     }
     if images_now {
         app.finish_image_import();

@@ -2684,9 +2684,13 @@ fn header_and_watermark_drawability_matches_what_applying_refuses() {
 fn page_text_the_standard_fonts_cant_draw_is_refused() {
     let mut doc = fixture();
     let before: Vec<Vec<String>> = (0..3).map(|p| streams(&reopen(&doc), p)).collect();
+    // Japanese the Type 3 face can draw is page content, not a `?`. This test refuses only
+    // characters no face can draw. `added_japanese_text_uses_type3_outlines` covers the drawn case.
     let text = AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: "日本語のテキスト".into(), ..AddedText::default() };
-    let err = add_content(&mut doc, 0, &Content::Text(text)).unwrap_err().to_string();
-    assert!(err.contains("\"日\" (U+65E5)"), "{err}");
+    if first_undrawable(&text).is_some() {
+        let err = add_content(&mut doc, 0, &Content::Text(text)).unwrap_err().to_string();
+        assert!(err.contains("\"日\" (U+65E5)"), "{err}");
+    }
     let hf = HeaderFooter {
         text: ["Ελληνικά".into(), String::new(), String::new(), String::new(), String::new(), String::new()],
         ..HeaderFooter::default()
@@ -2702,7 +2706,11 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
     // Retyping existing text is refused the same way, and the whole document is left as it was.
     let saved = write_incremental(&doc, &SaveOptions::default()).unwrap();
     let retyped = AddedText { text: "Café 中".into(), ..text.clone() };
-    assert!(update_content(&mut doc, 0, 0, &Content::Text(retyped)).unwrap_err().to_string().contains("U+4E2D"));
+    // BIZ UDPGothic and BIZ UDMincho encode Greek, so "Ελληνικά" is drawn by the Japanese face.
+    // U+1F600 is in none of those faces, and still must be refused.
+    let foreign = if first_undrawable(&retyped).is_some() { retyped } else { AddedText { text: "Café \u{1F600}".into(), ..text.clone() } };
+    let err = update_content(&mut doc, 0, 0, &Content::Text(foreign)).unwrap_err().to_string();
+    assert!(err.contains("U+4E2D") || err.contains("U+1F600"), "{err}");
     assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), saved, "a refused update changes nothing");
     // A carriage return is checked where it would be drawn: added text splits on LF only, so
     // CRLF would leave a `?`; headers and watermarks split CRLF into lines, but not a lone CR.
@@ -2718,14 +2726,20 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
     // in, refused (never written as `?`) when it isn't. Text left to the standard font still counts.
     let arabic = |text: &str| AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: text.into(), ..AddedText::default() };
     // U+061C is in the Arabic block but is a direction mark that's dropped, not shaped: it never
-    // makes text drawable, nor (with the face) undrawable.
-    assert!(add_content(&mut doc, 0, &Content::Text(arabic("\u{061C}中"))).is_err());
+    // makes text drawable, nor (with the face) undrawable. 中 is refused only when no face draws it.
+    let marked = arabic("\u{061C}中");
+    if first_undrawable(&marked).is_some() {
+        assert!(add_content(&mut doc, 0, &Content::Text(marked)).is_err());
+    }
     if pdfcraft_fonts::arabic_has('م') {
         add_content(&mut doc, 0, &Content::Text(arabic("مرحبا Hello"))).unwrap();
         add_content(&mut doc, 0, &Content::Text(arabic("\u{061C}Hello"))).unwrap();
         for text in ["مرحبا 中", "\u{061C}中"] {
-            let err = add_content(&mut doc, 0, &Content::Text(arabic(text))).unwrap_err().to_string();
-            assert!(err.contains("U+4E2D"), "{text:?}: {err}");
+            let item = arabic(text);
+            if first_undrawable(&item).is_some() {
+                let err = add_content(&mut doc, 0, &Content::Text(item)).unwrap_err().to_string();
+                assert!(err.contains("U+4E2D"), "{text:?}: {err}");
+            }
         }
     } else {
         // #403's own refusal says what's missing; the Add-text editor still keeps the draft.
@@ -2736,8 +2750,11 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
         // the standard font would write as `?`.
         let n = list_added(&doc).iter().filter(|a| a.page == 0).count();
         add_content(&mut doc, 0, &Content::Text(arabic("x"))).unwrap();
-        let err = update_content(&mut doc, 0, n, &Content::Text(arabic("ب中"))).unwrap_err().to_string();
-        assert!(err.contains("U+4E2D"), "{err}");
+        let mixed = arabic("ب中");
+        if first_undrawable(&mixed).is_some() {
+            let err = update_content(&mut doc, 0, n, &Content::Text(mixed)).unwrap_err().to_string();
+            assert!(err.contains("U+4E2D"), "{err}");
+        }
         update_content(&mut doc, 0, n, &Content::Text(arabic("ب"))).unwrap();
     }
 }
@@ -2972,9 +2989,15 @@ fn added_thai_text_wraps_clusters_and_survives_reopen() {
     assert_eq!(super::added::lines(&narrow), ["กิ่", "กิ่", "กิ่"]);
     update_content(&mut doc, 0, 0, &Content::Text(AddedText { text: "แก้ไข น้ำ".into(), ..t.clone() })).unwrap();
     assert!(!own(&doc, 0).is_empty());
-    let bad = Content::Text(AddedText { text: "ไทย 日".into(), ..t });
+    // 日 is drawn by the Japanese face when this build has one. Greek is in BIZ UDPGothic and
+    // BIZ UDMincho, so it is drawn too. U+1F600 is in none of those faces: the update is refused
+    // and the item already on the page stays as it was.
+    let mixed = AddedText { text: "ไทย 日".into(), ..t.clone() };
+    let foreign = AddedText { text: "ไทย \u{1F600}".into(), ..t };
+    let bad = if first_undrawable(&mixed).is_some() { mixed } else { foreign };
+    assert!(first_undrawable(&bad).is_some(), "a character no face encodes must stay refused");
     let before = list_added(&doc);
-    assert!(update_content(&mut doc, 0, 0, &bad).is_err());
+    assert!(update_content(&mut doc, 0, 0, &Content::Text(bad)).is_err());
     assert_eq!(list_added(&doc), before);
     delete_content(&mut doc, 0, 0).unwrap();
     assert!(list_added(&doc).is_empty());
@@ -4414,6 +4437,75 @@ fn japanese_paragraphs_wrap_between_characters_without_closing_marks_at_a_row_st
         assert!(block.rect[2] - block.rect[0] <= 120.5, "{:?} {rows:?}", block.rect);
         for row in &rows {
             assert!(!row.starts_with(['、', '。', '」', 'っ']) && !row.ends_with('「'), "{row:?} in {rows:?}");
+        }
+    }
+}
+
+#[test]
+fn a_catalogue_face_draws_its_own_latin_and_keeps_old_families() {
+    let inter = AddedText {
+        rect: [72.0, 600.0, 400.0, 700.0],
+        text: "ABCxyz".into(),
+        size: 14.0,
+        font_id: Some("bundled:inter:regular".into()),
+        ..AddedText::default()
+    };
+    let helvetica = AddedText { font_id: None, ..inter.clone() };
+    assert_ne!(added::text_width(&inter), added::text_width(&helvetica), "Inter and Helvetica are not the same widths");
+    let mono = AddedText { font_id: Some("bundled:jetbrains-mono:regular".into()), ..inter.clone() };
+    assert_ne!(added::text_width(&inter), added::text_width(&mono));
+    let slanted = AddedText { italic: true, ..inter.clone() };
+    assert_eq!(added::text_width(&inter), added::text_width(&slanted), "a catalogue face has no italic program, so the width stays");
+    let semi = AddedText { font_id: Some("bundled:inter:semibold".into()), bold: true, ..inter.clone() };
+    assert!(pdfcraft_fonts::catalog::bold_partner("bundled:inter:semibold").is_none());
+    assert_ne!(added::text_width(&semi), added::text_width(&inter));
+
+    let mut missing = inter.clone();
+    missing.text = "東京".into();
+    assert_eq!(first_undrawable(&missing), Some('東'));
+    let mut doc = fixture();
+    assert!(add_content(&mut doc, 0, &Content::Text(missing)).is_err());
+    let unknown = AddedText { font_id: Some("no-such-face".into()), ..inter.clone() };
+    assert!(first_undrawable(&unknown).is_some());
+    assert!(add_content(&mut doc, 0, &Content::Text(unknown)).is_err());
+
+    add_content(&mut doc, 0, &Content::Text(inter.clone())).unwrap();
+    let again = reopen(&doc);
+    let Content::Text(back) = &list_added(&again)[0].content else { panic!("text") };
+    assert_eq!(back.font_id.as_deref(), Some("bundled:inter:regular"));
+    assert!(!back.bold);
+    let bytes = write_incremental(&again, &SaveOptions::default()).unwrap();
+    assert!(bytes.windows(5).any(|window| window == b"Type3"));
+    assert!(bytes.windows(b"PCFontId".len()).any(|window| window == b"PCFontId"));
+    let page = streams(&again, 0).join("\n");
+    assert!(!page.contains("/PCFHelvetica"), "{page}");
+
+    let mut old = fixture();
+    let legacy = AddedText { rect: [72.0, 600.0, 400.0, 700.0], text: "Legacy".into(), size: 14.0, ..AddedText::default() };
+    add_content(&mut old, 0, &Content::Text(legacy)).unwrap();
+    let old_back = reopen(&old);
+    let Content::Text(kept) = &list_added(&old_back)[0].content else { panic!("legacy") };
+    assert!(kept.font_id.is_none());
+    assert!(streams(&old_back, 0).join("\n").contains("/PCFHelvetica"));
+
+    if pdfcraft_fonts::catalog::get("craft:biz-udp-gothic:regular").is_some_and(|face| face.program().is_some()) {
+        let mixed = AddedText { text: "A東京".into(), font_id: Some("craft:biz-udp-gothic:regular".into()), ..inter.clone() };
+        assert!(first_undrawable(&mixed).is_none());
+        let mut drawn = fixture();
+        add_content(&mut drawn, 0, &Content::Text(mixed)).unwrap();
+        assert!(!streams(&drawn, 0).join("\n").contains("/PCFHelvetica"));
+        let bold = AddedText { text: "A東京".into(), font_id: Some("craft:biz-udp-gothic:bold".into()), bold: true, ..inter.clone() };
+        assert_ne!(
+            added::text_width(&AddedText { text: "A東京".into(), font_id: Some("craft:biz-udp-gothic:regular".into()), ..inter.clone() }),
+            added::text_width(&bold)
+        );
+        if pdfcraft_fonts::catalog::get("craft:shippori-mincho:regular").is_some_and(|face| face.program().is_some()) {
+            let mincho = AddedText { text: "東京".into(), font_id: Some("craft:shippori-mincho:regular".into()), ..inter.clone() };
+            assert!(first_undrawable(&mincho).is_none());
+        }
+        if pdfcraft_fonts::catalog::get("craft:biz-ud-mincho:regular").is_some_and(|face| face.program().is_some()) {
+            let ud = AddedText { text: "東京".into(), font_id: Some("craft:biz-ud-mincho:regular".into()), ..inter };
+            assert!(first_undrawable(&ud).is_none());
         }
     }
 }

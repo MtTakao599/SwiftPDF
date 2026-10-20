@@ -499,6 +499,9 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     });
     match selected {
         Some((page, index, text)) => {
+            if app.quick_tool != crate::QuickTool::AddText && crate::content_ui::text_font_button(ui) {
+                crate::content_ui::open_text_font(app, &text, &text.text);
+            }
             if let Some(style) = crate::content_ui::format_panel(ui, t, &text) {
                 app.text_style = pdfcraft_engine::AddedText { text: String::new(), rect: [0.0; 4], ..style.clone() };
                 app.apply_edit(pdfcraft_engine::Edit::UpdateContent { page, index, content: pdfcraft_engine::AddedContent::Text(style) });

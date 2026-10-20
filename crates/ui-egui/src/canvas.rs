@@ -2001,12 +2001,12 @@ fn scale_tag(scale: f32) -> u64 {
 
 /// Tag for a print-preview raster. [`PRINT_TAG`] is always set. [`GRAYSCALE_TAG`] is set only
 /// when Print in grayscale is on.
-fn print_preview_tag(scale: f32, grayscale: bool) -> u64 {
+pub(crate) fn print_preview_tag(scale: f32, grayscale: bool) -> u64 {
     scale_tag(scale) | PRINT_TAG | if grayscale { GRAYSCALE_TAG } else { 0 }
 }
 
 /// The image uploaded for a print preview. Luminance conversion happens only for [`GRAYSCALE_TAG`].
-fn print_preview_image(tag: u64, img: egui::ColorImage) -> egui::ColorImage {
+pub(crate) fn print_preview_image(tag: u64, img: egui::ColorImage) -> egui::ColorImage {
     if tag & GRAYSCALE_TAG != 0 { grayscale(img) } else { img }
 }
 
@@ -2354,7 +2354,6 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     // No dialog, close prompt or palette over the page: only then does page input count.
     let unobstructed = !app.modal_open() && !app.palette_open;
     let stamp_block = app.stamp_refusal(index);
-    let seal_locked = app.seal_store.locked();
     let view = &mut app.views[index];
     if view.organize {
         organize_grid(view, info, doc.allows_assembly(), doc.dirty, unobstructed, ui, &t);
@@ -2618,6 +2617,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         | QuickTool::Stamp(_)
         | QuickTool::CustomStamp(_)
         | QuickTool::ChairmanSeal(_)
+        | QuickTool::DateStamp(_)
         | QuickTool::Link
         | QuickTool::SignArea { .. }
         | QuickTool::MarqueeZoom
@@ -2647,10 +2647,6 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     let mut image_action: Option<crate::edit_text_ui::ImageAction> = None;
     let custom_stamp = match app.quick_tool {
         QuickTool::CustomStamp(i) => app.custom_stamps.get(i).cloned(),
-        _ => None,
-    };
-    let chairman_seal = match app.quick_tool {
-        QuickTool::ChairmanSeal(i) => app.seal_store.library.seals.get(i).cloned(),
         _ => None,
     };
     let stamp_grant = app.session.view_only() && app.session.allows(pdfcraft_engine::Capability::Stamp);
@@ -2972,42 +2968,37 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 }
             }
             let draft_click = crate::stamps_ui::page_draft(painter, view, info, i, &xf);
+            let armed_image = matches!(tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_) | QuickTool::DateStamp(_));
             if stamp_grant
+                && armed_image
                 && !draft_click
                 && let Some(p) = ui.input(|inp| inp.pointer.hover_pos()).filter(|p| xf.rect.contains(*p))
             {
-                let chosen = custom_stamp.as_ref().map(|cs| (cs.name.clone(), cs.file.clone(), cs.data.clone(), cs.page, false)).or_else(|| {
-                    chairman_seal.as_ref().map(|seal| (seal.name.clone(), seal.file.clone(), std::sync::Arc::new(seal.data.clone()), 0, true))
-                });
-                if let Some((name, file, data, source_page, chairman)) = chosen {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                    if resp.clicked() {
-                        if let Some(why) = stamp_block.clone() {
-                            refused = Some(why);
-                        } else if chairman && seal_locked {
-                            refused = Some("印影ファイルを復号できないため、理事長印は使えません。".into());
-                        } else {
-                            let (vx, vy) = xf.screen_to_view(p);
-                            let u = info.pages[i].view_to_user(vx, vy);
-                            let pixels = crate::seal_store::preview_rgba(&data);
-                            let rect = crate::stamps_ui::place_at(
-                                &info.pages[i],
-                                [f64::from(u[0]), f64::from(u[1])],
-                                pixels.as_ref().map(|(w, h, _)| (*w, *h)),
-                            );
-                            view.stamp_place = Some(crate::stamps_ui::StampPlace {
-                                page: i,
-                                rect,
-                                name,
-                                file,
-                                data,
-                                source_page,
-                                opacity: 1.0,
-                                chairman,
-                                pixels,
-                                drag: None,
-                            });
-                            stamp_placed = true;
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                if resp.clicked() {
+                    if let Some(why) = stamp_block.clone() {
+                        refused = Some(why);
+                    } else {
+                        let (vx, vy) = xf.screen_to_view(p);
+                        let u = info.pages[i].view_to_user(vx, vy);
+                        let seal_locked = app.seal_store.locked();
+                        match crate::stamps_ui::build_stamp_place(
+                            crate::stamps_ui::ArmedInputs {
+                                tool: app.quick_tool,
+                                custom_stamps: &app.custom_stamps,
+                                seals: &app.seal_store.library.seals,
+                                date_stamps: &app.date_stamps,
+                                seal_locked,
+                            },
+                            i,
+                            [f64::from(u[0]), f64::from(u[1])],
+                            info.pages[i].rotation,
+                        ) {
+                            Ok(place) => {
+                                view.stamp_place = Some(place);
+                                stamp_placed = true;
+                            }
+                            Err(why) => refused = Some(why),
                         }
                     }
                 }
@@ -3805,7 +3796,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some(e) = crate::fill_sign::type_box(ui.ctx(), view, info, &author) {
         view.pending_edit = Some(e);
     }
-    let stamp_ui = matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_)) || view.stamp_place.is_some();
+    let stamp_ui =
+        matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_) | QuickTool::DateStamp(_)) || view.stamp_place.is_some();
     let (typed, text_done) =
         crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, !matches!(app.dialog, Some(crate::Dialog::Print)) && !stamp_ui);
     if typed.is_some() {
@@ -3832,7 +3824,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         view.links.selected = None;
     }
     // A rubber stamp is one click, then back to selecting. An image stamp's preview stays armed
-    // until キャンセル or 確定, so this must not clear CustomStamp or ChairmanSeal.
+    // until キャンセル or 確定, so this must not clear CustomStamp, ChairmanSeal or DateStamp.
     if stamp_placed && view.stamp_place.is_none() {
         tool = QuickTool::Select;
     }
@@ -4514,7 +4506,7 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
     // registered image stamp stays while stamping is granted, so the palette click is not undone
     // before the next frame. The tools themselves are unchanged for a session that can edit.
     let added_text = matches!(app.quick_tool, QuickTool::AddText) && app.active_ids().is_some_and(|(_, id)| app.session.allows_added_text(id));
-    let image_stamp = matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_))
+    let image_stamp = matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_) | QuickTool::DateStamp(_))
         && app.active_ids().is_some_and(|(_, id)| app.session.allows_stamp(id));
     if app.session.view_only()
         && !added_text

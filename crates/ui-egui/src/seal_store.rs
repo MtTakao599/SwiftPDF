@@ -25,13 +25,15 @@ const MAGIC: &[u8] = b"SWSEAL1\n";
 #[cfg(test)]
 pub static FAIL_SEAL_WRITE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SealImage {
     pub name: String,
     pub file: String,
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// Placement percent. 100 is the size a click used before this field existed.
+    pub scale: f64,
 }
 
 /// One line of the chairman-seal log. `event` is `confirmed`, `undone`, `redone`, `removed` or
@@ -46,7 +48,7 @@ pub struct SealEvent {
     pub event: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SealLibrary {
     pub seals: Vec<SealImage>,
     pub history: Vec<SealEvent>,
@@ -74,6 +76,9 @@ struct StoredSeal {
     width: u32,
     height: u32,
     data: String,
+    /// Absent in a file written before v0.6.0. Those seals are 100%.
+    #[serde(default = "crate::stamp_preset::default_scale")]
+    scale: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,6 +159,19 @@ impl SealStore {
         }
         let previous = self.library.clone();
         self.library.seals.remove(index);
+        self.persist(previous)
+    }
+
+    /// Remember the percent for the next placement. A failed write restores the previous library
+    /// and does not replace a file that could not be decrypted.
+    pub fn set_scale(&mut self, index: usize, scale: f64) -> Result<(), String> {
+        self.ensure_open()?;
+        let scale = crate::stamp_preset::checked_scale(scale).ok_or_else(|| "倍率は25%から400%です".to_string())?;
+        if index >= self.library.seals.len() {
+            return Err("印影が見つかりません".into());
+        }
+        let previous = self.library.clone();
+        self.library.seals[index].scale = scale;
         self.persist(previous)
     }
 
@@ -240,6 +258,9 @@ fn validate_seal(seal: &SealImage) -> Result<(), String> {
     if seal.width == 0 || seal.height == 0 || seal.width > 8000 || seal.height > 8000 {
         return Err("印影の画像サイズを確認してください".into());
     }
+    if crate::stamp_preset::checked_scale(seal.scale).is_none() {
+        return Err("倍率は25%から400%です".into());
+    }
     Ok(())
 }
 
@@ -254,6 +275,7 @@ fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
                 width: seal.width,
                 height: seal.height,
                 data: base64::engine::general_purpose::STANDARD.encode(&seal.data),
+                scale: crate::stamp_preset::scale_or_hundred(seal.scale),
             })
             .collect(),
         history: library
@@ -296,7 +318,14 @@ fn decode_file(bytes: &[u8]) -> Result<SealLibrary, &'static str> {
         let data = base64::engine::general_purpose::STANDARD
             .decode(stored.data.as_bytes())
             .map_err(|_| "印影ファイルを復号できませんでした。ファイルはそのままにしてあります。")?;
-        let seal = SealImage { name: stored.name, file: stored.file, width: stored.width, height: stored.height, data };
+        let seal = SealImage {
+            name: stored.name,
+            file: stored.file,
+            width: stored.width,
+            height: stored.height,
+            data,
+            scale: crate::stamp_preset::scale_or_hundred(stored.scale),
+        };
         validate_seal(&seal).map_err(|_| "印影ファイルを復号できませんでした。ファイルはそのままにしてあります。")?;
         seals.push(seal);
     }
@@ -325,7 +354,7 @@ pub fn utc_now() -> String {
 }
 
 /// Howard Hinnant's civil-from-days, for a UTC date. `z` is days since 1970-01-01.
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = (z - era * 146_097) as u64;
@@ -381,7 +410,7 @@ mod tests {
     }
 
     fn sample() -> SealImage {
-        SealImage { name: "試験印".into(), file: "seal.png".into(), width: 2, height: 2, data: png() }
+        SealImage { name: "試験印".into(), file: "seal.png".into(), width: 2, height: 2, data: png(), scale: 100.0 }
     }
 
     #[test]
@@ -563,6 +592,11 @@ startxref
             chairman: true,
             pixels: preview_rgba(&seal.data),
             drag: None,
+            scale: 100.0,
+            nominal: (60.0, 60.0),
+            source: crate::stamps_ui::PlaceSource::Chairman(0),
+            circular: false,
+            date_overlay: None,
         });
         app.seal_ack = false;
         app.ask_stamp_confirm();
@@ -623,6 +657,11 @@ startxref
             chairman: true,
             pixels: preview_rgba(&seal.data),
             drag: None,
+            scale: 100.0,
+            nominal: (60.0, 60.0),
+            source: crate::stamps_ui::PlaceSource::Chairman(0),
+            circular: false,
+            date_overlay: None,
         });
         app.seal_ack = true;
         app.ask_stamp_confirm();
@@ -869,6 +908,55 @@ startxref
         let mut store = store;
         assert!(store.add_seal(huge).is_err());
         assert!(!dir.join("seals.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before `scale` existed loads as 100% and is not rewritten. A file that
+    /// cannot be decrypted is not replaced when a scale save is attempted.
+    #[test]
+    #[cfg(windows)]
+    fn an_old_seal_file_loads_at_one_hundred_and_a_bad_file_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-scale", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seals.bin");
+        let image = png();
+        let data = base64::engine::general_purpose::STANDARD.encode(&image);
+        let plain = format!(r#"{{"seals":[{{"name":"試験印","file":"seal.png","width":2,"height":2,"data":"{data}"}}],"history":[]}}"#);
+        let protected = pdfcraft_platform::dpapi::protect_user(plain.as_bytes()).unwrap();
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&protected);
+        std::fs::write(&path, &bytes).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = SealStore::load(path.clone());
+        assert!(store.error.is_none(), "{:?}", store.error);
+        assert_eq!(store.library.seals.len(), 1);
+        assert_eq!(store.library.seals[0].scale, 100.0);
+        assert_eq!(store.library.seals[0].data, image);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "loading must not rewrite seals.bin");
+        let mut store = store;
+        store.set_scale(0, 80.0).unwrap();
+        assert_eq!(store.library.seals[0].scale, 80.0);
+        assert_eq!(store.library.seals[0].data, image);
+        let again = SealStore::load(path.clone());
+        assert_eq!(again.library.seals[0].scale, 80.0);
+        assert_eq!(again.library.seals[0].data, image);
+        std::fs::write(&path, b"SWSEAL1\nnot-a-ciphertext").unwrap();
+        let snapshot = std::fs::read(&path).unwrap();
+        let mut bad = SealStore::load(path.clone());
+        assert!(bad.error.is_some());
+        assert!(bad.set_scale(0, 50.0).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+        let _reset = ResetSealWrite;
+        let mut store = SealStore::load({
+            let fresh = dir.join("rollback.bin");
+            let mut ok = SealStore::load(fresh.clone());
+            ok.add_seal(sample()).unwrap();
+            fresh
+        });
+        FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
+        assert!(store.set_scale(0, 50.0).is_err());
+        assert_eq!(store.library.seals[0].scale, 100.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
