@@ -2284,6 +2284,11 @@ pub fn shortcuts(view: &mut DocView, ctx: &egui::Context, speed: crate::scroll_s
 const KEY_SCROLL_LINE: f32 = 40.0;
 
 pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+    if app.active == Some(index)
+        && app.seal_approval.as_ref().is_some_and(|approval| app.views.get(index).is_some_and(|view| view.id != approval.doc))
+    {
+        app.seal_approval = None;
+    }
     let t = Tokens::get(ui.ctx());
     // Keyboard scrolling applies to this frame's page view only, never later.
     let key_scroll = std::mem::take(&mut app.views[index].key_scroll);
@@ -2924,6 +2929,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             // every viewing mode); then comments; then text selection.
             if let QuickTool::Stamp(kind) = tool
                 && allowed
+                && unobstructed
                 && let Some(p) = ui.input(|inp| inp.pointer.hover_pos()).filter(|p| xf.rect.contains(*p))
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -2948,6 +2954,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             }
             if let Some(cs) = custom_stamp.as_ref()
                 && allowed
+                && unobstructed
                 && let Some(p) = ui.input(|inp| inp.pointer.hover_pos()).filter(|p| xf.rect.contains(*p))
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -2967,10 +2974,16 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     stamp_placed = true;
                 }
             }
-            let draft_click = crate::stamps_ui::page_draft(painter, view, info, i, &xf);
+            let before_place = view.stamp_place.as_ref().map(|place| (place.page, place.rect, place.scale, place.opacity));
+            let draft_click = crate::stamps_ui::page_draft(painter, view, info, i, &xf, unobstructed);
+            let place_moved = view.stamp_place.as_ref().map(|place| (place.page, place.rect, place.scale, place.opacity)) != before_place;
+            if place_moved && view.stamp_place.as_ref().is_some_and(|place| place.chairman) {
+                app.seal_approval = None;
+            }
             let armed_image = matches!(tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_) | QuickTool::DateStamp(_));
             if stamp_grant
                 && armed_image
+                && unobstructed
                 && !draft_click
                 && let Some(p) = ui.input(|inp| inp.pointer.hover_pos()).filter(|p| xf.rect.contains(*p))
             {
@@ -2995,6 +3008,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                             info.pages[i].rotation,
                         ) {
                             Ok(place) => {
+                                if let Some(error) = place.seal.as_ref().and_then(|seal| seal.error.clone()) {
+                                    refused = Some(error);
+                                }
                                 view.stamp_place = Some(place);
                                 stamp_placed = true;
                             }

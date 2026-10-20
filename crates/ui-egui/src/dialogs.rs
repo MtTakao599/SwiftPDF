@@ -15,6 +15,34 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
     unlock(app, ctx);
 }
 
+/// The chairman-seal effect editor. It is a window, not a centred modal, so it can be dragged
+/// off the seal. The dialog flag stays set, which is what keeps the page from taking clicks.
+fn show_seal_effects_window(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new("seal-effects-input-block")).order(egui::Order::Middle).fixed_pos(screen.min).interactable(true).show(ctx, |ui| {
+        let _ = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+    });
+    let mut open = true;
+    let shown = egui::Window::new("印影効果")
+        .id(egui::Id::new("seal-effects-window"))
+        .collapsible(false)
+        .resizable(false)
+        .movable(true)
+        .order(egui::Order::Foreground)
+        .default_pos(egui::pos2(24.0, 88.0))
+        .frame(widgets::dialog_frame(ctx))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            widgets::begin_dialog(ui);
+            ui.set_min_width(480.0);
+            crate::stamps_ui::seal_effects_body(ui, app)
+        });
+    let close = shown.and_then(|response| response.inner).unwrap_or(false);
+    if !open || close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        app.dialog = None;
+    }
+}
+
 fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     password(app, ctx);
     save_prompt(app, ctx);
@@ -30,6 +58,10 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         app.view_draft = None;
         return;
     };
+    if dialog == Dialog::SealEffects {
+        show_seal_effects_window(app, ctx);
+        return;
+    }
     // Properties ▸ Fonts shows the fonts as they are now, after any content edits.
     if let (Dialog::Properties(PropsTab::Fonts), Some((_, id))) = (dialog, app.active_ids()) {
         app.session.refresh_fonts(id);
@@ -1002,6 +1034,10 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     app.commit_stamp_place();
                 }
                 close = save || cancel;
+                return;
+            }
+            Dialog::SealEffects => {
+                close = crate::stamps_ui::seal_effects_body(ui, app);
                 return;
             }
             Dialog::DeleteSeal => {

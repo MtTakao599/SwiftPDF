@@ -7,9 +7,11 @@
 //! The original image the user picked, and any operating-system backup of this file, are outside
 //! this encryption.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -21,9 +23,28 @@ const MAX_NAME_CHARS: usize = 40;
 const MAX_PLAINTEXT: usize = 16 << 20;
 const MAGIC: &[u8] = b"SWSEAL1\n";
 
-/// When set, the next save fails before it touches the file. Tests only.
 #[cfg(test)]
-pub static FAIL_SEAL_WRITE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static FAIL_SEAL_WRITE_FLAG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test switch for a failed seal-file write. Each test thread has its own flag.
+#[cfg(test)]
+pub struct FailSealWrite;
+
+#[cfg(test)]
+impl FailSealWrite {
+    pub fn store(&self, fail: bool, _order: Ordering) {
+        FAIL_SEAL_WRITE_FLAG.with(|flag| flag.set(fail));
+    }
+
+    pub fn load(&self, _order: Ordering) -> bool {
+        FAIL_SEAL_WRITE_FLAG.with(|flag| flag.get())
+    }
+}
+
+#[cfg(test)]
+pub static FAIL_SEAL_WRITE: FailSealWrite = FailSealWrite;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SealImage {
@@ -34,18 +55,101 @@ pub struct SealImage {
     pub data: Vec<u8>,
     /// Placement percent. 100 is the size a click used before this field existed.
     pub scale: f64,
+    /// Ink effects. Missing on a file written before v0.7.0, which means off.
+    pub effects: SealEffects,
+}
+
+/// How a chairman seal may be varied when it is placed. Off leaves the registered PNG unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SealEffects {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Half-range of the random rotation, in degrees. 0 keeps the seal upright. At most 30.
+    #[serde(default)]
+    pub rotation_deg: f64,
+    /// Maximum fraction of alpha a worn pixel may lose, in percent. At most 30.
+    #[serde(default)]
+    pub fade: f64,
+    /// Stored spread from an older file. v0.7.0 does not paint it. At most 30.
+    #[serde(default)]
+    pub bleed: f64,
+    /// Fixed angle instead of a seed-drawn one. Absent on a file written before this choice existed,
+    /// which keeps the older random rotation.
+    #[serde(default)]
+    pub manual: bool,
+    /// Degrees when `manual` is set. Negative is anticlockwise. At most 30 in either direction.
+    #[serde(default)]
+    pub manual_deg: f64,
+}
+
+impl Default for SealEffects {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl SealEffects {
+    /// Manual rotation at 0° and no wear. The registered PNG is stamped as stored.
+    pub const fn off() -> Self {
+        Self { enabled: false, rotation_deg: 0.0, fade: 0.0, bleed: 0.0, manual: true, manual_deg: 0.0 }
+    }
+
+    /// The values used when random rotation is first chosen: ±2° and wear 10. Spread stays 0.
+    pub const fn enabled_preset() -> Self {
+        Self { enabled: true, rotation_deg: 2.0, fade: 10.0, bleed: 0.0, manual: false, manual_deg: 0.0 }
+    }
+
+    /// A file from the checkbox era with processing switched off. Its stored range and wear stay
+    /// on disk and are not applied. A placement the new window has edited is not this shape.
+    pub fn legacy_off(self) -> bool {
+        !self.enabled && !self.manual
+    }
+
+    /// True when the stamped PNG and rectangle stay as they were. A stored spread does not count:
+    /// v0.7.0 does not paint it. An old switched-off file stays unchanged even if range and wear
+    /// numbers were left behind.
+    pub fn is_passthrough(self) -> bool {
+        if self.legacy_off() {
+            return true;
+        }
+        let turn = if self.manual { self.manual_deg.abs() } else { self.rotation_deg };
+        self.fade == 0.0 && turn == 0.0
+    }
+
+    /// Remember that the new window has touched this placement, so a later zero is not read as an
+    /// old switched-off file.
+    pub fn mark_enabled(&mut self) {
+        if self.manual {
+            self.enabled = self.manual_deg.abs() > 1.0e-9 || self.fade > 0.0;
+        } else {
+            self.enabled = true;
+        }
+    }
 }
 
 /// One line of the chairman-seal log. `event` is `confirmed`, `undone`, `redone`, `removed` or
 /// `removal-undone`. It records what happened to the working document. It does not mean the PDF
 /// was saved, printed or officially issued.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SealEvent {
     pub at: String,
     pub file: String,
     pub page: u32,
     pub seal: String,
     pub event: String,
+    /// The stamped image was the processed preview, rather than the registered PNG.
+    pub processed: bool,
+    /// Rotation actually applied, in degrees. Zero when the image was not rotated.
+    pub angle_deg: f64,
+    /// Wear slider at the time of the event.
+    pub fade: f64,
+    /// Pattern seed. Zero on a line written before this field existed.
+    pub seed: u64,
+    /// SHA-256 of the PNG given to the stamp, as 64 hex characters. Empty on an older line.
+    /// The PNG itself is not stored. This is an operation note, not proof the PDF was saved.
+    pub image_sha256: String,
+    /// `manual`, `random`, or empty on a line written before the rotation mode was recorded.
+    pub rotation_mode: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -79,6 +183,9 @@ struct StoredSeal {
     /// Absent in a file written before v0.6.0. Those seals are 100%.
     #[serde(default = "crate::stamp_preset::default_scale")]
     scale: f64,
+    /// Absent in a file written before v0.7.0. Those seals are not processed.
+    #[serde(default)]
+    effects: SealEffects,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +195,20 @@ struct StoredEvent {
     page: u32,
     seal: String,
     event: String,
+    /// Absent on a line written before processed stamps were recorded.
+    #[serde(default)]
+    processed: bool,
+    #[serde(default)]
+    angle_deg: f64,
+    #[serde(default)]
+    fade: f64,
+    #[serde(default)]
+    seed: u64,
+    #[serde(default)]
+    image_sha256: String,
+    /// Absent on a line written before manual rotation. Empty means the mode was not recorded.
+    #[serde(default)]
+    rotation_mode: String,
 }
 
 impl SealStore {
@@ -175,12 +296,28 @@ impl SealStore {
         self.persist(previous)
     }
 
+    /// Remember the ink settings for the next placement. A failed write restores the previous
+    /// library and does not replace a file that could not be decrypted.
+    pub fn set_effects(&mut self, index: usize, effects: SealEffects) -> Result<(), String> {
+        self.ensure_open()?;
+        let effects = checked_effects(effects).ok_or_else(|| "印影の加工設定を確認してください".to_string())?;
+        if index >= self.library.seals.len() {
+            return Err("印影が見つかりません".into());
+        }
+        let previous = self.library.clone();
+        self.library.seals[index].effects = effects;
+        self.persist(previous)
+    }
+
     pub fn append_event(&mut self, event: SealEvent) -> Result<(), String> {
         self.ensure_open()?;
         if event.seal.chars().count() > MAX_NAME_CHARS || event.file.chars().count() > 240 || event.at.chars().count() > 40 {
             return Err("使用履歴に記録できない内容です".into());
         }
         if !matches!(event.event.as_str(), "confirmed" | "undone" | "redone" | "removed" | "removal-undone") {
+            return Err("使用履歴に記録できない内容です".into());
+        }
+        if !event_mark_ok(&event) {
             return Err("使用履歴に記録できない内容です".into());
         }
         let previous = self.library.clone();
@@ -261,7 +398,26 @@ fn validate_seal(seal: &SealImage) -> Result<(), String> {
     if crate::stamp_preset::checked_scale(seal.scale).is_none() {
         return Err("倍率は25%から400%です".into());
     }
+    if checked_effects(seal.effects).is_none() {
+        return Err("印影の加工設定を確認してください".into());
+    }
     Ok(())
+}
+
+fn checked_effects(effects: SealEffects) -> Option<SealEffects> {
+    if effects.rotation_deg.is_finite()
+        && (0.0..=30.0).contains(&effects.rotation_deg)
+        && effects.fade.is_finite()
+        && (0.0..=30.0).contains(&effects.fade)
+        && effects.bleed.is_finite()
+        && (0.0..=30.0).contains(&effects.bleed)
+        && effects.manual_deg.is_finite()
+        && (-30.0..=30.0).contains(&effects.manual_deg)
+    {
+        Some(effects)
+    } else {
+        None
+    }
 }
 
 fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
@@ -276,6 +432,7 @@ fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
                 height: seal.height,
                 data: base64::engine::general_purpose::STANDARD.encode(&seal.data),
                 scale: crate::stamp_preset::scale_or_hundred(seal.scale),
+                effects: seal.effects,
             })
             .collect(),
         history: library
@@ -287,6 +444,12 @@ fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
                 page: event.page,
                 seal: event.seal.clone(),
                 event: event.event.clone(),
+                processed: event.processed,
+                angle_deg: event.angle_deg,
+                fade: event.fade,
+                seed: event.seed,
+                image_sha256: event.image_sha256.clone(),
+                rotation_mode: event.rotation_mode.clone(),
             })
             .collect(),
     };
@@ -325,15 +488,31 @@ fn decode_file(bytes: &[u8]) -> Result<SealLibrary, &'static str> {
             height: stored.height,
             data,
             scale: crate::stamp_preset::scale_or_hundred(stored.scale),
+            effects: stored.effects,
         };
         validate_seal(&seal).map_err(|_| "印影ファイルを復号できませんでした。ファイルはそのままにしてあります。")?;
         seals.push(seal);
     }
-    let history = body
-        .history
-        .into_iter()
-        .map(|event| SealEvent { at: event.at, file: event.file, page: event.page, seal: event.seal, event: event.event })
-        .collect();
+    let mut history = Vec::new();
+    for event in body.history {
+        let event = SealEvent {
+            at: event.at,
+            file: event.file,
+            page: event.page,
+            seal: event.seal,
+            event: event.event,
+            processed: event.processed,
+            angle_deg: event.angle_deg,
+            fade: event.fade,
+            seed: event.seed,
+            image_sha256: event.image_sha256,
+            rotation_mode: event.rotation_mode,
+        };
+        if !event_mark_ok(&event) {
+            return Err("印影ファイルを復号できませんでした。ファイルはそのままにしてあります。");
+        }
+        history.push(event);
+    }
     Ok(SealLibrary { seals, history })
 }
 
@@ -377,6 +556,60 @@ pub struct SealUse {
     pub page: u32,
     pub file_name: String,
     pub active: bool,
+    /// Copied onto later undo and redo lines. The PNG is not kept here.
+    pub processed: bool,
+    pub angle_deg: f64,
+    pub fade: f64,
+    pub seed: u64,
+    pub image_sha256: String,
+    pub rotation_mode: String,
+}
+
+impl SealEvent {
+    /// A history line without processing details. Older callers, and events that predate them, use this.
+    pub fn line(at: impl Into<String>, file: impl Into<String>, page: u32, seal: impl Into<String>, event: impl Into<String>) -> Self {
+        Self {
+            at: at.into(),
+            file: file.into(),
+            page,
+            seal: seal.into(),
+            event: event.into(),
+            processed: false,
+            angle_deg: 0.0,
+            fade: 0.0,
+            seed: 0,
+            image_sha256: String::new(),
+            rotation_mode: String::new(),
+        }
+    }
+
+    /// The same processing note as the placement, for undo, redo and removal.
+    pub fn from_use(at: impl Into<String>, event: impl Into<String>, use_: &SealUse) -> Self {
+        Self {
+            at: at.into(),
+            file: use_.file_name.clone(),
+            page: use_.page,
+            seal: use_.name.clone(),
+            event: event.into(),
+            processed: use_.processed,
+            angle_deg: use_.angle_deg,
+            fade: use_.fade,
+            seed: use_.seed,
+            image_sha256: use_.image_sha256.clone(),
+            rotation_mode: use_.rotation_mode.clone(),
+        }
+    }
+}
+
+fn event_mark_ok(event: &SealEvent) -> bool {
+    let sha_ok = event.image_sha256.is_empty() || (event.image_sha256.len() == 64 && event.image_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let mode_ok = matches!(event.rotation_mode.as_str(), "" | "manual" | "random");
+    sha_ok
+        && mode_ok
+        && event.angle_deg.is_finite()
+        && event.angle_deg.abs() <= 30.0 + 1.0e-6
+        && event.fade.is_finite()
+        && (0.0..=30.0).contains(&event.fade)
 }
 
 impl crate::PdfCraftApp {
@@ -410,7 +643,40 @@ mod tests {
     }
 
     fn sample() -> SealImage {
-        SealImage { name: "試験印".into(), file: "seal.png".into(), width: 2, height: 2, data: png(), scale: 100.0 }
+        SealImage { name: "試験印".into(), file: "seal.png".into(), width: 2, height: 2, data: png(), scale: 100.0, effects: SealEffects::off() }
+    }
+
+    #[test]
+    fn an_old_history_line_and_a_stored_bleed_still_parse() {
+        let json = r#"{"seals":[{"name":"試験印","file":"a.png","width":2,"height":2,"data":"","scale":100.0,"effects":{"enabled":true,"rotation_deg":2.0,"fade":10.0,"bleed":5.0}}],"history":[{"at":"1970-01-01 00:00:00 UTC","file":"a.pdf","page":1,"seal":"試験印","event":"confirmed"}]}"#;
+        let body: FileBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.seals[0].effects.bleed, 5.0);
+        assert!(!body.seals[0].effects.manual);
+        assert!(!body.seals[0].effects.is_passthrough());
+        assert!(!body.history[0].processed);
+        assert!(body.history[0].image_sha256.is_empty());
+        assert!(body.history[0].rotation_mode.is_empty());
+        assert_eq!(body.history[0].seed, 0);
+        assert!((body.history[0].angle_deg - 0.0).abs() < 1e-9);
+        let switched_off: SealEffects = serde_json::from_str(r#"{"enabled":false,"rotation_deg":2.0,"fade":10.0,"bleed":4.0}"#).unwrap();
+        assert!(switched_off.legacy_off());
+        assert!(switched_off.is_passthrough());
+        assert_eq!(switched_off.rotation_deg, 2.0);
+        assert_eq!(switched_off.fade, 10.0);
+        let absent: SealEffects = serde_json::from_str("{}").unwrap();
+        assert!(absent.is_passthrough());
+        let manual = SealEffects { enabled: true, rotation_deg: 12.0, fade: 4.0, bleed: 0.0, manual: true, manual_deg: -15.0 };
+        let back: SealEffects = serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
+        assert_eq!(back, manual);
+        let mut event = SealEvent::line("1970-01-01 00:00:00 UTC", "a.pdf", 1, "試験印", "confirmed");
+        event.angle_deg = -30.0;
+        event.rotation_mode = "manual".into();
+        assert!(event_mark_ok(&event));
+        event.angle_deg = 30.1;
+        assert!(!event_mark_ok(&event));
+        event.angle_deg = 30.0;
+        event.rotation_mode = "sideways".into();
+        assert!(!event_mark_ok(&event));
     }
 
     #[test]
@@ -437,38 +703,12 @@ mod tests {
         assert_eq!(again.library.seals.len(), 1);
         assert_eq!(again.library.seals[0].data, png());
         let mut again = again;
-        again
-            .append_event(SealEvent {
-                at: "1970-01-01 00:00:00 UTC".into(),
-                file: "sample.pdf".into(),
-                page: 1,
-                seal: "試験印".into(),
-                event: "confirmed".into(),
-            })
-            .unwrap();
+        again.append_event(SealEvent::line("1970-01-01 00:00:00 UTC", "sample.pdf", 1, "試験印", "confirmed")).unwrap();
         let logged = SealStore::load(path.clone());
         assert_eq!(logged.library.history.len(), 1);
         assert_eq!(logged.library.history[0].event, "confirmed");
-        again
-            .append_event(SealEvent {
-                at: "1970-01-01 00:00:01 UTC".into(),
-                file: "sample.pdf".into(),
-                page: 1,
-                seal: "試験印".into(),
-                event: "removal-undone".into(),
-            })
-            .unwrap();
-        assert!(
-            again
-                .append_event(SealEvent {
-                    at: "1970-01-01 00:00:02 UTC".into(),
-                    file: "sample.pdf".into(),
-                    page: 1,
-                    seal: "試験印".into(),
-                    event: "issued".into(),
-                })
-                .is_err()
-        );
+        again.append_event(SealEvent::line("1970-01-01 00:00:01 UTC", "sample.pdf", 1, "試験印", "removal-undone")).unwrap();
+        assert!(again.append_event(SealEvent::line("1970-01-01 00:00:02 UTC", "sample.pdf", 1, "試験印", "issued")).is_err());
         let logged = SealStore::load(path.clone());
         assert_eq!(logged.library.history.len(), 2);
         assert_eq!(logged.library.history[1].event, "removal-undone");
@@ -597,12 +837,15 @@ startxref
             source: crate::stamps_ui::PlaceSource::Chairman(0),
             circular: false,
             date_overlay: None,
+            rotation: 0,
+            seal: None,
+            preview_gen: 0,
         });
-        app.seal_ack = false;
+        app.seal_approval = None;
         app.ask_stamp_confirm();
         assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
-        assert!(!app.seal_ack, "opening the approval dialog clears the checkbox");
-        app.seal_ack = true;
+        assert!(app.seal_approval.is_none(), "opening the approval dialog clears the checkbox");
+        assert!(crate::stamps_ui::approve_current_seal(app).is_ok(), "{:?}", app.toast);
         app.commit_stamp_place();
         app.dialog = None;
     }
@@ -662,10 +905,13 @@ startxref
             source: crate::stamps_ui::PlaceSource::Chairman(0),
             circular: false,
             date_overlay: None,
+            rotation: 0,
+            seal: None,
+            preview_gen: 0,
         });
-        app.seal_ack = true;
+        assert!(crate::stamps_ui::approve_current_seal(&mut app).is_ok(), "{:?}", app.toast);
         app.ask_stamp_confirm();
-        assert!(!app.seal_ack, "redo must not leave the checkbox able to stamp again");
+        assert!(app.seal_approval.is_none(), "redo must not leave the checkbox able to stamp again");
         assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
         app.dialog = None;
         app.views[0].stamp_place = None;
@@ -851,7 +1097,7 @@ startxref
             assert!(matches!(h.state().dialog, Some(crate::Dialog::ConfirmSeal)), "{mode:?} {:?}", h.state().toast);
             h.get_by_label("この文書への押印が承認されていることを確認しました").click();
             h.run_steps(1);
-            assert!(h.state().seal_ack, "{mode:?}");
+            assert!(h.state().seal_approval.is_some(), "{mode:?}");
             h.get_all_by_label("確定").nth(1).expect("dialog confirm").click();
             h.run_steps(4);
             assert_eq!(ui_stamp_count(&h), 1, "{mode:?} place {:?}", h.state().toast);
@@ -932,6 +1178,7 @@ startxref
         assert!(store.error.is_none(), "{:?}", store.error);
         assert_eq!(store.library.seals.len(), 1);
         assert_eq!(store.library.seals[0].scale, 100.0);
+        assert_eq!(store.library.seals[0].effects, SealEffects::off());
         assert_eq!(store.library.seals[0].data, image);
         assert_eq!(std::fs::read(&path).unwrap(), before, "loading must not rewrite seals.bin");
         let mut store = store;
@@ -957,6 +1204,85 @@ startxref
         FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
         assert!(store.set_scale(0, 50.0).is_err());
         assert_eq!(store.library.seals[0].scale, 100.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Effect settings round-trip inside the encrypted file. A failed write puts the previous
+    /// settings back and does not replace a file that could not be decrypted.
+    #[test]
+    #[cfg(windows)]
+    fn effect_settings_reload_and_a_failed_or_undecryptable_write_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-effects", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seals.bin");
+        let mut store = SealStore::load(path.clone());
+        store.add_seal(sample()).unwrap();
+        let png = store.library.seals[0].data.clone();
+        let before = std::fs::read(&path).unwrap();
+        let reloaded = SealStore::load(path.clone());
+        assert_eq!(reloaded.library.seals[0].effects, SealEffects::off());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "loading must not rewrite seals.bin");
+        let preset = SealEffects::enabled_preset();
+        store.set_effects(0, preset).unwrap();
+        assert_eq!(store.library.seals[0].effects, preset);
+        assert_eq!(store.library.seals[0].data, png);
+        let again = SealStore::load(path.clone());
+        assert_eq!(again.library.seals[0].effects, preset);
+        assert_eq!(again.library.seals[0].data, png);
+        assert_eq!(again.library.seals[0].scale, 100.0);
+        assert!(
+            store.set_effects(0, SealEffects { enabled: true, rotation_deg: 30.0, fade: 10.0, bleed: 0.0, manual: false, manual_deg: 0.0 }).is_ok()
+        );
+        let wide = SealStore::load(path.clone());
+        assert_eq!(wide.library.seals[0].effects.rotation_deg, 30.0);
+        assert!(!wide.library.seals[0].effects.manual);
+        let manual = SealEffects { enabled: true, rotation_deg: 2.0, fade: 8.0, bleed: 1.0, manual: true, manual_deg: -30.0 };
+        store.set_effects(0, manual).unwrap();
+        let turned = SealStore::load(path.clone());
+        assert_eq!(turned.library.seals[0].effects, manual);
+        assert_eq!(turned.library.seals[0].effects.bleed, 1.0);
+        assert!(
+            store.set_effects(0, SealEffects { enabled: true, rotation_deg: 31.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 }).is_err()
+        );
+        assert!(
+            store.set_effects(0, SealEffects { enabled: true, rotation_deg: 2.0, fade: 8.0, bleed: 1.0, manual: true, manual_deg: 31.0 }).is_err()
+        );
+        assert!(
+            store.set_effects(0, SealEffects { enabled: true, rotation_deg: 2.0, fade: 8.0, bleed: 1.0, manual: true, manual_deg: -31.0 }).is_err()
+        );
+        assert_eq!(store.library.seals[0].effects, manual);
+        let legacy = SealEffects { enabled: false, rotation_deg: 2.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 };
+        store.set_effects(0, legacy).unwrap();
+        let legacy_bytes = std::fs::read(&path).unwrap();
+        let loaded = SealStore::load(path.clone());
+        assert_eq!(loaded.library.seals[0].effects, legacy);
+        assert!(loaded.library.seals[0].effects.is_passthrough());
+        assert_eq!(std::fs::read(&path).unwrap(), legacy_bytes, "loading an old switched-off file must not rewrite it");
+        store.set_effects(0, manual).unwrap();
+        let mut event = SealEvent::line("1970-01-01 00:00:00 UTC", "sample.pdf", 1, "試験印", "confirmed");
+        event.angle_deg = -30.0;
+        event.processed = true;
+        event.rotation_mode = "manual".into();
+        store.append_event(event).unwrap();
+        let logged = SealStore::load(path.clone());
+        assert_eq!(logged.library.history.last().map(|event| event.rotation_mode.as_str()), Some("manual"));
+        assert!((logged.library.history.last().unwrap().angle_deg + 30.0).abs() < 1.0e-9);
+        assert_eq!(store.library.seals[0].data, png);
+        std::fs::write(&path, b"SWSEAL1\nnot-a-ciphertext").unwrap();
+        let snapshot = std::fs::read(&path).unwrap();
+        let mut bad = SealStore::load(path.clone());
+        assert!(bad.error.is_some());
+        assert!(bad.set_effects(0, preset).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+        let _reset = ResetSealWrite;
+        let fresh = dir.join("rollback.bin");
+        let mut ok = SealStore::load(fresh);
+        ok.add_seal(sample()).unwrap();
+        FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
+        assert!(ok.set_effects(0, preset).is_err());
+        assert_eq!(ok.library.seals[0].effects, SealEffects::off());
+        assert_eq!(ok.library.seals[0].data, sample().data);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

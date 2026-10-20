@@ -13,7 +13,7 @@ const FIELD_MIN_HEIGHT: f32 = 30.0;
 const DIALOG_PAD_X: i8 = 20;
 const DIALOG_PAD_Y: i8 = 16;
 
-fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
+pub(crate) fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
     let t = Tokens::get(ctx);
     egui::Frame::new()
         .fill(t.card)

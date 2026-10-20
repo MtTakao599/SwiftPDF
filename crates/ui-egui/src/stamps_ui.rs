@@ -447,7 +447,7 @@ fn chairman_section(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
         remove = Some(());
     }
     if remove.is_some() {
-        app.seal_ack = false;
+        app.seal_approval = None;
         app.dialog = Some(Dialog::DeleteSeal);
     }
 }
@@ -533,6 +533,7 @@ impl PdfCraftApp {
                 height: d.height,
                 data: d.data.to_vec(),
                 scale: crate::stamp_preset::scale_or_hundred(d.scale),
+                effects: crate::seal_store::SealEffects::off(),
             };
             match self.seal_store.add_seal(seal) {
                 Ok(()) => {
@@ -1256,6 +1257,33 @@ pub struct StampPlace {
     pub source: PlaceSource,
     pub circular: bool,
     pub date_overlay: Option<crate::stamp_preset::DateOverlay>,
+    /// Page rotation, in degrees, used to swap effect padding the same way [`Self::nominal`] swaps.
+    pub rotation: u16,
+    /// Chairman seals only. Absent for a general stamp or a date stamp.
+    pub seal: Option<SealDraft>,
+    /// Bumped only when [`Self::pixels`] is replaced. The page reuses the preview texture while this stays put.
+    pub preview_gen: u64,
+}
+
+/// The chairman-seal preview. The registered PNG and the source pixels are not written by effects.
+#[derive(Clone, Debug)]
+pub struct SealDraft {
+    /// Decoded registration image. Effects read it and do not change it.
+    pub source: (u32, u32, Vec<u8>),
+    pub effects: crate::seal_store::SealEffects,
+    pub seed: u64,
+    /// Degrees actually used for this seed. Zero when effects are off.
+    pub angle_deg: f64,
+    /// Output size divided by the source size, in image space.
+    pub axis: (f64, f64),
+    /// Ink rectangle before padding. Scale and millimetres use this, and it stays centred in [`StampPlace::rect`].
+    pub ink_rect: [f64; 4],
+    /// Set when the last preview failed. Confirm stays unavailable until the settings work or are turned off.
+    pub error: Option<String>,
+    /// Settings and seed of the pixels now in [`StampPlace::pixels`]. A repeat refresh with the same key does nothing.
+    applied: Option<EffectStamp>,
+    /// Identity of [`Self::source`]. The before-image texture uses it and does not follow effect rebuilds.
+    source_gen: u64,
 }
 
 /// Which library entry a placement came from, so 「この倍率を既定にする」 can store it.
@@ -1275,12 +1303,13 @@ struct Armed {
     scale: f64,
     source: PlaceSource,
     overlay: Option<crate::stamp_preset::DateOverlay>,
+    effects: crate::seal_store::SealEffects,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum StampDrag {
-    Move { from: egui::Pos2, origin: [f64; 4] },
-    Resize { handle: (i8, i8), from: egui::Pos2, origin: [f64; 4] },
+    Move { from: egui::Pos2, origin: [f64; 4], ink: [f64; 4] },
+    Resize { handle: (i8, i8), from: egui::Pos2, origin: [f64; 4], ink: [f64; 4] },
 }
 
 fn screen_to_user(xf: &crate::canvas::PageXform, info: &pdfcraft_render::DocInfo, page: usize, p: egui::Pos2) -> [f64; 2] {
@@ -1301,24 +1330,76 @@ fn screen_rect_to_user(xf: &crate::canvas::PageXform, info: &pdfcraft_render::Do
 
 const CORNERS: [(i8, i8); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EffectStamp {
+    enabled: bool,
+    manual: bool,
+    rotation: u64,
+    manual_deg: u64,
+    fade: u64,
+    bleed: u64,
+    seed: u64,
+}
+
+fn effect_stamp(effects: &crate::seal_store::SealEffects, seed: u64) -> EffectStamp {
+    EffectStamp {
+        enabled: effects.enabled,
+        manual: effects.manual,
+        rotation: effects.rotation_deg.to_bits(),
+        manual_deg: effects.manual_deg.to_bits(),
+        fade: effects.fade.to_bits(),
+        // Spread is stored and ignored, so it must not rebuild the preview.
+        bleed: 0,
+        seed,
+    }
+}
+
+fn fresh_preview_gen() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn assign_pixels(place: &mut StampPlace, pixels: Option<(u32, u32, Vec<u8>)>) {
+    place.pixels = pixels;
+    place.preview_gen = fresh_preview_gen();
+}
+
+/// Upload the placement image once per [`StampPlace::preview_gen`]. Opacity is a tint, so it does not upload again.
+fn preview_texture(ctx: &egui::Context, cache: &str, generation: u64, width: u32, height: u32, pixels: &[u8]) -> egui::TextureHandle {
+    let key = egui::Id::new(cache);
+    if let Some((cached, texture)) = ctx.data(|data| data.get_temp::<(u64, egui::TextureHandle)>(key))
+        && cached == generation
+    {
+        return texture;
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels);
+    let texture = ctx.load_texture("stamp-place-preview", image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(key, (generation, texture.clone())));
+    texture
+}
+
 /// Draw and drag the unconfirmed stamp. Returns true when this click belongs to the draft.
+///
+/// `interactive` is false while a dialog covers the page. The image is still drawn, and a drag
+/// that was already running is dropped, so the effects window can sit beside the seal without
+/// moving it or rebuilding it.
 pub(crate) fn page_draft(
     painter: &egui::Painter,
     view: &mut crate::canvas::DocView,
     info: &pdfcraft_render::DocInfo,
     page: usize,
     xf: &crate::canvas::PageXform,
+    interactive: bool,
 ) -> bool {
     let Some(place) = view.stamp_place.as_mut() else { return false };
     if place.page != page {
         return false;
     }
     let screen = user_rect_to_screen(xf, info, page, place.rect);
-    if let Some((width, height, pixels)) = place.pixels.clone()
-        && pixels.len() == (width as usize).saturating_mul(height as usize).saturating_mul(4)
+    if let Some((width, height, pixels)) = place.pixels.as_ref()
+        && pixels.len() == (*width as usize).saturating_mul(*height as usize).saturating_mul(4)
     {
-        let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels);
-        let texture = painter.ctx().load_texture("stamp-place-preview", image, egui::TextureOptions::LINEAR);
+        let texture = preview_texture(painter.ctx(), "stamp-place-preview", place.preview_gen, *width, *height, pixels);
         let tint = egui::Color32::WHITE.gamma_multiply(place.opacity.clamp(0.0, 1.0) as f32);
         painter.image(texture.id(), screen, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
     }
@@ -1327,25 +1408,33 @@ pub(crate) fn page_draft(
         let at = crate::comments::handle_pos(screen, handle);
         painter.circle(at, 4.5, egui::Color32::WHITE, egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 110, 180)));
     }
+    if !interactive {
+        place.drag = None;
+        return false;
+    }
     let pointer = painter.ctx().input(|input| input.pointer.hover_pos());
     let pressed = painter.ctx().input(|input| input.pointer.primary_pressed());
     let down = painter.ctx().input(|input| input.pointer.primary_down());
     let handle_at = |p: egui::Pos2| CORNERS.into_iter().find(|handle| crate::comments::handle_pos(screen, *handle).distance(p) <= 8.0);
     if pressed && let Some(p) = pointer {
+        let ink = place.seal.as_ref().map(|seal| seal.ink_rect).unwrap_or(place.rect);
         if let Some(handle) = handle_at(p) {
-            place.drag = Some(StampDrag::Resize { handle, from: p, origin: place.rect });
+            place.drag = Some(StampDrag::Resize { handle, from: p, origin: place.rect, ink });
         } else if screen.expand(2.0).contains(p) {
-            place.drag = Some(StampDrag::Move { from: p, origin: place.rect });
+            place.drag = Some(StampDrag::Move { from: p, origin: place.rect, ink });
         }
     }
     if let Some(p) = pointer {
         match place.drag {
-            Some(StampDrag::Move { from, origin }) => {
+            Some(StampDrag::Move { from, origin, ink }) => {
                 let (a, b) = (screen_to_user(xf, info, page, from), screen_to_user(xf, info, page, p));
                 let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                place.rect = [origin[0] + dx, origin[1] + dy, origin[2] + dx, origin[3] + dy];
+                place.rect = shift_rect(origin, dx, dy);
+                if let Some(seal) = place.seal.as_mut() {
+                    seal.ink_rect = shift_rect(ink, dx, dy);
+                }
             }
-            Some(StampDrag::Resize { handle, from, origin }) => {
+            Some(StampDrag::Resize { handle, from, origin, .. }) => {
                 let from_screen = user_rect_to_screen(xf, info, page, origin);
                 let ratio = (from_screen.height() > 0.0)
                     .then(|| from_screen.width() / from_screen.height())
@@ -1353,7 +1442,13 @@ pub(crate) fn page_draft(
                 let next = crate::comments::resized(from_screen, handle, p - from, ratio);
                 if next.width() >= 4.0 && next.height() >= 4.0 {
                     place.rect = screen_rect_to_user(xf, info, page, next);
-                    place.scale = crate::stamp_preset::percent_of(place.rect, place.nominal.0);
+                    if let Some(seal) = place.seal.as_mut() {
+                        seal.ink_rect = ink_from_display(place.rect, seal.axis, place.rotation);
+                        let width = seal.ink_rect;
+                        place.scale = crate::stamp_preset::percent_of(width, place.nominal.0);
+                    } else {
+                        place.scale = crate::stamp_preset::percent_of(place.rect, place.nominal.0);
+                    }
                 }
             }
             None => {}
@@ -1455,10 +1550,11 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
     let name = app.views[index].stamp_place.as_ref().map(|place| place.name.clone()).unwrap_or_default();
     let dated = app.views[index].stamp_place.as_ref().is_some_and(|place| place.date_overlay.is_some());
     let calendar = app.views[index].stamp_place.as_ref().is_some_and(|place| place.date_overlay.as_ref().is_some_and(|date| date.show_calendar));
+    let chairman = app.views[index].stamp_place.as_ref().is_some_and(|place| place.chairman);
     let height = if calendar {
         248.0
-    } else if dated {
-        108.0
+    } else if dated || chairman {
+        112.0
     } else {
         72.0
     };
@@ -1477,14 +1573,15 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                     && let Some(place) = app.views[index].stamp_place.as_mut()
                 {
                     place.opacity = opacity.clamp(0.0, 1.0);
+                    app.seal_approval = None;
                 }
                 let committed = app.views[index].stamp_place.as_ref().map(|place| place.scale).unwrap_or(100.0);
                 let scale_label = ui.label("倍率");
                 match scale_percent_field(ui, ("place-scale", index), committed, scale_label.id) {
                     ScaleCommit::Set(scale) => {
                         if let Some(place) = app.views[index].stamp_place.as_mut() {
-                            place.rect = crate::stamp_preset::rect_at_scale(place.rect, place.nominal, scale);
-                            place.scale = scale;
+                            apply_place_scale(place, scale);
+                            app.seal_approval = None;
                             if place.date_overlay.as_ref().is_some_and(|overlay| overlay.drawn.is_some()) && !rebake_date(place) {
                                 notice = Some("日付を画像にできませんでした。".into());
                             }
@@ -1494,18 +1591,31 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                     ScaleCommit::Unchanged => {}
                 }
                 if let Some(place) = app.views[index].stamp_place.as_ref() {
-                    ui.label(crate::stamp_preset::size_label(place.rect, place.circular));
+                    ui.label(crate::stamp_preset::size_label(measured_rect(place), place.circular));
                 }
                 if widgets::pill_button(ui, "この倍率を既定にする", false).clicked() {
                     save_scale = true;
                 }
-                if widgets::pill_button(ui, "確定", true).clicked() {
+                let blocked = app.views[index].stamp_place.as_ref().and_then(commit_block_message);
+                if ui.add_enabled_ui(blocked.is_none(), |ui| widgets::pill_button(ui, "確定", true)).inner.clicked() {
                     confirm = true;
                 }
                 if widgets::pill_button(ui, "キャンセル", false).clicked() {
                     cancel = true;
                 }
             });
+            if chairman {
+                ui.horizontal(|ui| {
+                    if widgets::pill_button(ui, "印影効果…", false).clicked() {
+                        app.dialog = Some(Dialog::SealEffects);
+                    }
+                    if let Some(place) = app.views[index].stamp_place.as_ref()
+                        && let Some(error) = place.seal.as_ref().and_then(|seal| seal.error.clone())
+                    {
+                        ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(176, 48, 48)));
+                    }
+                });
+            }
             if dated {
                 ui.horizontal(|ui| {
                     ui.label("日付");
@@ -1678,30 +1788,359 @@ fn rebake_date(place: &mut StampPlace) -> bool {
     let Some(overlay) = place.date_overlay.as_ref() else { return true };
     match crate::stamp_preset::render_placed(overlay, place.rect) {
         Some(pixels) => {
-            place.pixels = Some(pixels);
+            assign_pixels(place, Some(pixels));
             true
         }
         None => false,
     }
 }
 
+/// Rectangle the millimetre label measures. Effect padding stays out of this rectangle.
+pub(crate) fn measured_rect(place: &StampPlace) -> [f64; 4] {
+    place.seal.as_ref().map(|seal| seal.ink_rect).unwrap_or(place.rect)
+}
+
+fn shift_rect(rect: [f64; 4], dx: f64, dy: f64) -> [f64; 4] {
+    [rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy]
+}
+
+fn page_axis(axis: (f64, f64), rotation: u16) -> (f64, f64) {
+    let (sx, sy) = if matches!(rotation, 90 | 270) { (axis.1, axis.0) } else { axis };
+    let finite = |value: f64| if value.is_finite() && value > 0.0 { value } else { 1.0 };
+    (finite(sx), finite(sy))
+}
+
+/// Grow `ink` about its centre by the processed image's extra margin.
+fn display_rect(ink: [f64; 4], axis: (f64, f64), rotation: u16) -> [f64; 4] {
+    let (sx, sy) = page_axis(axis, rotation);
+    let cx = (ink[0] + ink[2]) * 0.5;
+    let cy = (ink[1] + ink[3]) * 0.5;
+    let w = (ink[2] - ink[0]).abs() * sx;
+    let h = (ink[3] - ink[1]).abs() * sy;
+    if !cx.is_finite() || !cy.is_finite() || !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return ink;
+    }
+    [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5]
+}
+
+fn ink_from_display(display: [f64; 4], axis: (f64, f64), rotation: u16) -> [f64; 4] {
+    let (sx, sy) = page_axis(axis, rotation);
+    let cx = (display[0] + display[2]) * 0.5;
+    let cy = (display[1] + display[3]) * 0.5;
+    let w = (display[2] - display[0]).abs() / sx;
+    let h = (display[3] - display[1]).abs() / sy;
+    if !cx.is_finite() || !cy.is_finite() || !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return display;
+    }
+    [cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5]
+}
+
+fn apply_place_scale(place: &mut StampPlace, scale: f64) {
+    if let Some(seal) = place.seal.as_mut() {
+        seal.ink_rect = crate::stamp_preset::rect_at_scale(seal.ink_rect, place.nominal, scale);
+        let (axis, ink) = (seal.axis, seal.ink_rect);
+        place.rect = display_rect(ink, axis, place.rotation);
+    } else {
+        place.rect = crate::stamp_preset::rect_at_scale(place.rect, place.nominal, scale);
+    }
+    place.scale = scale;
+}
+
+fn next_effect_seed(previous: u64) -> u64 {
+    let tick =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)).unwrap_or(1);
+    let mixed = previous.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(tick).wrapping_add(0xA5A5);
+    if mixed == previous { previous.wrapping_add(1) } else { mixed }
+}
+
+fn effect_failure(error: crate::seal_effect::EffectError) -> String {
+    match error {
+        crate::seal_effect::EffectError::TooLarge => "加工後の印影が大きすぎます。設定を下げるか、キャンセルしてください。".into(),
+        crate::seal_effect::EffectError::BadSize | crate::seal_effect::EffectError::BadLength => {
+            "印影を加工できません。設定を見直すか、キャンセルしてください。".into()
+        }
+    }
+}
+
+/// Rebuild the chairman preview from the stored source, settings and seed. The source and the PNG are not written.
+pub(crate) fn refresh_seal_preview(place: &mut StampPlace) {
+    let Some(draft) = place.seal.as_ref() else { return };
+    if draft.source.0 == 0 || draft.source.1 == 0 || draft.source.2.is_empty() {
+        if let Some(draft) = place.seal.as_mut() {
+            draft.error = Some("印影を表示できません。設定を見直すか、キャンセルしてください。".into());
+            draft.applied = None;
+        }
+        return;
+    }
+    let key = effect_stamp(&draft.effects, draft.seed);
+    if draft.applied == Some(key) && draft.error.is_none() && place.pixels.is_some() {
+        return;
+    }
+    let applied = crate::seal_effect::apply(&draft.source.2, draft.source.0, draft.source.1, &draft.effects, draft.seed);
+    let Some(draft) = place.seal.as_mut() else { return };
+    match applied {
+        Ok(crate::seal_effect::Applied::Unchanged) => {
+            let pixels = (draft.source.0, draft.source.1, draft.source.2.clone());
+            place.rect = draft.ink_rect;
+            draft.angle_deg = 0.0;
+            draft.axis = (1.0, 1.0);
+            draft.error = None;
+            draft.applied = Some(key);
+            assign_pixels(place, Some(pixels));
+        }
+        Ok(crate::seal_effect::Applied::Image(image)) => {
+            let axis = image.axis_scale();
+            draft.angle_deg = image.angle_deg;
+            draft.axis = axis;
+            draft.error = None;
+            draft.applied = Some(key);
+            place.rect = display_rect(draft.ink_rect, axis, place.rotation);
+            assign_pixels(place, Some((image.width, image.height, image.rgba)));
+        }
+        Err(error) => {
+            draft.error = Some(effect_failure(error));
+            draft.applied = None;
+        }
+    }
+}
+
+pub(crate) fn set_place_effects(place: &mut StampPlace, effects: crate::seal_store::SealEffects) -> Option<String> {
+    let draft = place.seal.as_mut()?;
+    draft.effects = effects;
+    refresh_seal_preview(place);
+    place.seal.as_ref().and_then(|seal| seal.error.clone())
+}
+
+fn commit_block_message(place: &StampPlace) -> Option<String> {
+    place.seal.as_ref().and_then(|seal| seal.error.clone())
+}
+
+/// What the chairman-seal checkbox confirmed: the PNG that will be written, where, and on which document.
+/// A ticked box without this snapshot does not allow the stamp.
+#[derive(Clone, Debug)]
+pub(crate) struct SealApproval {
+    pub doc: pdfcraft_engine::DocId,
+    pub page: usize,
+    pub rect: [f64; 4],
+    pub opacity: f64,
+    /// Preview generation at approval. The dialog uses it so it does not re-encode every frame.
+    pub preview_gen: u64,
+    /// SHA-256 of the PNG bytes that commit will pass to the stamp.
+    pub sha256: [u8; 32],
+}
+
+fn sha256_bytes(message: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
+        0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa,
+        0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85,
+        0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let bit_len = u64::try_from(message.len()).unwrap_or(u64::MAX).saturating_mul(8);
+    let mut data = Vec::with_capacity(message.len().saturating_add(72));
+    data.extend_from_slice(message);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    let mut state = [0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    for chunk in data.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (i, bytes) in chunk.chunks_exact(4).enumerate() {
+            let Ok(bytes) = <[u8; 4]>::try_from(bytes) else { continue };
+            if let Some(slot) = words.get_mut(i) {
+                *slot = u32::from_be_bytes(bytes);
+            }
+        }
+        for i in 16..64 {
+            let earlier = words[i - 15];
+            let recent = words[i - 2];
+            let small = earlier.rotate_right(7) ^ earlier.rotate_right(18) ^ (earlier >> 3);
+            let large = recent.rotate_right(17) ^ recent.rotate_right(19) ^ (recent >> 10);
+            words[i] = words[i - 16].wrapping_add(small).wrapping_add(words[i - 7]).wrapping_add(large);
+        }
+        let mut a = state[0];
+        let mut b = state[1];
+        let mut c = state[2];
+        let mut d = state[3];
+        let mut e = state[4];
+        let mut f = state[5];
+        let mut g = state[6];
+        let mut h = state[7];
+        for i in 0..64 {
+            let high = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let first = h.wrapping_add(high).wrapping_add(choose).wrapping_add(K[i]).wrapping_add(words[i]);
+            let low = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(first);
+            d = c;
+            c = b;
+            b = a;
+            a = first.wrapping_add(low.wrapping_add(majority));
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        let start = i.saturating_mul(4);
+        if let Some(slot) = out.get_mut(start..start + 4) {
+            slot.copy_from_slice(&word.to_be_bytes());
+        }
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in sha256_bytes(bytes) {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn rect_same(left: [f64; 4], right: [f64; 4]) -> bool {
+    left.iter().zip(right).all(|(a, b)| (a - b).abs() <= 1.0e-6)
+}
+
+/// The preview pixels differ from the registered PNG. A random range that happened to draw 0°,
+/// with no wear, does not: the original PNG is stamped and is not encoded again.
+fn seal_writes_processed(seal: &SealDraft) -> bool {
+    if seal.effects.legacy_off() {
+        return false;
+    }
+    if seal.error.is_some() {
+        return true;
+    }
+    seal.effects.fade > 0.0 || seal.angle_deg.abs() > 1.0e-6
+}
+
+fn rotation_mode_name(effects: &crate::seal_store::SealEffects) -> &'static str {
+    if effects.manual {
+        "manual"
+    } else if effects.legacy_off() {
+        ""
+    } else {
+        "random"
+    }
+}
+
+/// PNG bytes the stamp edit will receive. A processed chairman seal is encoded from the preview
+/// RGBA. Anything else keeps the bytes it already had. A failed encode does not fall back.
+fn stamp_image_bytes(place: &StampPlace) -> Result<Arc<Vec<u8>>, String> {
+    if place.date_overlay.is_some() {
+        let (width, height, pixels) = place.pixels.as_ref().ok_or("日付を画像にできませんでした。")?;
+        let png = crate::stamp_preset::encode_rgba_png(*width, *height, pixels).ok_or("日付を画像にできませんでした。")?;
+        return Ok(Arc::new(png));
+    }
+    let processed = place.chairman && place.seal.as_ref().is_some_and(seal_writes_processed);
+    if processed {
+        if let Some(error) = place.seal.as_ref().and_then(|seal| seal.error.clone()) {
+            return Err(error);
+        }
+        let (width, height, pixels) = place.pixels.as_ref().ok_or_else(|| "加工済み印影を用意できないため、押印しませんでした。".to_string())?;
+        let png = crate::stamp_preset::encode_rgba_png(*width, *height, pixels)
+            .ok_or_else(|| "加工済み印影を画像にできませんでした。押印しませんでした。".to_string())?;
+        return Ok(Arc::new(png));
+    }
+    Ok(Arc::clone(&place.data))
+}
+
+fn approval_matches(approval: &SealApproval, doc: pdfcraft_engine::DocId, place: &StampPlace) -> bool {
+    approval.doc == doc
+        && approval.page == place.page
+        && approval.preview_gen == place.preview_gen
+        && rect_same(approval.rect, place.rect)
+        && (approval.opacity - place.opacity.clamp(0.0, 1.0)).abs() <= 1.0e-9
+}
+
+/// Record the current chairman placement as approved. A failed encode clears any earlier snapshot.
+pub(crate) fn approve_current_seal(app: &mut PdfCraftApp) -> Result<(), String> {
+    let Some(index) = app.active else { return Err("仮置きがありません。".into()) };
+    let Some(doc) = app.views.get(index).map(|view| view.id) else { return Err("仮置きがありません。".into()) };
+    let Some(place) = app.views[index].stamp_place.clone() else { return Err("仮置きがありません。".into()) };
+    if !place.chairman {
+        return Err("理事長印ではありません。".into());
+    }
+    let bytes = match stamp_image_bytes(&place) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            app.seal_approval = None;
+            return Err(error);
+        }
+    };
+    app.seal_approval = Some(SealApproval {
+        doc,
+        page: place.page,
+        rect: place.rect,
+        opacity: place.opacity.clamp(0.0, 1.0),
+        preview_gen: place.preview_gen,
+        sha256: sha256_bytes(bytes.as_ref()),
+    });
+    Ok(())
+}
+
 pub(crate) fn confirm_seal_body(ui: &mut egui::Ui, app: &mut PdfCraftApp) -> (bool, bool) {
     let Some(index) = app.active else { return (false, true) };
     let Some(place) = app.views[index].stamp_place.clone() else { return (false, true) };
-    let doc_name = app.session.get(app.views[index].id).map(|doc| doc.name.clone()).unwrap_or_default();
+    let doc = app.views[index].id;
+    let doc_name = app.session.get(doc).map(|doc| doc.name.clone()).unwrap_or_default();
+    if app.seal_approval.as_ref().is_some_and(|approval| !approval_matches(approval, doc, &place)) {
+        app.seal_approval = None;
+    }
+    let processed = place.seal.as_ref().is_some_and(seal_writes_processed);
     ui.label(egui::RichText::new("理事長印の確認").font(theme::semibold(18.0)));
     ui.add_space(6.0);
     ui.label(format!("印影: {}", place.name));
     ui.label(format!("ファイル: {doc_name}"));
     ui.label(format!("ページ: {}", place.page.saturating_add(1)));
+    ui.label(format!("加工: {}", if processed { "あり" } else { "なし" }));
+    if let Some(seal) = place.seal.as_ref() {
+        if seal.effects.manual || seal.effects.legacy_off() {
+            let angle = if seal.effects.legacy_off() { 0.0 } else { seal.effects.manual_deg };
+            ui.label(format!("回転: 手動 {angle:.1}°"));
+        } else {
+            ui.label(format!("回転: ランダム ±{:.1}°", seal.effects.rotation_deg));
+        }
+        ui.label(format!("実際の回転: {:.2}°", seal.angle_deg));
+        ui.label(format!("かすれ: {:.0}", seal.effects.fade));
+    }
+    ui.label(format!("倍率: {:.0}%", place.scale));
+    ui.label(format!("透明度: {:.0}%", place.opacity.clamp(0.0, 1.0) * 100.0));
     ui.label("これはこの文書への押印確認です。アプリが承認を証明するものではありません。確定は、保存や印刷が済んだという意味ではありません。");
     paint_place_preview(ui, &place);
     ui.add_space(8.0);
-    ui.add(widgets::checkbox(&mut app.seal_ack, "この文書への押印が承認されていることを確認しました"));
+    let mut checked = app.seal_approval.is_some();
+    if ui.add(widgets::checkbox(&mut checked, "この文書への押印が承認されていることを確認しました")).changed() {
+        if checked {
+            if let Err(error) = approve_current_seal(app) {
+                app.seal_approval = None;
+                app.notify(error);
+            }
+        } else {
+            app.seal_approval = None;
+        }
+    }
     ui.add_space(8.0);
     let (mut ok, mut cancel) = (false, false);
+    let approved = app.seal_approval.as_ref().is_some_and(|approval| approval_matches(approval, doc, &place));
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui.add_enabled_ui(app.seal_ack, |ui| widgets::pill_button(ui, "確定", true)).inner.clicked() {
+        if ui.add_enabled_ui(approved, |ui| widgets::pill_button(ui, "確定", true)).inner.clicked() {
             ok = true;
         }
         if widgets::pill_button(ui, "キャンセル", false).clicked() {
@@ -1716,14 +2155,251 @@ fn paint_place_preview(ui: &mut egui::Ui, place: &StampPlace) {
     if pixels.len() != (*width as usize).saturating_mul(*height as usize).saturating_mul(4) {
         return;
     }
-    let image = egui::ColorImage::from_rgba_unmultiplied([*width as usize, *height as usize], pixels);
-    let texture = ui.ctx().load_texture("stamp-confirm-preview", image, egui::TextureOptions::LINEAR);
+    let texture = preview_texture(ui.ctx(), "stamp-place-preview", place.preview_gen, *width, *height, pixels);
     let fit = 120.0 / (*width.max(height) as f32).max(1.0);
     ui.add(
         egui::Image::from_texture(&texture)
             .max_size(egui::vec2(*width as f32 * fit, *height as f32 * fit))
             .tint(egui::Color32::WHITE.gamma_multiply(place.opacity.clamp(0.0, 1.0) as f32)),
     );
+}
+
+/// Ink settings for the chairman seal being placed. Changes update the preview and are not saved
+/// until 「この加工設定を既定にする」.
+pub(crate) fn seal_effects_body(ui: &mut egui::Ui, app: &mut PdfCraftApp) -> bool {
+    let Some(index) = app.active else {
+        ui.label("仮置きがありません。");
+        return widgets::pill_button(ui, "閉じる", false).clicked();
+    };
+    let chairman = app.views.get(index).and_then(|view| view.stamp_place.as_ref()).is_some_and(|place| place.chairman && place.seal.is_some());
+    if !chairman {
+        ui.label("印影効果は理事長印の仮置きだけで使えます。");
+        return widgets::pill_button(ui, "閉じる", false).clicked();
+    }
+    let mut effects = app.views[index]
+        .stamp_place
+        .as_ref()
+        .and_then(|place| place.seal.as_ref().map(|seal| seal.effects))
+        .unwrap_or_else(crate::seal_store::SealEffects::off);
+    // An old switched-off file is shown as manual 0°. The stored file is not rewritten until the
+    // user changes a control or saves the default.
+    if effects.legacy_off() {
+        let bleed = effects.bleed;
+        effects = crate::seal_store::SealEffects::off();
+        effects.bleed = bleed;
+    }
+    let mut store = false;
+    let mut refresh = false;
+    ui.label("回転方式");
+    ui.horizontal(|ui| {
+        if ui.selectable_label(effects.manual, "手動回転").clicked() && !effects.manual {
+            effects.manual = true;
+            effects.mark_enabled();
+            store = true;
+            refresh = true;
+        }
+        if ui.selectable_label(!effects.manual, "ランダム回転").clicked() && effects.manual {
+            effects.manual = false;
+            if effects.rotation_deg == 0.0 && effects.fade == 0.0 {
+                let bleed = effects.bleed;
+                let kept = effects.manual_deg;
+                effects = crate::seal_store::SealEffects::enabled_preset();
+                effects.bleed = bleed;
+                effects.manual_deg = kept;
+            }
+            effects.mark_enabled();
+            store = true;
+            refresh = true;
+        }
+    });
+    let (turn_store, turn_refresh) = if effects.manual {
+        effect_number(ui, &mut effects.manual_deg, -30.0..=30.0, 0.1, "角度", "°")
+    } else {
+        effect_number(ui, &mut effects.rotation_deg, 0.0..=30.0, 0.1, "範囲", "°")
+    };
+    if effects.manual {
+        ui.label(egui::RichText::new("0°は回転なし。マイナスは左、プラスは右です").small().weak());
+    } else {
+        ui.label(egui::RichText::new("左右にこの角度まで回転します").small().weak());
+    }
+    let (fade_store, fade_refresh) = effect_number(ui, &mut effects.fade, 0.0..=30.0, 1.0, "かすれ", "");
+    ui.label(egui::RichText::new("押印ムラ・欠け・薄れを調整します").small().weak());
+    store |= turn_store || fade_store;
+    refresh |= turn_refresh || fade_refresh;
+    if store || refresh {
+        effects.mark_enabled();
+    }
+    ui.add_space(8.0);
+    let mut another = false;
+    let mut revert = false;
+    let mut save = false;
+    ui.horizontal(|ui| {
+        another = widgets::pill_button(ui, "別パターンを生成", false).clicked();
+        revert = widgets::pill_button(ui, "加工前に戻す", false).clicked();
+    });
+    ui.horizontal(|ui| {
+        save = widgets::pill_button(ui, "この加工設定を既定にする", false).clicked();
+    });
+    let changed_error = if refresh {
+        app.views.get_mut(index).and_then(|view| view.stamp_place.as_mut()).and_then(|place| set_place_effects(place, effects))
+    } else if store {
+        if let Some(place) = app.views.get_mut(index).and_then(|view| view.stamp_place.as_mut())
+            && let Some(seal) = place.seal.as_mut()
+        {
+            seal.effects = effects;
+        }
+        None
+    } else {
+        None
+    };
+    if let Some(error) = changed_error {
+        app.notify(error);
+    }
+    if store || refresh || another || revert {
+        app.seal_approval = None;
+    }
+    if another {
+        let error = app.views.get_mut(index).and_then(|view| view.stamp_place.as_mut()).and_then(|place| {
+            if let Some(seal) = place.seal.as_mut() {
+                seal.seed = next_effect_seed(seal.seed);
+            }
+            refresh_seal_preview(place);
+            place.seal.as_ref().and_then(|seal| seal.error.clone())
+        });
+        if let Some(error) = error {
+            app.notify(error);
+        }
+    }
+    let revert_error = if revert {
+        app.views
+            .get_mut(index)
+            .and_then(|view| view.stamp_place.as_mut())
+            .and_then(|place| set_place_effects(place, crate::seal_store::SealEffects::off()))
+    } else {
+        None
+    };
+    if let Some(error) = revert_error {
+        app.notify(error);
+    }
+    if save {
+        // The window may be showing a migrated manual 0° while the draft still has an old
+        // switched-off record. Saving stores the settings on screen.
+        let _ = app.views.get_mut(index).and_then(|view| view.stamp_place.as_mut()).and_then(|place| set_place_effects(place, effects));
+        app.save_place_effects();
+    }
+    if let Some(place) = app.views.get(index).and_then(|view| view.stamp_place.as_ref()) {
+        ui.add_space(8.0);
+        seal_compare(ui, place);
+    }
+    ui.add_space(8.0);
+    widgets::pill_button(ui, "閉じる", true).clicked()
+}
+
+/// 0 fits the seal, 1 is one source pixel per point, 2 is twice that.
+const COMPARE_FIT: u8 = 0;
+const COMPARE_100: u8 = 1;
+const COMPARE_200: u8 = 2;
+
+/// Before and after, at the same scale and centre. Zoom is display-only and does not rebuild the ink.
+fn seal_compare(ui: &mut egui::Ui, place: &StampPlace) {
+    let Some(seal) = place.seal.as_ref() else { return };
+    let (sw, sh, source) = &seal.source;
+    if *sw == 0 || *sh == 0 || source.len() != (*sw as usize).saturating_mul(*sh as usize).saturating_mul(4) {
+        return;
+    }
+    let (aw, ah, after) = place.pixels.as_ref().map(|(w, h, px)| (*w, *h, px.as_slice())).unwrap_or((*sw, *sh, source.as_slice()));
+    if after.len() != (aw as usize).saturating_mul(ah as usize).saturating_mul(4) {
+        return;
+    }
+    let zoom_id = ui.id().with("seal-compare-zoom");
+    let mut zoom = ui.data(|data| data.get_temp::<u8>(zoom_id)).unwrap_or(COMPARE_FIT);
+    ui.horizontal(|ui| {
+        ui.label("比較");
+        if ui.selectable_label(zoom == COMPARE_FIT, "全体").clicked() {
+            zoom = COMPARE_FIT;
+        }
+        if ui.selectable_label(zoom == COMPARE_100, "100%").clicked() {
+            zoom = COMPARE_100;
+        }
+        if ui.selectable_label(zoom == COMPARE_200, "200%").clicked() {
+            zoom = COMPARE_200;
+        }
+    });
+    ui.data_mut(|data| data.insert_temp(zoom_id, zoom));
+    let pad_x = aw.saturating_sub(*sw) / 2;
+    let pad_y = ah.saturating_sub(*sh) / 2;
+    let avail = ui.available_width().max(1.0);
+    let side_by_side = avail >= 460.0;
+    let cell = if side_by_side { (avail - 16.0) * 0.5 } else { avail };
+    let scale = match zoom {
+        COMPARE_100 => 1.0,
+        COMPARE_200 => 2.0,
+        _ => (cell / (aw as f32)).min(168.0 / (ah as f32)).clamp(0.02, 8.0),
+    };
+    let frame = egui::vec2(aw as f32 * scale, ah as f32 * scale);
+    let before_tex = preview_texture(ui.ctx(), "seal-compare-before", seal.source_gen, *sw, *sh, source);
+    let after_tex = preview_texture(ui.ctx(), "stamp-place-preview", place.preview_gen, aw, ah, after);
+    let paint = |ui: &mut egui::Ui| {
+        let one = |ui: &mut egui::Ui, caption: &str, texture: &egui::TextureHandle, inset: bool| {
+            ui.vertical(|ui| {
+                ui.label(caption);
+                let (rect, _) = ui.allocate_exact_size(frame, egui::Sense::hover());
+                ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::WHITE);
+                let image_rect = if inset {
+                    egui::Rect::from_min_size(
+                        rect.min + egui::vec2(pad_x as f32 * scale, pad_y as f32 * scale),
+                        egui::vec2(*sw as f32 * scale, *sh as f32 * scale),
+                    )
+                } else {
+                    rect
+                };
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+            });
+        };
+        if side_by_side {
+            ui.horizontal(|ui| {
+                one(ui, "加工前", &before_tex, true);
+                one(ui, "加工後", &after_tex, false);
+            });
+        } else {
+            one(ui, "加工前", &before_tex, true);
+            one(ui, "加工後", &after_tex, false);
+        }
+    };
+    if zoom == COMPARE_FIT {
+        paint(ui);
+    } else {
+        egui::ScrollArea::both().max_height(300.0).auto_shrink([false, false]).show(ui, paint);
+    }
+}
+
+/// A slider or number field stores its value while the pointer is down and rebuilds the preview
+/// when the gesture ends, or immediately for a click or a typed number.
+fn control_commits(changed: bool, dragged: bool, stopped: bool, other_live: bool) -> (bool, bool) {
+    let live = dragged || other_live;
+    (changed || dragged, stopped || (changed && !live))
+}
+
+fn effect_number(ui: &mut egui::Ui, value: &mut f64, range: std::ops::RangeInclusive<f64>, speed: f64, label: &str, suffix: &str) -> (bool, bool) {
+    let mut store = false;
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+        let slider = ui.add(egui::Slider::new(value, range.clone()).text(label));
+        let mut drag = egui::DragValue::new(value).range(range.clone()).speed(speed);
+        if !suffix.is_empty() {
+            drag = drag.suffix(suffix);
+        }
+        let typed = ui.add(drag);
+        let (slider_store, slider_refresh) = control_commits(slider.changed(), slider.dragged(), slider.drag_stopped(), typed.dragged());
+        let (typed_store, typed_refresh) = control_commits(typed.changed(), typed.dragged(), typed.drag_stopped(), slider.dragged());
+        store = slider_store || typed_store;
+        refresh = slider_refresh || typed_refresh;
+    });
+    let low = *range.start();
+    let high = *range.end();
+    *value = if value.is_finite() { value.clamp(low, high) } else { 0.0 };
+    (store, refresh)
 }
 
 pub(crate) fn delete_seal_body(ui: &mut egui::Ui, app: &mut PdfCraftApp) -> (bool, bool) {
@@ -1769,6 +2445,7 @@ pub(crate) fn build_stamp_place(inputs: ArmedInputs<'_>, page: usize, at: [f64; 
             scale: stamp.scale,
             source: PlaceSource::Custom(i),
             overlay: None,
+            effects: crate::seal_store::SealEffects::off(),
         }),
         QuickTool::ChairmanSeal(i) => inputs.seals.get(i).map(|seal| Armed {
             name: seal.name.clone(),
@@ -1779,6 +2456,7 @@ pub(crate) fn build_stamp_place(inputs: ArmedInputs<'_>, page: usize, at: [f64; 
             scale: seal.scale,
             source: PlaceSource::Chairman(i),
             overlay: None,
+            effects: seal.effects,
         }),
         QuickTool::DateStamp(i) => inputs.date_stamps.get(i).map(|stamp| {
             let today = crate::stamp_preset::japan_today();
@@ -1802,6 +2480,7 @@ pub(crate) fn build_stamp_place(inputs: ArmedInputs<'_>, page: usize, at: [f64; 
                     calendar_year: today.year,
                     calendar_month: today.month,
                 }),
+                effects: crate::seal_store::SealEffects::off(),
             }
         }),
         _ => None,
@@ -1827,13 +2506,44 @@ pub(crate) fn build_stamp_place(inputs: ArmedInputs<'_>, page: usize, at: [f64; 
         opacity: 1.0,
         chairman: armed.chairman,
         pixels,
+        preview_gen: fresh_preview_gen(),
         drag: None,
         scale,
         nominal,
         source: armed.source,
         circular,
         date_overlay: armed.overlay,
+        rotation,
+        seal: None,
     };
+    if place.chairman {
+        if let Some((width, height, rgba)) = place.pixels.clone() {
+            place.seal = Some(SealDraft {
+                source: (width, height, rgba),
+                effects: armed.effects,
+                seed: next_effect_seed(0),
+                angle_deg: 0.0,
+                axis: (1.0, 1.0),
+                ink_rect: place.rect,
+                error: None,
+                applied: None,
+                source_gen: fresh_preview_gen(),
+            });
+            refresh_seal_preview(&mut place);
+        } else {
+            place.seal = Some(SealDraft {
+                source: (0, 0, Vec::new()),
+                effects: armed.effects,
+                seed: 1,
+                angle_deg: 0.0,
+                axis: (1.0, 1.0),
+                ink_rect: place.rect,
+                error: Some("印影を表示できません。設定を見直すか、キャンセルしてください。".into()),
+                applied: None,
+                source_gen: fresh_preview_gen(),
+            });
+        }
+    }
     if place.date_overlay.is_some() && !rebake_date(&mut place) {
         return Err("日付を画像にできませんでした。".into());
     }
@@ -1891,6 +2601,17 @@ impl PdfCraftApp {
         }
     }
 
+    pub(crate) fn save_place_effects(&mut self) {
+        let Some(index) = self.active else { return };
+        let Some(place) = self.views[index].stamp_place.clone() else { return };
+        let PlaceSource::Chairman(i) = place.source else { return };
+        let Some(effects) = place.seal.as_ref().map(|seal| seal.effects) else { return };
+        match self.seal_store.set_effects(i, effects) {
+            Ok(()) => self.notify("この加工設定を既定にしました。"),
+            Err(error) => self.notify(error),
+        }
+    }
+
     pub(crate) fn ask_stamp_confirm(&mut self) {
         let Some(index) = self.active else { return };
         let Some(place) = self.views[index].stamp_place.clone() else { return };
@@ -1899,7 +2620,11 @@ impl PdfCraftApp {
             return;
         }
         if place.chairman {
-            self.seal_ack = false;
+            self.seal_approval = None;
+            if let Some(why) = commit_block_message(&place) {
+                self.notify(why);
+                return;
+            }
             self.dialog = Some(Dialog::ConfirmSeal);
             return;
         }
@@ -1913,38 +2638,66 @@ impl PdfCraftApp {
             self.notify(why);
             return;
         }
+        if let Some(why) = commit_block_message(&place) {
+            self.notify(why);
+            return;
+        }
         if place.date_overlay.as_ref().is_some_and(|overlay| overlay.drawn.is_some()) && !rebake_date(&mut place) {
             self.notify("日付を画像にできませんでした。");
             return;
         }
         let id = self.views[index].id;
         let file_name = self.session.get(id).map(|doc| doc.name.clone()).unwrap_or_default();
+        let bytes = match stamp_image_bytes(&place) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.seal_approval = None;
+                self.notify(error);
+                return;
+            }
+        };
+        let (processed, angle_deg, fade, seed, rotation_mode) = place
+            .seal
+            .as_ref()
+            .map(|seal| {
+                let processed = seal_writes_processed(seal);
+                let angle_deg = if processed { seal.angle_deg } else { 0.0 };
+                let fade = if processed { seal.effects.fade } else { 0.0 };
+                (processed, angle_deg, fade, seal.seed, rotation_mode_name(&seal.effects))
+            })
+            .unwrap_or((false, 0.0, 0.0, 0, ""));
         if place.chairman {
-            let event = crate::seal_store::SealEvent {
-                at: crate::seal_store::utc_now(),
-                file: file_name.clone(),
-                page: place.page.saturating_add(1) as u32,
-                seal: place.name.clone(),
-                event: "confirmed".into(),
-            };
+            let approved = self
+                .seal_approval
+                .as_ref()
+                .is_some_and(|approval| approval_matches(approval, id, &place) && approval.sha256 == sha256_bytes(bytes.as_ref()));
+            if !approved {
+                let had = self.seal_approval.take();
+                if had.is_none() {
+                    self.notify("承認されていないため、押印しませんでした。");
+                } else {
+                    self.notify("承認の内容が変わったため、押印しませんでした。もう一度確認してください。");
+                }
+                return;
+            }
+            let mut event = crate::seal_store::SealEvent::line(
+                crate::seal_store::utc_now(),
+                file_name.clone(),
+                place.page.saturating_add(1) as u32,
+                place.name.clone(),
+                "confirmed",
+            );
+            event.processed = processed;
+            event.angle_deg = angle_deg;
+            event.fade = fade;
+            event.seed = seed;
+            event.image_sha256 = sha256_hex(bytes.as_ref());
+            event.rotation_mode = rotation_mode.to_string();
             if let Err(error) = self.seal_store.append_event(event) {
                 self.notify(format!("使用履歴を記録できないため、押印しませんでした。{error}"));
                 return;
             }
         }
-        let bytes = if place.date_overlay.is_some() {
-            let Some((width, height, pixels)) = place.pixels.clone() else {
-                self.notify("日付を画像にできませんでした。");
-                return;
-            };
-            let Some(png) = crate::stamp_preset::encode_rgba_png(width, height, &pixels) else {
-                self.notify("日付を画像にできませんでした。");
-                return;
-            };
-            std::sync::Arc::new(png)
-        } else {
-            place.data.clone()
-        };
         let edit = pdfcraft_engine::Edit::AddCustomStamp {
             page: place.page,
             rect: place.rect,
@@ -1971,11 +2724,18 @@ impl PdfCraftApp {
                 page: place.page.saturating_add(1) as u32,
                 file_name,
                 active: true,
+                processed,
+                angle_deg,
+                fade,
+                seed,
+                image_sha256: self.seal_store.library.history.last().map(|event| event.image_sha256.clone()).unwrap_or_default(),
+                rotation_mode: self.seal_store.library.history.last().map(|event| event.rotation_mode.clone()).unwrap_or_default(),
             });
         }
         if let Some(view) = self.views.get_mut(index) {
             view.stamp_place = None;
         }
+        self.seal_approval = None;
         self.quick_tool = QuickTool::Select;
     }
 
@@ -2039,13 +2799,7 @@ impl PdfCraftApp {
         } else {
             "redone"
         };
-        let event = crate::seal_store::SealEvent {
-            at: crate::seal_store::utc_now(),
-            file: self.seal_uses[use_index].file_name.clone(),
-            page: self.seal_uses[use_index].page,
-            seal: self.seal_uses[use_index].name.clone(),
-            event: event_name.into(),
-        };
+        let event = crate::seal_store::SealEvent::from_use(crate::seal_store::utc_now(), event_name, &self.seal_uses[use_index]);
         if self.seal_store.append_event(event).is_err() {
             let restored = if undo { self.session.redo(id).is_ok() } else { self.session.undo(id).is_ok() };
             if restored {
@@ -2474,5 +3228,931 @@ mod date_font_tests {
         assert!(matches!(h.state().dialog, Some(crate::Dialog::DateStamp)));
         assert!(h.state().date_draft.drawn.as_ref().unwrap().bottom_font.is_none());
         assert_eq!(h.state().date_draft.drawn.as_ref().unwrap().bottom, "理事会");
+    }
+}
+
+#[cfg(test)]
+mod effect_preview_tests {
+    use super::*;
+
+    struct PolicyRestore((bool, bool, bool));
+
+    impl Drop for PolicyRestore {
+        fn drop(&mut self) {
+            crate::output_policy::set_blocked(self.0.0);
+            crate::output_policy::set_save_as_allowed(self.0.1);
+            crate::output_policy::set_print_allowed(self.0.2);
+        }
+    }
+
+    fn policy() -> PolicyRestore {
+        PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()))
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        let mut image = image::RgbaImage::new(width, height);
+        for (x, y, px) in image.enumerate_pixels_mut() {
+            let edge = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+            *px = if edge { image::Rgba([0, 0, 0, 0]) } else { image::Rgba([180, 20, 20, 255]) };
+        }
+        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        png
+    }
+
+    fn seal(effects: crate::seal_store::SealEffects) -> crate::seal_store::SealImage {
+        let data = png(48, 32);
+        crate::seal_store::SealImage { name: "試験印".into(), file: "seal.png".into(), width: 48, height: 32, data, scale: 100.0, effects }
+    }
+
+    fn chairman(effects: crate::seal_store::SealEffects, seed: u64, rotation: u16) -> StampPlace {
+        let seal = seal(effects);
+        let bytes = seal.data.clone();
+        let mut place = build_stamp_place(
+            ArmedInputs {
+                tool: QuickTool::ChairmanSeal(0),
+                custom_stamps: &[],
+                seals: std::slice::from_ref(&seal),
+                date_stamps: &[],
+                seal_locked: false,
+            },
+            0,
+            [100.0, 150.0],
+            rotation,
+        )
+        .unwrap();
+        assert_eq!(place.data.as_ref(), &bytes);
+        let draft = place.seal.as_mut().unwrap();
+        draft.seed = seed;
+        refresh_seal_preview(&mut place);
+        assert_eq!(place.seal.as_ref().unwrap().source.2, crate::seal_store::preview_rgba(&bytes).unwrap().2);
+        place
+    }
+
+    fn center(rect: [f64; 4]) -> [f64; 2] {
+        [(rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5]
+    }
+
+    #[test]
+    fn effects_off_keep_the_original_preview_rectangle_and_png() {
+        let bytes = png(48, 32);
+        let place = chairman(crate::seal_store::SealEffects::off(), 7, 0);
+        let draft = place.seal.as_ref().unwrap();
+        assert!(draft.effects.is_passthrough());
+        assert_eq!(draft.angle_deg, 0.0);
+        assert_eq!(place.rect, draft.ink_rect);
+        assert_eq!(place.pixels.as_ref().map(|(_, _, px)| px.clone()), Some(draft.source.2.clone()));
+        assert_eq!(place.data.as_slice(), bytes.as_slice());
+        assert!(commit_block_message(&place).is_none());
+        assert_eq!(
+            crate::stamp_preset::size_label(measured_rect(&place), place.circular),
+            crate::stamp_preset::size_label(place.rect, place.circular)
+        );
+        assert!((place.scale - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn effects_on_preview_keeps_centre_scale_opacity_and_source() {
+        let mut place = chairman(crate::seal_store::SealEffects::enabled_preset(), 5, 0);
+        place.opacity = 0.35;
+        apply_place_scale(&mut place, 80.0);
+        let ink_center = center(measured_rect(&place));
+        let png = place.data.clone();
+        let source = place.seal.as_ref().unwrap().source.2.clone();
+        let error = set_place_effects(
+            &mut place,
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 10.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 },
+        );
+        assert!(error.is_none(), "{error:?}");
+        let draft = place.seal.as_ref().unwrap();
+        assert!(draft.angle_deg.abs() <= 10.0 + 1e-9);
+        assert!(commit_block_message(&place).is_none());
+        assert!(!place.seal.as_ref().unwrap().effects.is_passthrough());
+        assert!((place.opacity - 0.35).abs() < 1e-9);
+        assert!((place.scale - 80.0).abs() < 1e-6);
+        assert_eq!(center(draft.ink_rect), ink_center);
+        assert_eq!(center(place.rect), ink_center);
+        assert_eq!(place.data.as_ref(), png.as_ref());
+        assert_eq!(draft.source.2, source);
+        assert_ne!(place.pixels.as_ref().map(|(_, _, px)| px.as_slice()), Some(source.as_slice()));
+        assert_eq!(
+            crate::stamp_preset::size_label(measured_rect(&place), place.circular),
+            crate::stamp_preset::size_label(draft.ink_rect, place.circular)
+        );
+    }
+
+    #[test]
+    fn another_seed_changes_the_pattern_and_the_same_seed_repeats_it() {
+        let mut place = chairman(crate::seal_store::SealEffects::enabled_preset(), 11, 0);
+        let first = place.pixels.clone();
+        let angle = place.seal.as_ref().unwrap().angle_deg;
+        let seed = place.seal.as_ref().unwrap().seed;
+        place.seal.as_mut().unwrap().seed = next_effect_seed(seed);
+        refresh_seal_preview(&mut place);
+        assert_ne!(place.seal.as_ref().unwrap().seed, seed);
+        assert_ne!(place.pixels, first);
+        place.seal.as_mut().unwrap().seed = 11;
+        refresh_seal_preview(&mut place);
+        assert_eq!(place.pixels, first);
+        assert_eq!(place.seal.as_ref().unwrap().angle_deg, angle);
+        assert_eq!(place.data.as_slice(), png(48, 32).as_slice());
+    }
+
+    #[test]
+    fn page_rotation_keeps_the_ink_box_and_puts_padding_outside_it() {
+        for rotation in [90u16, 270] {
+            let off = chairman(crate::seal_store::SealEffects::off(), 3, rotation);
+            let nominal = crate::stamp_preset::nominal_size(rotation, Some((48, 32)));
+            let expected = crate::stamp_preset::place_rect([100.0, 150.0], nominal, 100.0);
+            assert_eq!(off.seal.as_ref().unwrap().ink_rect, expected);
+            assert_eq!(off.rect, expected);
+            let on = chairman(
+                crate::seal_store::SealEffects { enabled: true, rotation_deg: 10.0, fade: 0.0, bleed: 0.0, manual: false, manual_deg: 0.0 },
+                5,
+                rotation,
+            );
+            let draft = on.seal.as_ref().unwrap();
+            assert_eq!(draft.ink_rect, expected);
+            assert_eq!(center(on.rect), center(draft.ink_rect));
+            assert!(draft.angle_deg.abs() > 0.2, "{}", draft.angle_deg);
+            assert!(on.rect[2] - on.rect[0] > expected[2] - expected[0] || on.rect[3] - on.rect[1] > expected[3] - expected[1]);
+            assert_eq!(crate::stamp_preset::size_label(measured_rect(&on), on.circular), crate::stamp_preset::size_label(expected, on.circular));
+        }
+    }
+
+    #[test]
+    fn a_general_stamp_and_a_date_stamp_are_not_processed() {
+        let data = std::sync::Arc::new(png(48, 32));
+        let stamp = CustomStamp { category: "試験".into(), name: "一般".into(), file: "a.png".into(), page: 0, data: data.clone(), scale: 80.0 };
+        let place = build_stamp_place(
+            ArmedInputs {
+                tool: QuickTool::CustomStamp(0),
+                custom_stamps: std::slice::from_ref(&stamp),
+                seals: &[],
+                date_stamps: &[],
+                seal_locked: false,
+            },
+            0,
+            [40.0, 50.0],
+            90,
+        )
+        .unwrap();
+        assert!(place.seal.is_none());
+        assert!(!place.chairman);
+        assert!(commit_block_message(&place).is_none());
+        assert!((place.scale - 80.0).abs() < 1e-6);
+        assert_eq!(place.data.as_ref(), data.as_ref());
+        let nominal = crate::stamp_preset::nominal_size(90, Some((48, 32)));
+        assert_eq!(place.rect, crate::stamp_preset::place_rect([40.0, 50.0], nominal, 80.0));
+
+        let dated = crate::stamp_preset::DateStamp {
+            name: "日付".into(),
+            file: "date.png".into(),
+            data: data.clone(),
+            scale: 100.0,
+            region: crate::stamp_preset::default_region(),
+            font: crate::stamp_preset::default_font(),
+            color: crate::stamp_preset::default_color(),
+            drawn: None,
+        };
+        let place = build_stamp_place(
+            ArmedInputs {
+                tool: QuickTool::DateStamp(0),
+                custom_stamps: &[],
+                seals: &[],
+                date_stamps: std::slice::from_ref(&dated),
+                seal_locked: false,
+            },
+            0,
+            [40.0, 50.0],
+            0,
+        )
+        .unwrap();
+        assert!(place.seal.is_none());
+        assert!(place.date_overlay.is_some());
+        assert!(commit_block_message(&place).is_none());
+        assert_eq!(place.data.as_ref(), data.as_ref());
+    }
+
+    #[test]
+    fn processed_chairman_seals_ask_for_approval_and_a_direct_commit_without_it_is_refused() {
+        let mut app = crate::PdfCraftApp::new();
+        let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+        app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        let original = png(48, 32);
+        app.views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::enabled_preset(), 5, 0));
+        let registered = app.views[0].stamp_place.as_ref().unwrap().data.clone();
+        app.ask_stamp_confirm();
+        assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)), "{:?}", app.toast);
+        app.commit_stamp_place();
+        assert_eq!(app.toast.as_ref().map(|(text, _)| text.as_str()), Some("承認されていないため、押印しませんでした。"));
+        assert!(app.views[0].stamp_place.is_some());
+        assert!(app.seal_store.library.history.is_empty());
+        assert_eq!(app.views[0].stamp_place.as_ref().unwrap().data.as_ref(), registered.as_ref());
+        assert_eq!(registered.as_ref(), original.as_slice());
+        app.views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::off(), 5, 0));
+        app.toast = None;
+        app.ask_stamp_confirm();
+        assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
+        assert!(app.seal_approval.is_none());
+        assert!(app.seal_store.library.history.is_empty());
+    }
+
+    #[test]
+    fn signed_and_annotation_banned_pdfs_still_refuse_a_processed_seal() {
+        let mut author = crate::PdfCraftApp::new();
+        let blank = author.session.create_blank(200.0, 300.0, 1).unwrap();
+        author.open_bytes("plain.pdf", None, blank.to_vec()).unwrap();
+        let id = author.views[0].id;
+        author
+            .session
+            .apply(
+                id,
+                pdfcraft_engine::Edit::Protect(pdfcraft_engine::Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: pdfcraft_engine::Printing::None,
+                    changes: pdfcraft_engine::Changes::None,
+                    ..pdfcraft_engine::Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.session.get(id).unwrap().bytes.clone();
+        let mut banned = crate::PdfCraftApp::new();
+        banned.set_view_only(true);
+        banned.grant_stamp();
+        banned.open_bytes("locked.pdf", None, locked.to_vec()).unwrap();
+        banned.quick_tool = QuickTool::ChairmanSeal(0);
+        let refused = banned.begin_stamp_place(0, 0, [40.0, 40.0], 0).unwrap_err();
+        assert!(refused.contains("注釈"), "{refused}");
+        assert!(banned.seal_store.library.history.is_empty());
+
+        let p12 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap();
+        let identity = pdfcraft_engine::sign::pkcs12::open(&p12, "test").unwrap();
+        let plain = pdfcraft_engine::Session::new().create_blank(200.0, 300.0, 1).unwrap();
+        let mut signer = pdfcraft_engine::Session::new().with_clock(|| 1_800_000_000);
+        let sid = signer.open("plain.pdf", None, plain, None).unwrap();
+        let signed = signer.sign(sid, &identity, pdfcraft_engine::SignOptions { rect: None, ..Default::default() }).unwrap();
+        let mut signed_app = crate::PdfCraftApp::new();
+        signed_app.set_view_only(true);
+        signed_app.grant_stamp();
+        signed_app.open_bytes("signed.pdf", None, signed.to_vec()).unwrap();
+        signed_app.quick_tool = QuickTool::ChairmanSeal(0);
+        let refused = signed_app.begin_stamp_place(0, 0, [40.0, 40.0], 0).unwrap_err();
+        assert!(refused.contains("電子署名"), "{refused}");
+        assert!(signed_app.seal_store.library.history.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saving_the_default_reloads_and_a_failed_write_keeps_the_old_one() {
+        use std::sync::atomic::Ordering;
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-preview", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seals.bin");
+        let mut app = crate::PdfCraftApp::new();
+        let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+        app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.set_seal_store(path.clone());
+        app.start_chairman_seal("seal.png".into(), png(48, 32));
+        app.save_custom_stamp();
+        assert_eq!(app.seal_store.library.seals[0].effects, crate::seal_store::SealEffects::off());
+        app.quick_tool = QuickTool::ChairmanSeal(0);
+        app.begin_stamp_place(0, 0, [80.0, 90.0], 0).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        let preset = crate::seal_store::SealEffects::enabled_preset();
+        let error = app.views[0].stamp_place.as_mut().and_then(|place| set_place_effects(place, preset));
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), stored, "editing the preview must not rewrite seals.bin");
+        assert_eq!(app.seal_store.library.seals[0].effects, crate::seal_store::SealEffects::off());
+        app.save_place_effects();
+        assert_eq!(app.seal_store.library.seals[0].effects, preset);
+        assert_eq!(app.seal_store.library.seals[0].data, png(48, 32));
+        let reloaded = crate::seal_store::SealStore::load(path.clone());
+        assert_eq!(reloaded.library.seals[0].effects, preset);
+        assert_eq!(reloaded.library.seals[0].data, png(48, 32));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::seal_store::FAIL_SEAL_WRITE.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        crate::seal_store::FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
+        let _ = app.views[0].stamp_place.as_mut().and_then(|place| set_place_effects(place, crate::seal_store::SealEffects::off()));
+        app.save_place_effects();
+        assert_eq!(app.toast.as_ref().map(|(text, _)| text.as_str()), Some("印影ファイルを書き出せませんでした"));
+        assert_eq!(app.seal_store.library.seals[0].effects, preset);
+        let kept = crate::seal_store::SealStore::load(path);
+        assert_eq!(kept.library.seals[0].effects, preset);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn approval_hash_is_sha256() {
+        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    fn render_page(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut renderer = pdfcraft_render::PageRenderer::new(std::sync::Arc::new(bytes.to_vec()), Default::default());
+        let shot = renderer.render(pdfcraft_render::RenderRequest { page: 0, scale: 2.0, ..Default::default() });
+        assert!(shot.error.is_none(), "{:?}", shot.error);
+        (shot.width, shot.height, shot.rgba.to_vec())
+    }
+
+    fn close_rect(place: [f64; 4], annotation: [f32; 4]) {
+        for (got, want) in annotation.iter().zip(place) {
+            assert!((f64::from(*got) - want).abs() < 0.05, "annotation {annotation:?} place {place:?}");
+        }
+    }
+
+    fn fresh_seal_app(dir: &std::path::Path) -> crate::PdfCraftApp {
+        let mut app = crate::PdfCraftApp::new();
+        let blank = app.session.create_blank(240.0, 320.0, 1).unwrap();
+        app.open_bytes("opened.pdf", None, blank.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.grant_edit_text();
+        app.set_seal_store(dir.join("seals.bin"));
+        app.start_chairman_seal("seal.png".into(), png(48, 32));
+        app.save_custom_stamp();
+        assert_eq!(app.seal_store.library.seals[0].data, png(48, 32), "{:?}", app.toast);
+        app.quick_tool = QuickTool::ChairmanSeal(0);
+        app
+    }
+
+    fn commit_on_rotated_page(dir: &std::path::Path, degrees: i64) {
+        let mut maker = pdfcraft_engine::Session::new();
+        let blank = maker.create_blank(240.0, 320.0, 1).unwrap();
+        let made = maker.open("turned.pdf", None, blank, None).unwrap();
+        maker.apply(made, pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees }).unwrap();
+        let turned = maker.save_bytes(made).unwrap();
+        let mut app = crate::PdfCraftApp::new();
+        app.open_bytes("turned.pdf", None, turned.to_vec()).unwrap();
+        let id = app.views[0].id;
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.grant_save_as();
+        app.set_seal_store(dir.join(format!("seals-{degrees}.bin")));
+        app.start_chairman_seal("seal.png".into(), png(48, 32));
+        app.save_custom_stamp();
+        let registered = app.seal_store.library.seals[0].data.clone();
+        let place = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 6.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 },
+            4,
+            degrees as u16,
+        );
+        let rect = place.rect;
+        let ink = place.seal.as_ref().unwrap().ink_rect;
+        assert_eq!(center(rect), center(ink), "{degrees}");
+        app.views[0].stamp_place = Some(place);
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "{degrees} {:?}", app.toast);
+        let ann = app.session.get(id).unwrap().info.annotations.iter().find(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(rect, ann);
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let mut reader = pdfcraft_engine::Session::new();
+        let opened = reader.open("turned.pdf", None, saved, None).unwrap();
+        let again = reader.get(opened).unwrap().info.annotations.iter().find(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(rect, again);
+        assert_eq!(app.seal_store.library.seals[0].data, registered);
+        let event = app.seal_store.library.history.last().unwrap();
+        assert!(event.processed, "{degrees}");
+        assert!((event.fade - 10.0).abs() < 1e-9, "{degrees}");
+    }
+
+    /// Processed chairman seals commit the preview PNG. The registered image and an effect-off
+    /// placement stay on the original bytes and rectangle.
+    #[test]
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn a_processed_chairman_seal_commits_the_preview_png() {
+        use std::sync::atomic::Ordering;
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-commit", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = fresh_seal_app(&dir);
+        let registered = app.seal_store.library.seals[0].data.clone();
+        let id = app.views[0].id;
+
+        app.views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::off(), 5, 0));
+        let off_rect = app.views[0].stamp_place.as_ref().unwrap().rect;
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "off commit {:?}", app.toast);
+        let off_event = app.seal_store.library.history.last().unwrap().clone();
+        assert_eq!(off_event.event, "confirmed");
+        assert!(!off_event.processed);
+        assert_eq!(off_event.rotation_mode, "manual");
+        assert_eq!(off_event.image_sha256, sha256_hex(&registered));
+        assert!(!app.seal_store.library.history.iter().any(|event| event.image_sha256.len() > 64));
+        let ann = app.session.get(id).unwrap().info.annotations.iter().find(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(off_rect, ann);
+        app.grant_save_as();
+        let off_saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let (_, _, off_rgba) = render_page(off_saved.as_ref());
+        assert_eq!(app.seal_store.library.seals[0].data, registered);
+
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        let redone = app.seal_store.library.history.last().unwrap();
+        assert_eq!(redone.event, "redone");
+        assert_eq!(redone.image_sha256, off_event.image_sha256);
+        assert_eq!(redone.rotation_mode, off_event.rotation_mode);
+        assert!(!redone.processed);
+        let redone_saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let (_, _, redone_rgba) = render_page(redone_saved.as_ref());
+        assert_eq!(redone_rgba, off_rgba, "undo and redo keep the stamped image");
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+
+        let mut worn = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 0.0, fade: 30.0, bleed: 30.0, manual: false, manual_deg: 0.0 },
+            8,
+            0,
+        );
+        worn.opacity = 0.4;
+        let worn_png = stamp_image_bytes(&worn).unwrap();
+        assert_ne!(worn_png.as_ref(), registered.as_slice(), "wear must not reuse the registered PNG");
+        let ink = worn.seal.as_ref().unwrap().ink_rect;
+        assert_eq!(center(worn.rect), center(ink));
+        assert_eq!(crate::stamp_preset::size_label(measured_rect(&worn), worn.circular), crate::stamp_preset::size_label(ink, worn.circular));
+        app.views[0].stamp_place = Some(worn.clone());
+        approve_current_seal(&mut app).unwrap();
+        app.views[0].stamp_place.as_mut().unwrap().opacity = 0.2;
+        let history_before = app.seal_store.library.history.len();
+        app.commit_stamp_place();
+        assert_eq!(
+            app.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("承認の内容が変わったため、押印しませんでした。もう一度確認してください。")
+        );
+        assert!(app.seal_approval.is_none());
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+        assert!(app.views[0].stamp_place.is_some());
+
+        app.views[0].stamp_place.as_mut().unwrap().opacity = 0.4;
+        approve_current_seal(&mut app).unwrap();
+        let moved = app.views[0].stamp_place.as_ref().unwrap().rect;
+        app.views[0].stamp_place.as_mut().unwrap().rect = [moved[0] + 3.0, moved[1], moved[2] + 3.0, moved[3]];
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"));
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+
+        app.views[0].stamp_place = Some(worn.clone());
+        approve_current_seal(&mut app).unwrap();
+        if let Some(place) = app.views[0].stamp_place.as_mut() {
+            apply_place_scale(place, 80.0);
+        }
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+
+        app.views[0].stamp_place = Some(worn.clone());
+        let committed_rect = app.views[0].stamp_place.as_ref().unwrap().rect;
+        let preview = app.views[0].stamp_place.as_ref().unwrap().pixels.clone();
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "processed commit {:?}", app.toast);
+        let event = app.seal_store.library.history.last().unwrap().clone();
+        assert_eq!(event.event, "confirmed");
+        assert!(event.processed);
+        assert!((event.fade - 30.0).abs() < 1e-9);
+        assert_eq!(event.seed, 8);
+        assert_eq!(event.angle_deg, 0.0);
+        assert_eq!(event.rotation_mode, "random");
+        assert_eq!(event.image_sha256, sha256_hex(worn_png.as_ref()));
+        assert_ne!(event.image_sha256, sha256_hex(&registered));
+        let ann = app.session.get(id).unwrap().info.annotations.iter().rfind(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(committed_rect, ann);
+        let (pw, ph, px) = preview.unwrap();
+        assert_eq!(worn_png.as_slice(), crate::stamp_preset::encode_rgba_png(pw, ph, &px).unwrap().as_slice());
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let mut reader = pdfcraft_engine::Session::new();
+        let reopened = reader.open("copy.pdf", None, saved.clone(), None).unwrap();
+        let again = reader.get(reopened).unwrap().info.annotations.iter().rfind(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(committed_rect, again);
+        let (worn_w, worn_h, worn_rgba) = render_page(saved.as_ref());
+        assert_ne!(worn_rgba, off_rgba, "the processed stamp must not look like the original PNG");
+        let image = egui::ColorImage::from_rgba_unmultiplied([worn_w as usize, worn_h as usize], &worn_rgba);
+        let printed = crate::canvas::print_preview_image(crate::canvas::print_preview_tag(1.0, false), image.clone());
+        assert_eq!(printed.pixels, image.pixels, "print preview keeps the processed page");
+        assert_eq!(app.seal_store.library.seals[0].data, registered);
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        let worn_again = app.session.save_edited_copy_bytes(id).unwrap();
+        let (_, _, worn_again_rgba) = render_page(worn_again.as_ref());
+        assert_eq!(worn_again_rgba, worn_rgba, "undo and redo keep the processed image");
+        let redone_worn = app.seal_store.library.history.last().unwrap();
+        assert_eq!(redone_worn.event, "redone");
+        assert!(redone_worn.processed);
+        assert_eq!(redone_worn.image_sha256, event.image_sha256);
+        assert_eq!(redone_worn.rotation_mode, event.rotation_mode);
+
+        let turned = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 10.0, fade: 0.0, bleed: 0.0, manual: false, manual_deg: 0.0 },
+            5,
+            0,
+        );
+        let turned_png = stamp_image_bytes(&turned).unwrap();
+        assert_ne!(turned.rect, turned.seal.as_ref().unwrap().ink_rect);
+        assert_eq!(center(turned.rect), center(turned.seal.as_ref().unwrap().ink_rect));
+        app.views[0].stamp_place = Some(turned.clone());
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        let turn_event = app.seal_store.library.history.last().unwrap();
+        assert!(turn_event.processed);
+        assert!(turn_event.angle_deg.abs() > 0.2);
+        assert_eq!(turn_event.rotation_mode, "random");
+        assert_eq!(turn_event.fade, 0.0);
+        assert_eq!(turn_event.image_sha256, sha256_hex(turned_png.as_ref()));
+
+        let mut both = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 8.0, fade: 20.0, bleed: 12.0, manual: false, manual_deg: 0.0 },
+            9,
+            0,
+        );
+        let both_seed = both.seal.as_ref().unwrap().seed;
+        both.seal.as_mut().unwrap().seed = next_effect_seed(both_seed);
+        refresh_seal_preview(&mut both);
+        let both_png = stamp_image_bytes(&both).unwrap();
+        app.views[0].stamp_place = Some(both);
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        let both_event = app.seal_store.library.history.last().unwrap();
+        assert!(both_event.processed);
+        assert!((both_event.fade - 20.0).abs() < 1e-9);
+        assert_ne!(both_event.seed, both_seed);
+        assert_eq!(both_event.image_sha256, sha256_hex(both_png.as_ref()));
+        assert_ne!(both_event.image_sha256, sha256_hex(&registered));
+
+        for degrees in [90_i64, 270] {
+            commit_on_rotated_page(&dir, degrees);
+        }
+
+        let mut broken = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 0.0, fade: 30.0, bleed: 0.0, manual: false, manual_deg: 0.0 },
+            3,
+            0,
+        );
+        broken.pixels = Some((4, 4, vec![1, 2, 3]));
+        let kept = broken.data.clone();
+        app.views[0].stamp_place = Some(broken);
+        assert!(approve_current_seal(&mut app).is_err());
+        let history_before = app.seal_store.library.history.len();
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("画像にできません"), "{:?}", app.toast);
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+        assert_eq!(app.views[0].stamp_place.as_ref().unwrap().data.as_ref(), kept.as_ref());
+
+        struct ResetWrite;
+        impl Drop for ResetWrite {
+            fn drop(&mut self) {
+                crate::seal_store::FAIL_SEAL_WRITE.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetWrite;
+        app.views[0].stamp_place = Some(chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 0.0, fade: 15.0, bleed: 0.0, manual: false, manual_deg: 0.0 },
+            2,
+            0,
+        ));
+        approve_current_seal(&mut app).unwrap();
+        crate::seal_store::FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
+        let stamps_before = app.session.get(id).unwrap().info.annotations.iter().filter(|a| a.subtype == "Stamp").count();
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("使用履歴"), "{:?}", app.toast);
+        assert_eq!(app.session.get(id).unwrap().info.annotations.iter().filter(|a| a.subtype == "Stamp").count(), stamps_before);
+        assert!(app.views[0].stamp_place.is_some());
+        crate::seal_store::FAIL_SEAL_WRITE.store(false, Ordering::SeqCst);
+        assert_eq!(app.seal_store.library.seals[0].data, registered);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zero_turn_keeps_the_registered_png_and_a_new_pattern_keeps_a_manual_angle() {
+        let idle = chairman(crate::seal_store::SealEffects::off(), 3, 0);
+        assert_eq!(stamp_image_bytes(&idle).unwrap().as_ref(), idle.data.as_ref());
+        assert_eq!(idle.rect, idle.seal.as_ref().unwrap().ink_rect);
+        let legacy = crate::seal_store::SealEffects { enabled: false, rotation_deg: 2.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 };
+        let old = chairman(legacy, 1, 0);
+        assert!(old.seal.as_ref().unwrap().effects.is_passthrough());
+        assert_eq!(stamp_image_bytes(&old).unwrap().as_ref(), old.data.as_ref());
+        assert_eq!(old.rect, old.seal.as_ref().unwrap().ink_rect);
+
+        let mut sampled = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 30.0, fade: 0.0, bleed: 0.0, manual: false, manual_deg: 0.0 },
+            6,
+            0,
+        );
+        sampled.seal.as_mut().unwrap().angle_deg = 0.0;
+        sampled.seal.as_mut().unwrap().effects.fade = 0.0;
+        assert_eq!(stamp_image_bytes(&sampled).unwrap().as_ref(), sampled.data.as_ref(), "a random draw of 0° must not re-encode the PNG");
+
+        let mut fixed = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 12.0, fade: 10.0, bleed: 0.0, manual: true, manual_deg: -15.0 },
+            2,
+            0,
+        );
+        let angle = fixed.seal.as_ref().unwrap().angle_deg;
+        assert!((angle + 15.0).abs() < 1.0e-9, "{angle}");
+        let shown = fixed.pixels.clone();
+        fixed.seal.as_mut().unwrap().seed = next_effect_seed(fixed.seal.as_ref().unwrap().seed);
+        refresh_seal_preview(&mut fixed);
+        assert!((fixed.seal.as_ref().unwrap().angle_deg - angle).abs() < 1.0e-9);
+        assert_eq!(fixed.seal.as_ref().unwrap().effects.manual_deg, -15.0);
+        assert_ne!(fixed.pixels, shown, "wear still changes with the seed");
+
+        let mut still = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 0.0, fade: 0.0, bleed: 0.0, manual: true, manual_deg: 15.0 },
+            4,
+            0,
+        );
+        let pixels = still.pixels.clone();
+        still.seal.as_mut().unwrap().seed = next_effect_seed(4);
+        refresh_seal_preview(&mut still);
+        assert!((still.seal.as_ref().unwrap().angle_deg - 15.0).abs() < 1.0e-9);
+        assert_eq!(still.pixels, pixels, "a new pattern does not move a fixed angle when there is no wear");
+        assert_ne!(still.rect, still.seal.as_ref().unwrap().ink_rect);
+        assert_eq!(center(still.rect), center(still.seal.as_ref().unwrap().ink_rect));
+        assert_eq!(
+            crate::stamp_preset::size_label(measured_rect(&still), still.circular),
+            crate::stamp_preset::size_label(still.seal.as_ref().unwrap().ink_rect, still.circular)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn manual_rotation_commits_and_a_later_change_is_refused() {
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-manual", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = fresh_seal_app(&dir);
+        app.grant_save_as();
+        let registered = app.seal_store.library.seals[0].data.clone();
+        let id = app.views[0].id;
+        let manual = crate::seal_store::SealEffects { enabled: true, rotation_deg: 4.0, fade: 0.0, bleed: 2.0, manual: true, manual_deg: -30.0 };
+        let place = chairman(manual, 4, 0);
+        let rect = place.rect;
+        app.views[0].stamp_place = Some(place.clone());
+        let history_before = app.seal_store.library.history.len();
+        app.commit_stamp_place();
+        assert_eq!(app.toast.as_ref().map(|(text, _)| text.as_str()), Some("承認されていないため、押印しませんでした。"));
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+
+        app.views[0].stamp_place = Some(place.clone());
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "{:?}", app.toast);
+        let event = app.seal_store.library.history.last().unwrap().clone();
+        assert_eq!(event.rotation_mode, "manual");
+        assert!(event.processed);
+        assert!((event.angle_deg + 30.0).abs() < 1.0e-6, "{}", event.angle_deg);
+        assert_eq!(event.fade, 0.0);
+        assert_eq!(event.image_sha256, sha256_hex(stamp_image_bytes(&place).unwrap().as_ref()));
+        let ann = app.session.get(id).unwrap().info.annotations.iter().rfind(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(rect, ann);
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let mut reader = pdfcraft_engine::Session::new();
+        let opened = reader.open("copy.pdf", None, saved.clone(), None).unwrap();
+        let again = reader.get(opened).unwrap().info.annotations.iter().rfind(|a| a.subtype == "Stamp").unwrap().rect;
+        close_rect(rect, again);
+        let (_, _, first) = render_page(saved.as_ref());
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        let redone = app.session.save_edited_copy_bytes(id).unwrap();
+        let (_, _, second) = render_page(redone.as_ref());
+        assert_eq!(first, second);
+        assert_eq!(app.seal_store.library.history.last().unwrap().rotation_mode, "manual");
+        assert_eq!(app.seal_store.library.seals[0].data, registered);
+
+        let mut next = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 2.0, fade: 0.0, bleed: 0.0, manual: true, manual_deg: 15.0 },
+            7,
+            0,
+        );
+        app.views[0].stamp_place = Some(next.clone());
+        approve_current_seal(&mut app).unwrap();
+        next.seal.as_mut().unwrap().effects.manual_deg = 10.0;
+        refresh_seal_preview(&mut next);
+        app.views[0].stamp_place = Some(next);
+        let history_before = app.seal_store.library.history.len();
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+        assert_eq!(app.seal_store.library.history.len(), history_before);
+
+        let mut random = chairman(crate::seal_store::SealEffects::enabled_preset(), 8, 0);
+        app.views[0].stamp_place = Some(random.clone());
+        approve_current_seal(&mut app).unwrap();
+        random.seal.as_mut().unwrap().effects.rotation_deg = 30.0;
+        refresh_seal_preview(&mut random);
+        app.views[0].stamp_place = Some(random.clone());
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+
+        app.views[0].stamp_place = Some(random.clone());
+        approve_current_seal(&mut app).unwrap();
+        random.seal.as_mut().unwrap().effects.manual = true;
+        random.seal.as_mut().unwrap().effects.manual_deg = 0.0;
+        refresh_seal_preview(&mut random);
+        app.views[0].stamp_place = Some(random.clone());
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+
+        app.views[0].stamp_place = Some(random.clone());
+        approve_current_seal(&mut app).unwrap();
+        random.seal.as_mut().unwrap().seed = next_effect_seed(random.seal.as_ref().unwrap().seed);
+        refresh_seal_preview(&mut random);
+        app.views[0].stamp_place = Some(random.clone());
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+
+        app.views[0].stamp_place = Some(random.clone());
+        approve_current_seal(&mut app).unwrap();
+        random.seal.as_mut().unwrap().effects.fade = 20.0;
+        refresh_seal_preview(&mut random);
+        app.views[0].stamp_place = Some(random);
+        app.commit_stamp_place();
+        assert!(app.toast.as_ref().unwrap().0.contains("変わった"), "{:?}", app.toast);
+
+        let wear = chairman(
+            crate::seal_store::SealEffects { enabled: true, rotation_deg: 0.0, fade: 12.0, bleed: 9.0, manual: true, manual_deg: 0.0 },
+            11,
+            0,
+        );
+        let wear_png = stamp_image_bytes(&wear).unwrap();
+        assert_ne!(wear_png.as_ref(), registered.as_slice());
+        app.views[0].stamp_place = Some(wear.clone());
+        approve_current_seal(&mut app).unwrap();
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "{:?}", app.toast);
+        let wear_event = app.seal_store.library.history.last().unwrap();
+        assert_eq!(wear_event.rotation_mode, "manual");
+        assert!(wear_event.processed);
+        assert_eq!(wear_event.angle_deg, 0.0);
+        assert!((wear_event.fade - 12.0).abs() < 1.0e-9);
+        assert_eq!(wear_event.image_sha256, sha256_hex(wear_png.as_ref()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_place_bar_offers_effects_only_for_a_chairman_seal() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+            let mut app = crate::PdfCraftApp::new();
+            let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+            app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+            app.set_view_only(true);
+            app.grant_stamp();
+            app
+        });
+        h.run_steps(2);
+        h.state_mut().views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::enabled_preset(), 5, 0));
+        h.run_steps(2);
+        assert!(h.query_by_label("印影効果…").is_some());
+        assert!(h.query_by_label("加工済み印影の確定は次の実装段階で対応します").is_none());
+        assert!(h.query_by_label("にじみ").is_none());
+        h.get_by_label("印影効果…").click();
+        h.run_steps(2);
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::SealEffects)));
+        assert!(h.query_by_label("手動回転").is_some());
+        assert!(h.query_by_label("ランダム回転").is_some());
+        assert!(h.query_by_label("別パターンを生成").is_some());
+        assert!(h.query_by_label("加工前に戻す").is_some());
+        assert!(h.query_by_label("この加工設定を既定にする").is_some());
+        h.state_mut().dialog = None;
+        let mut general = chairman(crate::seal_store::SealEffects::off(), 1, 0);
+        general.chairman = false;
+        general.seal = None;
+        h.state_mut().views[0].stamp_place = Some(general);
+        h.run_steps(2);
+        assert!(h.query_by_label("印影効果…").is_none());
+
+        h.state_mut().set_ui_mode(crate::UiMode::Simple);
+        h.state_mut().views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::enabled_preset(), 5, 0));
+        h.run_steps(2);
+        h.get_by_label("印影効果…").click();
+        h.run_steps(2);
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::SealEffects)));
+        assert!(h.query_by_label("手動回転").is_some());
+        assert!(h.query_by_label("ランダム回転").is_some());
+        assert!(h.query_by_label("別パターンを生成").is_some());
+        assert!(h.query_by_label("加工前").is_some());
+        assert!(h.query_by_label("加工後").is_some());
+        let source = h.state().views[0].stamp_place.as_ref().unwrap().seal.as_ref().unwrap().source.clone();
+        crate::seal_effect::testing::reset();
+        h.get_by_label("100%").click();
+        h.run_steps(1);
+        h.get_by_label("200%").click();
+        h.run_steps(1);
+        h.get_by_label("全体").click();
+        h.run_steps(1);
+        assert_eq!(crate::seal_effect::testing::calls(), 0, "changing the comparison zoom must not rebuild the seal");
+        assert_eq!(h.state().views[0].stamp_place.as_ref().unwrap().seal.as_ref().unwrap().source, source);
+        let generation = h.state().views[0].stamp_place.as_ref().unwrap().preview_gen;
+        let pixels = h.state().views[0].stamp_place.as_ref().unwrap().pixels.clone();
+        crate::seal_effect::testing::reset();
+        let title = h.get_by_label("印影効果").rect();
+        // The accessible name covers the whole window. Only the title strip moves it.
+        let from = egui::pos2(title.min.x + 48.0, title.min.y + 18.0);
+        let to = from + egui::vec2(140.0, 70.0);
+        h.hover_at(from);
+        h.run_steps(1);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(2);
+        h.drop_at(to);
+        h.run_steps(2);
+        assert_eq!(crate::seal_effect::testing::calls(), 0, "moving the window must not rebuild the seal");
+        assert_eq!(h.state().views[0].stamp_place.as_ref().unwrap().preview_gen, generation);
+        assert_eq!(h.state().views[0].stamp_place.as_ref().unwrap().pixels, pixels);
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::SealEffects)));
+        let moved = h.get_by_label("印影効果").rect();
+        assert!(moved.center().distance(title.center()) > 20.0, "the title bar drag should move the window, before {title:?} after {moved:?}");
+
+        crate::seal_effect::testing::reset();
+        let doc = h.state().views[0].id;
+        h.state_mut().seal_approval = Some(SealApproval { doc, page: 0, rect: [0.0; 4], opacity: 1.0, preview_gen: 0, sha256: [0; 32] });
+        let fade = h.get_by_role_and_label(egui::accesskit::Role::Slider, "かすれ").rect();
+        let start = fade.center();
+        let end = start + egui::vec2(48.0, 0.0);
+        h.drag_at(start);
+        h.run_steps(1);
+        h.hover_at(end);
+        h.run_steps(3);
+        let during = crate::seal_effect::testing::calls();
+        assert!(during <= 1, "a slider drag rebuilt the seal {during} times before release");
+        h.drop_at(end);
+        h.run_steps(3);
+        let after = crate::seal_effect::testing::calls();
+        assert!(after <= during + 1, "release rebuilt more than once: during {during} after {after}");
+        assert!(after >= 1, "releasing the slider should rebuild once");
+        assert!(h.state().seal_approval.is_none(), "changing wear drops the approval");
+
+        let source = h.state().views[0].stamp_place.as_ref().unwrap().seal.as_ref().unwrap().source.clone();
+        let shown = h.state().views[0].stamp_place.as_ref().unwrap().pixels.clone();
+        h.get_by_label("別パターンを生成").click();
+        h.run_steps(2);
+        assert_eq!(h.state().views[0].stamp_place.as_ref().unwrap().seal.as_ref().unwrap().source, source);
+        assert_ne!(h.state().views[0].stamp_place.as_ref().unwrap().pixels, shown);
+        h.get_by_label("加工前に戻す").click();
+        h.run_steps(2);
+        let reverted = h.state().views[0].stamp_place.as_ref().unwrap().seal.as_ref().unwrap().effects;
+        assert!(reverted.manual);
+        assert_eq!(reverted.manual_deg, 0.0);
+        assert_eq!(reverted.fade, 0.0);
+        assert!(reverted.is_passthrough());
+        assert!(h.state().seal_approval.is_none());
+    }
+
+    #[test]
+    fn the_preview_rebuilds_only_when_the_settings_or_seed_change() {
+        let mut place = chairman(crate::seal_store::SealEffects::enabled_preset(), 5, 0);
+        let generation = place.preview_gen;
+        let pixels = place.pixels.clone();
+        refresh_seal_preview(&mut place);
+        assert_eq!(place.preview_gen, generation);
+        assert_eq!(place.pixels, pixels);
+        let same = place.seal.as_ref().unwrap().effects;
+        assert!(set_place_effects(&mut place, same).is_none());
+        assert_eq!(place.preview_gen, generation, "the same settings and seed must not rebuild");
+        let mut ignored = same;
+        ignored.bleed = 30.0;
+        assert!(set_place_effects(&mut place, ignored).is_none());
+        assert_eq!(place.preview_gen, generation, "a stored spread must not rebuild the preview");
+        assert_eq!(place.pixels, pixels);
+        let mut next = same;
+        next.fade = 30.0;
+        assert!(set_place_effects(&mut place, next).is_none());
+        assert_ne!(place.preview_gen, generation);
+        let rebuilt = place.pixels.clone();
+        assert_ne!(rebuilt, pixels);
+        let generation = place.preview_gen;
+        place.seal.as_mut().unwrap().seed = 99;
+        refresh_seal_preview(&mut place);
+        assert_ne!(place.preview_gen, generation);
+        assert_ne!(place.pixels, rebuilt);
+        let again = place.pixels.clone();
+        let generation = place.preview_gen;
+        refresh_seal_preview(&mut place);
+        assert_eq!(place.preview_gen, generation);
+        assert_eq!(place.pixels, again);
+    }
+
+    #[test]
+    fn a_slider_drag_does_not_commit_until_it_stops() {
+        assert_eq!(control_commits(true, true, false, false), (true, false));
+        assert_eq!(control_commits(false, false, true, false), (false, true));
+        assert_eq!(control_commits(true, false, false, false), (true, true));
+        assert_eq!(control_commits(true, false, false, true), (true, false));
+        assert_eq!(control_commits(false, false, false, false), (false, false));
     }
 }

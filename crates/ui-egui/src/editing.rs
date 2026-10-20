@@ -60,13 +60,7 @@ impl PdfCraftApp {
             None
         };
         if let Some(use_index) = removed_seal {
-            let event = crate::seal_store::SealEvent {
-                at: crate::seal_store::utc_now(),
-                file: self.seal_uses[use_index].file_name.clone(),
-                page: self.seal_uses[use_index].page,
-                seal: self.seal_uses[use_index].name.clone(),
-                event: "removed".into(),
-            };
+            let event = crate::seal_store::SealEvent::from_use(crate::seal_store::utc_now(), "removed", &self.seal_uses[use_index]);
             if let Err(error) = self.seal_store.append_event(event) {
                 self.notify(format!("使用履歴を記録できないため、印影は削除しませんでした。{error}"));
                 return false;

@@ -62,6 +62,7 @@ mod measure_ui;
 mod ocr_ui;
 mod optimize_ui;
 pub mod output_policy;
+mod seal_effect;
 mod seal_store;
 mod search_ui;
 mod sign_ui;
@@ -400,6 +401,8 @@ pub enum Dialog {
     CreateStamp,
     /// Confirm a chairman seal before it is applied.
     ConfirmSeal,
+    /// Ink settings for the chairman seal being placed. They are not saved until the user asks.
+    SealEffects,
     /// Confirm deletion of a chairman seal from the encrypted store.
     DeleteSeal,
     /// Register or edit a date stamp. It is stored with ordinary stamps, not chairman seals.
@@ -799,7 +802,9 @@ pub struct PdfCraftApp {
     /// Chairman seals. Not part of [`Self::persist`].
     pub seal_store: seal_store::SealStore,
     pub seal_uses: Vec<seal_store::SealUse>,
-    pub seal_ack: bool,
+    /// The chairman-seal approval for the image, rectangle and document that were just confirmed.
+    /// A checkbox that is merely ticked is not enough: commit checks this snapshot.
+    pub(crate) seal_approval: Option<stamps_ui::SealApproval>,
     /// PDF Optimizer choices.
     pub optimize_draft: OptimizeDraft,
     /// The running optimization (Optimize PDF ▸ Advanced optimization).
@@ -1124,7 +1129,7 @@ impl PdfCraftApp {
             stamp_try: false,
             seal_store: seal_store::SealStore::empty(),
             seal_uses: Vec::new(),
-            seal_ack: false,
+            seal_approval: None,
             optimize_draft: OptimizeDraft::default(),
             optimize_run: None,
             progress_notice: None,
