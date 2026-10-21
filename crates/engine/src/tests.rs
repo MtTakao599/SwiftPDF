@@ -2051,6 +2051,257 @@ fn a_layer_that_is_off_does_not_print_and_one_that_is_on_does() {
     }
 }
 
+/// Two optional-content groups. `print_state` adds a print-usage `/AS` entry for the red group.
+fn two_layer_pdf(print_state: Option<&str>) -> Vec<u8> {
+    let content = "/OC /L1 BDC 1 0 0 rg 0 0 40 40 re f EMC /OC /L2 BDC 0 0 1 rg 60 60 40 40 re f EMC";
+    let usage = match print_state {
+        Some(state) => format!(" /Usage << /Print << /PrintState /{state} >> >>"),
+        None => String::new(),
+    };
+    let application = match print_state {
+        Some(_) => " /AS [<< /Event /Print /OCGs [5 0 R] /Category [/Print] >>]",
+        None => "",
+    };
+    format!(
+        "%PDF-1.7\n\
+         1 0 obj << /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [5 0 R 6 0 R] /D << /Order [5 0 R 6 0 R]{application} >> >> >> endobj\n\
+         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Properties << /L1 5 0 R /L2 6 0 R >> >> >> endobj\n\
+         4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n\
+         5 0 obj << /Type /OCG /Name (Red){usage} >> endobj\n\
+         6 0 obj << /Type /OCG /Name (Blue) >> endobj\n\
+         trailer << /Root 1 0 R >>\n%%EOF",
+        content.len()
+    )
+    .into_bytes()
+}
+
+fn first_page_has_blue(pdf: Vec<u8>) -> bool {
+    let mut renderer = pdfcraft_render::PageRenderer::new(Arc::new(pdf), pdfcraft_render::RenderConfig::default());
+    let page = renderer.render(pdfcraft_render::RenderRequest { page: 0, scale: 0.5, ..Default::default() });
+    page.rgba.as_chunks::<4>().0.iter().any(|p| p[2] > 200 && p[0] < 60 && p[1] < 60)
+}
+
+/// The print-preview raster of the open document: the viewer's layer choices, true colours.
+fn print_preview_has_red(doc: &Document) -> bool {
+    let mut renderer = pdfcraft_render::PageRenderer::new(doc.bytes.clone(), doc.config.clone());
+    let page = renderer.render(pdfcraft_render::RenderRequest { page: 0, scale: 0.5, tag: pdfcraft_render::PRINT_TAG, ..Default::default() });
+    page.rgba.as_chunks::<4>().0.iter().any(|p| p[0] > 200 && p[1] < 60 && p[2] < 60)
+}
+
+fn oc_config(pdf: &[u8]) -> Option<pdfcraft_cos::Dict> {
+    let doc = pdfcraft_cos::Document::open(Arc::new(pdf.to_vec())).ok()?;
+    let root = doc.root()?;
+    let properties = doc.get(root).as_dict()?.get(b"OCProperties")?.clone();
+    let properties = doc.resolve(&properties);
+    let config = properties.as_dict()?.get(b"D")?.clone();
+    doc.resolve(&config).as_dict().cloned()
+}
+
+fn oc_refs(config: &pdfcraft_cos::Dict, key: &[u8]) -> Vec<u32> {
+    config
+        .get(key)
+        .and_then(pdfcraft_cos::Object::as_array)
+        .map(|items| items.iter().filter_map(|item| item.as_ref().map(|reference| reference.num)).collect())
+        .unwrap_or_default()
+}
+
+/// Names in `/ON` or `/OFF` of the print copy. Imposition gives the groups new object numbers,
+/// so the name is what stays put.
+fn oc_names(pdf: &[u8], key: &[u8]) -> Option<Vec<String>> {
+    let doc = pdfcraft_cos::Document::open(Arc::new(pdf.to_vec())).ok()?;
+    let root = doc.root()?;
+    let properties = doc.get(root).as_dict()?.get(b"OCProperties")?.clone();
+    let properties = doc.resolve(&properties);
+    let config = properties.as_dict()?.get(b"D")?.clone();
+    let config = doc.resolve(&config);
+    let config = config.as_dict()?;
+    let Some(items) = config.get(key).and_then(pdfcraft_cos::Object::as_array) else { return Some(Vec::new()) };
+    let mut names = Vec::new();
+    for item in items {
+        let group = doc.resolve(item);
+        names.push(group.as_dict()?.get(b"Name")?.as_string()?.to_text());
+    }
+    Some(names)
+}
+
+fn oc_print_event(config: &pdfcraft_cos::Dict) -> bool {
+    config
+        .get(b"AS")
+        .and_then(pdfcraft_cos::Object::as_array)
+        .and_then(|items| items.first())
+        .and_then(pdfcraft_cos::Object::as_dict)
+        .and_then(|event| event.get(b"Event"))
+        .and_then(pdfcraft_cos::Object::as_name)
+        == Some(b"Print".as_slice())
+}
+
+#[allow(clippy::expect_used)]
+fn open_layers(bytes: Vec<u8>) -> (Session, DocId) {
+    let mut session = Session::new();
+    let id = session.open("layers.pdf", None, Arc::new(bytes), None).expect("the synthetic layer file opens");
+    (session, id)
+}
+
+fn first_page_ink(pdf: Vec<u8>) -> usize {
+    let mut renderer = pdfcraft_render::PageRenderer::new(Arc::new(pdf), pdfcraft_render::RenderConfig::default());
+    let page = renderer.render(pdfcraft_render::RenderRequest { page: 0, scale: 0.5, ..Default::default() });
+    page.rgba.as_chunks::<4>().0.iter().filter(|pixel| pixel[0] < 250 || pixel[1] < 250 || pixel[2] < 250).count()
+}
+
+#[test]
+fn a_layer_hidden_in_the_panel_stays_hidden_when_printed() {
+    let source = red_layer_pdf(false);
+    let (mut session, id) = open_layers(source.clone());
+    let before = session.get(id).expect("open").bytes.clone();
+    assert!(session.set_layer_visible(id, 0, false));
+    let doc = session.get(id).expect("open");
+    assert!(!print_preview_has_red(doc), "the print preview uses the panel");
+    assert!(!doc.dirty);
+    assert!(doc.can_undo().is_none());
+    assert!(Arc::ptr_eq(&doc.bytes, &before));
+    let sheet = session.print_pdf(id, &print::Settings { pages: vec![0], ..Default::default() }).expect("prints");
+    assert!(!first_page_has_red(sheet.clone()), "the print-ready page hides the layer");
+    let config = oc_config(&sheet).expect("the print copy keeps optional content");
+    assert_eq!(oc_names(&sheet, b"OFF").expect("off list"), vec!["Red".to_string()]);
+    assert!(oc_names(&sheet, b"ON").expect("on list").is_empty());
+    assert_eq!(config.get(b"BaseState").and_then(pdfcraft_cos::Object::as_name), Some(b"ON".as_slice()));
+    let original = oc_config(&source).expect("the opened file has optional content");
+    assert!(oc_refs(&original, b"OFF").is_empty(), "the file's own default is left on");
+    assert!(Arc::ptr_eq(&session.get(id).expect("open").bytes, &before));
+    assert!(first_page_has_red(source), "opening the same bytes still shows the layer");
+}
+
+#[test]
+fn hiding_one_of_two_layers_prints_only_the_other() {
+    let source = two_layer_pdf(None);
+    let (mut session, id) = open_layers(source.clone());
+    assert!(session.set_layer_visible(id, 0, false));
+    let sheet = session.print_pdf(id, &print::Settings { pages: vec![0], ..Default::default() }).expect("prints");
+    assert!(!first_page_has_red(sheet.clone()));
+    assert!(first_page_has_blue(sheet.clone()));
+    let config = oc_config(&sheet).expect("optional content");
+    assert_eq!(oc_names(&sheet, b"OFF").expect("off list"), vec!["Red".to_string()]);
+    assert_eq!(oc_names(&sheet, b"ON").expect("on list"), vec!["Blue".to_string()]);
+    assert!(!oc_print_event(&config));
+    assert_eq!(session.get(id).expect("open").bytes.as_slice(), source.as_slice());
+}
+
+#[test]
+fn showing_every_layer_again_prints_them() {
+    let (mut session, id) = open_layers(two_layer_pdf(None));
+    assert!(session.set_layer_visible(id, 0, false));
+    assert!(session.set_layer_visible(id, 1, false));
+    assert!(session.set_layer_visible(id, 0, true));
+    assert!(session.set_layer_visible(id, 1, true));
+    let sheet = session.print_pdf(id, &print::Settings { pages: vec![0], ..Default::default() }).expect("prints");
+    assert!(first_page_has_red(sheet.clone()));
+    assert!(first_page_has_blue(sheet.clone()));
+    assert!(oc_names(&sheet, b"OFF").expect("off list").is_empty());
+    assert_eq!(oc_names(&sheet, b"ON").expect("on list"), vec!["Red".to_string(), "Blue".to_string()]);
+}
+
+#[test]
+fn a_hidden_layer_stays_off_when_the_file_also_has_a_print_usage() {
+    let source = two_layer_pdf(Some("ON"));
+    let (mut session, id) = open_layers(source.clone());
+    assert!(session.set_layer_visible(id, 0, false));
+    assert!(!print_preview_has_red(session.get(id).expect("open")));
+    let sheet = session.print_pdf(id, &print::Settings { pages: vec![0], ..Default::default() }).expect("prints");
+    assert!(!first_page_has_red(sheet.clone()), "this renderer does not let /AS turn /OFF back on");
+    assert!(first_page_has_blue(sheet.clone()));
+    let config = oc_config(&sheet).expect("optional content");
+    assert!(oc_print_event(&config), "/AS is kept on the print copy");
+    assert_eq!(oc_names(&sheet, b"OFF").expect("off list"), vec!["Red".to_string()]);
+    let original = oc_config(&source).expect("optional content");
+    assert!(oc_print_event(&original));
+    assert!(oc_refs(&original, b"OFF").is_empty());
+    assert!(first_page_has_red(source));
+}
+
+#[test]
+fn an_untouched_print_usage_does_not_change_the_default_state() {
+    // `/AS` would hide the red group for a consumer that applies print usage. This renderer
+    // reads `/D` only, and a panel that has not moved a layer leaves that configuration alone.
+    let source = two_layer_pdf(Some("OFF"));
+    assert!(first_page_has_red(source.clone()));
+    let (session, id) = open_layers(source);
+    let sheet = session.print_pdf(id, &print::Settings { pages: vec![0], ..Default::default() }).expect("prints");
+    assert!(first_page_has_red(sheet.clone()));
+    assert!(first_page_has_blue(sheet.clone()));
+    let config = oc_config(&sheet).expect("optional content");
+    assert!(oc_print_event(&config));
+    assert!(oc_refs(&config, b"OFF").is_empty());
+}
+
+#[test]
+fn a_hidden_layer_stays_out_of_colour_and_grayscale_image_prints() {
+    let (mut session, id) = open_layers(red_layer_pdf(false));
+    assert!(session.set_layer_visible(id, 0, false));
+    for grayscale in [false, true] {
+        let settings = print::Settings { pages: vec![0], raster: Some(print::Raster { dpi: 72.0, grayscale }), ..Default::default() };
+        let sheet = session.print_pdf(id, &settings).expect("prints as an image");
+        assert!(!first_page_has_red(sheet.clone()), "grayscale {grayscale}");
+        assert!(first_page_ink(sheet) < 40, "grayscale {grayscale}: the hidden square is not on the sheet");
+    }
+    assert!(session.set_layer_visible(id, 0, true));
+    let gray = print::Settings { pages: vec![0], raster: Some(print::Raster { dpi: 72.0, grayscale: true }), ..Default::default() };
+    let shown = session.print_pdf(id, &gray).expect("prints the visible layer in grey");
+    assert!(!first_page_has_red(shown.clone()), "grey has no red channel");
+    assert!(first_page_ink(shown) > 200, "the visible square is still ink");
+}
+
+#[test]
+fn uncommitted_text_on_a_hidden_layer_document_prints_without_the_layer() {
+    let source = red_layer_pdf(false);
+    let (mut session, id) = open_layers(source.clone());
+    let before = session.get(id).expect("open").bytes.clone();
+    assert!(session.set_layer_visible(id, 0, false));
+    let pending = PendingPrintText {
+        page: 0,
+        replace: None,
+        text: AddedText { text: "Printed note".into(), rect: [10.0, 60.0, 90.0, 90.0], size: 12.0, ..AddedText::default() },
+    };
+    let sheet = session.print_pdf_with_pending_text(id, &print::Settings { pages: vec![0], ..Default::default() }, Some(&pending)).expect("prints");
+    assert!(!first_page_has_red(sheet.clone()));
+    let mut reader = pdfcraft_render::PageRenderer::new(Arc::new(sheet), pdfcraft_render::RenderConfig::default());
+    let text = reader
+        .render(pdfcraft_render::RenderRequest { kind: pdfcraft_render::RequestKind::Text, scale: 1.0, ..Default::default() })
+        .text
+        .expect("text")
+        .plain_text();
+    assert!(text.contains("Printed note"), "{text}");
+    let doc = session.get(id).expect("open");
+    assert!(Arc::ptr_eq(&doc.bytes, &before));
+    assert!(!doc.dirty && doc.can_undo().is_none() && doc.can_redo().is_none());
+
+    let raster = print::Settings { pages: vec![0], raster: Some(print::Raster { dpi: 72.0, grayscale: false }), ..Default::default() };
+    let picture = session.print_pdf_with_pending_text(id, &raster, Some(&pending)).expect("prints the text into the picture");
+    assert!(!first_page_has_red(picture.clone()));
+    assert!(first_page_ink(picture) > 20, "the uncommitted text is in the picture");
+    assert_eq!(session.get(id).expect("open").bytes.as_slice(), source.as_slice());
+}
+
+#[test]
+fn hiding_a_layer_does_not_lift_a_print_ban_or_view_only() {
+    let protection =
+        Protection { open_password: Some("pw".into()), permissions_password: Some("owner".into()), printing: Printing::None, ..Default::default() };
+    let mut session = Session::new();
+    let id = session.open("layers.pdf", None, Arc::new(red_layer_pdf(false)), None).expect("opens");
+    session.apply(id, Edit::Protect(protection)).expect("protects");
+    let saved = session.save_bytes(id).expect("saves the protected copy");
+    let mut locked = Session::new();
+    let locked_id = locked.open("locked.pdf", None, saved, Some("pw")).expect("opens with the password");
+    assert!(locked.set_layer_visible(locked_id, 0, false));
+    assert_eq!(locked.print_pdf(locked_id, &print::Settings { pages: vec![0], ..Default::default() }), Err(EditError::NotPermitted("printing")));
+
+    let mut view = Session::new();
+    view.set_view_only(true);
+    let view_id = view.open("layers.pdf", None, Arc::new(red_layer_pdf(false)), None).expect("opens");
+    assert!(view.set_layer_visible(view_id, 0, false));
+    assert_eq!(view.print_pdf(view_id, &print::Settings { pages: vec![0], ..Default::default() }), Err(EditError::ViewOnly));
+}
+
 #[test]
 fn crop_and_duplicate_pages_show_in_the_viewer() {
     let (mut s, id) = session_with(2);

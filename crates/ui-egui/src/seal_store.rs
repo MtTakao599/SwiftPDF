@@ -817,7 +817,7 @@ startxref
         app.grant_stamp();
         app.grant_edit_text();
         app.start_chairman_seal("test-seal.png".into(), png());
-        app.save_custom_stamp();
+        app.accept_stamp_registration();
         assert_eq!(app.seal_store.library.seals.len(), 1, "{:?}", app.toast);
         let seal = app.seal_store.library.seals[0].clone();
         app.quick_tool = crate::QuickTool::ChairmanSeal(0);

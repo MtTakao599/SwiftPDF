@@ -381,3 +381,29 @@ fn modifier_selection_picks_foreground_text_and_added_items_over_background_artw
         assert!(new.rect.iter().enumerate().all(|(i, value)| (value - old.rect[i] - shift[i % 2]).abs() < 0.01), "{old:?} -> {new:?}");
     }
 }
+
+/// Preferences owns Escape. An open paragraph keeps its unapplied text.
+#[test]
+fn a_front_prompt_keeps_a_paragraph_draft() {
+    let mut h = harness();
+    let headline = at(&h, 55.0, 70.0);
+    click(&mut h, headline, Modifiers::NONE);
+    assert!(h.state().views[0].line_editor.is_some(), "the headline opens for editing");
+    h.state_mut().views[0].line_editor.as_mut().unwrap().text = "Group headline revised".into();
+    h.run_steps(2);
+    let before = objects(&h);
+    let id = h.state().views[0].id;
+    let undo = h.state().session.get(id).unwrap().can_undo().map(str::to_owned);
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::Preferences);
+    h.run_steps(3);
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "escape closes preferences");
+    assert_eq!(h.state().views[0].line_editor.as_ref().map(|editor| editor.text.as_str()), Some("Group headline revised"));
+    assert_eq!(objects(&h), before, "the paragraph is not written into the PDF");
+    assert_eq!(h.state().session.get(id).unwrap().can_undo().map(str::to_owned), undo);
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().views[0].line_editor.is_none(), "with no prompt, escape still discards the paragraph");
+    assert_eq!(objects(&h), before);
+}

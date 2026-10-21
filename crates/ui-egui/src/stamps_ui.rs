@@ -169,7 +169,13 @@ fn select_scale_text(ui: &egui::Ui, id: egui::Id, text: &str) {
 /// A percent box. The draft string lives only while the box is focused, so a half-typed `8`
 /// is not clamped to 25 and is not replaced by the last committed percent on the next frame.
 /// Enter, or clicking elsewhere, commits. Escape restores the committed percent without a notice.
-fn scale_percent_field(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, committed: f64, label: egui::Id) -> ScaleCommit {
+fn scale_percent_field(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    committed: f64,
+    label: egui::Id,
+    accept_keys: bool,
+) -> ScaleCommit {
     let id = ui.id().with(salt);
     let pass = ui.ctx().cumulative_pass_nr();
     // A widget earlier in the tree can take focus before this one runs. The draft saved on the
@@ -180,6 +186,9 @@ fn scale_percent_field(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt:
     let mut text =
         if focused || carry { previous.map(|draft| draft.text).unwrap_or_else(|| format_percent(committed)) } else { format_percent(committed) };
     let response = ui.add(crate::widgets::line(&mut text).id(id).desired_width(88.0).char_limit(8)).labelled_by(label);
+    if !accept_keys {
+        return ScaleCommit::Unchanged;
+    }
     if response.gained_focus() {
         select_scale_text(ui, response.id, &text);
     }
@@ -264,7 +273,7 @@ pub(crate) fn create_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) 
         ui.end_row();
         let l = ui.label("既定倍率 (%)");
         let scale = d.scale;
-        match scale_percent_field(ui, "stamp-draft-scale", scale, l.id) {
+        match scale_percent_field(ui, "stamp-draft-scale", scale, l.id, true) {
             ScaleCommit::Set(scale) => d.scale = scale,
             ScaleCommit::Rejected => scale_rejected = true,
             ScaleCommit::Unchanged => {}
@@ -318,7 +327,7 @@ pub(crate) fn palette_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Toke
             }
             resp.context_menu(|ui| {
                 let l = ui.label("既定倍率 (%)");
-                match scale_percent_field(ui, ("custom-menu-scale", i), s.scale, l.id) {
+                match scale_percent_field(ui, ("custom-menu-scale", i), s.scale, l.id, true) {
                     ScaleCommit::Set(scale) => scale_edit = Some((i, scale)),
                     ScaleCommit::Rejected => scale_rejected = true,
                     ScaleCommit::Unchanged => {}
@@ -371,7 +380,7 @@ fn date_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         }
         resp.context_menu(|ui| {
             let l = ui.label("既定倍率 (%)");
-            match scale_percent_field(ui, ("date-menu-scale", i), stamp.scale, l.id) {
+            match scale_percent_field(ui, ("date-menu-scale", i), stamp.scale, l.id, true) {
                 ScaleCommit::Set(scale) => scale_edit = Some((i, scale)),
                 ScaleCommit::Rejected => scale_rejected = true,
                 ScaleCommit::Unchanged => {}
@@ -555,6 +564,17 @@ impl PdfCraftApp {
         });
         self.quick_tool = QuickTool::CustomStamp(self.custom_stamps.len() - 1);
         self.note_stamp_try();
+    }
+
+    /// The Create Stamp OK button (`dialogs::show`) dismisses `Dialog::CreateStamp` and then
+    /// calls [`Self::save_custom_stamp`]. The save itself leaves the dialog up, because the
+    /// dialog frame has already closed it. A test that saves directly has to do both, or the
+    /// registration window stays in front and the stamp waits.
+    #[cfg(test)]
+    pub(crate) fn accept_stamp_registration(&mut self) {
+        assert!(matches!(self.dialog, Some(Dialog::CreateStamp)), "registration OK only closes CreateStamp, got {:?}", self.dialog);
+        self.dialog = None;
+        self.save_custom_stamp();
     }
 
     fn note_stamp_try(&mut self) {
@@ -800,7 +820,7 @@ fn drawn_date_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (boo
         ui.end_row();
         let l = ui.label("既定倍率 (%)");
         let scale = app.date_draft.scale;
-        match scale_percent_field(ui, "date-draft-scale", scale, l.id) {
+        match scale_percent_field(ui, "date-draft-scale", scale, l.id, true) {
             ScaleCommit::Set(scale) => {
                 app.date_draft.scale = scale;
                 changed = true;
@@ -1104,7 +1124,7 @@ pub(crate) fn date_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) ->
         ui.end_row();
         let l = ui.label("既定倍率 (%)");
         let scale = d.scale;
-        match scale_percent_field(ui, "date-draft-scale", scale, l.id) {
+        match scale_percent_field(ui, "date-draft-scale", scale, l.id, true) {
             ScaleCommit::Set(scale) => d.scale = scale,
             ScaleCommit::Rejected => scale_rejected = true,
             ScaleCommit::Unchanged => {}
@@ -1547,6 +1567,9 @@ pub(crate) fn stamp_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
 
 fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
     let t = Tokens::get(ui.ctx());
+    // A dialog in front owns Enter and Escape. The bar stays visible, but it must not confirm,
+    // cancel, or commit a number from those keys.
+    let keys = app.front_prompt().is_none();
     let name = app.views[index].stamp_place.as_ref().map(|place| place.name.clone()).unwrap_or_default();
     let dated = app.views[index].stamp_place.as_ref().is_some_and(|place| place.date_overlay.is_some());
     let calendar = app.views[index].stamp_place.as_ref().is_some_and(|place| place.date_overlay.as_ref().is_some_and(|date| date.show_calendar));
@@ -1569,7 +1592,9 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
             ui.horizontal(|ui| {
                 ui.label(format!("配置中: {name}"));
                 let mut opacity = app.views[index].stamp_place.as_ref().map(|place| place.opacity).unwrap_or(1.0);
-                if ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("透明度")).changed()
+                let opacity_changed = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("透明度")).changed();
+                if keys
+                    && opacity_changed
                     && let Some(place) = app.views[index].stamp_place.as_mut()
                 {
                     place.opacity = opacity.clamp(0.0, 1.0);
@@ -1577,36 +1602,43 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                 }
                 let committed = app.views[index].stamp_place.as_ref().map(|place| place.scale).unwrap_or(100.0);
                 let scale_label = ui.label("倍率");
-                match scale_percent_field(ui, ("place-scale", index), committed, scale_label.id) {
-                    ScaleCommit::Set(scale) => {
-                        if let Some(place) = app.views[index].stamp_place.as_mut() {
-                            apply_place_scale(place, scale);
-                            app.seal_approval = None;
-                            if place.date_overlay.as_ref().is_some_and(|overlay| overlay.drawn.is_some()) && !rebake_date(place) {
-                                notice = Some("日付を画像にできませんでした。".into());
+                let scale_commit = scale_percent_field(ui, ("place-scale", index), committed, scale_label.id, keys);
+                if keys {
+                    match scale_commit {
+                        ScaleCommit::Set(scale) => {
+                            if let Some(place) = app.views[index].stamp_place.as_mut() {
+                                apply_place_scale(place, scale);
+                                app.seal_approval = None;
+                                if place.date_overlay.as_ref().is_some_and(|overlay| overlay.drawn.is_some()) && !rebake_date(place) {
+                                    notice = Some("日付を画像にできませんでした。".into());
+                                }
                             }
                         }
+                        ScaleCommit::Rejected => notice = Some("倍率は25%から400%です。".into()),
+                        ScaleCommit::Unchanged => {}
                     }
-                    ScaleCommit::Rejected => notice = Some("倍率は25%から400%です。".into()),
-                    ScaleCommit::Unchanged => {}
                 }
                 if let Some(place) = app.views[index].stamp_place.as_ref() {
                     ui.label(crate::stamp_preset::size_label(measured_rect(place), place.circular));
                 }
-                if widgets::pill_button(ui, "この倍率を既定にする", false).clicked() {
+                let save_scale_clicked = widgets::pill_button(ui, "この倍率を既定にする", false).clicked();
+                if keys && save_scale_clicked {
                     save_scale = true;
                 }
                 let blocked = app.views[index].stamp_place.as_ref().and_then(commit_block_message);
-                if ui.add_enabled_ui(blocked.is_none(), |ui| widgets::pill_button(ui, "確定", true)).inner.clicked() {
+                let confirm_clicked = ui.add_enabled_ui(blocked.is_none(), |ui| widgets::pill_button(ui, "確定", true)).inner.clicked();
+                if keys && confirm_clicked {
                     confirm = true;
                 }
-                if widgets::pill_button(ui, "キャンセル", false).clicked() {
+                let cancel_clicked = widgets::pill_button(ui, "キャンセル", false).clicked();
+                if keys && cancel_clicked {
                     cancel = true;
                 }
             });
             if chairman {
                 ui.horizontal(|ui| {
-                    if widgets::pill_button(ui, "印影効果…", false).clicked() {
+                    let effects = widgets::pill_button(ui, "印影効果…", false).clicked();
+                    if keys && effects {
                         app.dialog = Some(Dialog::SealEffects);
                     }
                     if let Some(place) = app.views[index].stamp_place.as_ref()
@@ -1625,7 +1657,7 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                         .and_then(|place| place.date_overlay.as_ref().map(|date| date.entry.clone()))
                         .unwrap_or_default();
                     let edited = ui.add(crate::widgets::line(&mut text).desired_width(110.0).hint_text("YYYY/M/D"));
-                    if edited.changed() {
+                    if keys && edited.changed() {
                         let parsed = crate::stamp_preset::parse_date(&text);
                         if let Some(place) = app.views[index].stamp_place.as_mut()
                             && let Some(overlay) = place.date_overlay.as_mut()
@@ -1648,7 +1680,8 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                     if date_bad {
                         ui.label(egui::RichText::new("日付が正しくありません").color(egui::Color32::from_rgb(176, 48, 48)));
                     }
-                    if widgets::pill_button(ui, "今日", false).clicked() {
+                    let today_clicked = widgets::pill_button(ui, "今日", false).clicked();
+                    if keys && today_clicked {
                         let today = crate::stamp_preset::japan_today();
                         if let Some(place) = app.views[index].stamp_place.as_mut()
                             && let Some(overlay) = place.date_overlay.as_mut()
@@ -1664,7 +1697,9 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                             notice = Some("日付を画像にできませんでした。".into());
                         }
                     }
-                    if widgets::pill_button(ui, "カレンダー", false).clicked()
+                    let calendar_clicked = widgets::pill_button(ui, "カレンダー", false).clicked();
+                    if keys
+                        && calendar_clicked
                         && let Some(place) = app.views[index].stamp_place.as_mut()
                         && let Some(overlay) = place.date_overlay.as_mut()
                     {
@@ -1677,7 +1712,10 @@ fn place_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui, index: usize) {
                         .as_ref()
                         .and_then(|place| place.date_overlay.as_ref().map(|date| (date.calendar_year, date.calendar_month)))
                 {
-                    let action = month_grid(ui, year, month);
+                    let action = if keys { month_grid(ui, year, month) } else { MonthAction::None };
+                    if !keys {
+                        let _ = month_grid(ui, year, month);
+                    }
                     match action {
                         MonthAction::Prev | MonthAction::Next => {
                             let (y, m) = shift_month(year, month, matches!(action, MonthAction::Next));
@@ -2613,6 +2651,9 @@ impl PdfCraftApp {
     }
 
     pub(crate) fn ask_stamp_confirm(&mut self) {
+        if self.front_blocks_stamp_commit() {
+            return;
+        }
         let Some(index) = self.active else { return };
         let Some(place) = self.views[index].stamp_place.clone() else { return };
         if let Some(why) = self.stamp_refusal(index) {
@@ -2631,7 +2672,20 @@ impl PdfCraftApp {
         self.commit_stamp_place();
     }
 
+    /// A prompt other than the chairman-seal confirmation is in front. Commit and the
+    /// confirmation itself wait until that prompt is gone.
+    fn front_blocks_stamp_commit(&self) -> bool {
+        match self.front_prompt() {
+            None => false,
+            Some(crate::PromptLayer::Dialog) => !matches!(self.dialog, Some(Dialog::ConfirmSeal)),
+            Some(_) => true,
+        }
+    }
+
     pub(crate) fn commit_stamp_place(&mut self) {
+        if self.front_blocks_stamp_commit() {
+            return;
+        }
         let Some(index) = self.active else { return };
         let Some(mut place) = self.views[index].stamp_place.clone() else { return };
         if let Some(why) = self.stamp_refusal(index) {
@@ -3580,7 +3634,7 @@ mod effect_preview_tests {
         app.grant_edit_text();
         app.set_seal_store(dir.join("seals.bin"));
         app.start_chairman_seal("seal.png".into(), png(48, 32));
-        app.save_custom_stamp();
+        app.accept_stamp_registration();
         assert_eq!(app.seal_store.library.seals[0].data, png(48, 32), "{:?}", app.toast);
         app.quick_tool = QuickTool::ChairmanSeal(0);
         app
@@ -3600,7 +3654,7 @@ mod effect_preview_tests {
         app.grant_save_as();
         app.set_seal_store(dir.join(format!("seals-{degrees}.bin")));
         app.start_chairman_seal("seal.png".into(), png(48, 32));
-        app.save_custom_stamp();
+        app.accept_stamp_registration();
         let registered = app.seal_store.library.seals[0].data.clone();
         let place = chairman(
             crate::seal_store::SealEffects { enabled: true, rotation_deg: 6.0, fade: 10.0, bleed: 5.0, manual: false, manual_deg: 0.0 },
@@ -3625,6 +3679,56 @@ mod effect_preview_tests {
         let event = app.seal_store.library.history.last().unwrap();
         assert!(event.processed, "{degrees}");
         assert!((event.fade - 10.0).abs() < 1e-9, "{degrees}");
+    }
+
+    /// The registration window is in front until its OK button dismisses it. A stamp waits,
+    /// and so does a commit while the permissions prompt covers the approval dialog.
+    #[test]
+    #[cfg(windows)]
+    fn a_registration_dialog_blocks_stamping_until_ok_closes_it() {
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-front", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = crate::PdfCraftApp::new();
+        let blank = app.session.create_blank(240.0, 320.0, 1).unwrap();
+        app.open_bytes("opened.pdf", None, blank.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.set_seal_store(dir.join("seals.bin"));
+        let id = app.views[0].id;
+        app.start_chairman_seal("seal.png".into(), png(48, 32));
+        assert!(matches!(app.dialog, Some(crate::Dialog::CreateStamp)));
+        app.views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::off(), 1, 0));
+        app.ask_stamp_confirm();
+        assert!(matches!(app.dialog, Some(crate::Dialog::CreateStamp)), "registration stays in front");
+        assert!(app.seal_approval.is_none());
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_some(), "{:?}", app.toast);
+        assert!(app.seal_store.library.history.is_empty());
+        assert!(app.session.get(id).unwrap().info.annotations.iter().all(|a| a.subtype != "Stamp"));
+
+        app.accept_stamp_registration();
+        assert!(app.dialog.is_none());
+        app.ask_stamp_confirm();
+        assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
+        app.commit_stamp_place();
+        assert_eq!(app.toast.as_ref().map(|(text, _)| text.as_str()), Some("承認されていないため、押印しませんでした。"));
+        assert!(app.seal_store.library.history.is_empty());
+        assert!(app.views[0].stamp_place.is_some());
+
+        approve_current_seal(&mut app).unwrap();
+        app.unlock_prompt = Some(crate::UnlockPrompt { doc: id, name: "opened.pdf".into(), input: String::new(), error: None, then: None });
+        app.toast = None;
+        app.commit_stamp_place();
+        assert!(app.toast.is_none(), "a prompt in front of the approval dialog does not commit");
+        assert!(app.views[0].stamp_place.is_some());
+        assert!(app.seal_store.library.history.is_empty());
+        app.unlock_prompt = None;
+        app.commit_stamp_place();
+        assert!(app.views[0].stamp_place.is_none(), "{:?}", app.toast);
+        assert_eq!(app.seal_store.library.history.last().map(|event| event.event.as_str()), Some("confirmed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Processed chairman seals commit the preview PNG. The registered image and an effect-off
@@ -4154,5 +4258,124 @@ mod effect_preview_tests {
         assert_eq!(control_commits(true, false, false, false), (true, true));
         assert_eq!(control_commits(true, false, false, true), (true, false));
         assert_eq!(control_commits(false, false, false, false), (false, false));
+    }
+
+    #[test]
+    fn a_covering_dialog_refuses_the_stamp_commit() {
+        let mut app = crate::PdfCraftApp::new();
+        let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+        app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::off(), 5, 0));
+        approve_current_seal(&mut app).unwrap();
+        assert!(app.seal_approval.is_some());
+        app.dialog = Some(crate::Dialog::SealEffects);
+        app.ask_stamp_confirm();
+        app.commit_stamp_place();
+        assert_eq!(app.dialog, Some(crate::Dialog::SealEffects));
+        assert!(app.views[0].stamp_place.is_some());
+        assert!(app.seal_store.library.history.is_empty());
+        assert!(app.seal_approval.is_some(), "a covered commit must leave the approval in place");
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn enter_does_not_skip_seal_approval_and_escape_clears_it() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+            let mut app = crate::PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+            app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+            app.set_view_only(true);
+            app.grant_stamp();
+            app
+        });
+        h.run_steps(3);
+        h.state_mut().views[0].stamp_place = Some(chairman(crate::seal_store::SealEffects::off(), 3, 0));
+        h.state_mut().ask_stamp_confirm();
+        h.run_steps(3);
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::ConfirmSeal)));
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::ConfirmSeal)), "enter must not confirm");
+        assert!(h.state().seal_approval.is_none());
+        assert!(h.state().views[0].stamp_place.is_some());
+        assert!(h.state().seal_store.library.history.is_empty());
+        h.get_by_label("この文書への押印が承認されていることを確認しました").click();
+        h.run_steps(2);
+        assert!(h.state().seal_approval.is_some());
+        let id = h.state().views[0].id;
+        h.state_mut().unlock_prompt = Some(crate::UnlockPrompt { doc: id, name: "opened.pdf".into(), input: String::new(), error: None, then: None });
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert!(h.state().views[0].stamp_place.is_some(), "enter on the front prompt must not stamp");
+        assert!(h.state().seal_store.library.history.is_empty());
+        assert!(matches!(h.state().dialog, Some(crate::Dialog::ConfirmSeal)));
+        h.state_mut().unlock_prompt = None;
+        h.run_steps(2);
+        assert!(h.state().seal_approval.is_some());
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.state().dialog.is_none(), "escape cancels the confirmation");
+        assert!(h.state().seal_approval.is_none(), "escape drops the approval");
+        assert!(h.state().views[0].stamp_place.is_some());
+        assert!(h.state().seal_store.library.history.is_empty());
+    }
+
+    #[test]
+    fn save_shortcuts_wait_until_the_dialog_closes() {
+        use egui_kittest::Harness;
+        let dir = std::env::temp_dir().join(format!("pdfcraft-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("copy.pdf");
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+            let mut app = crate::PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            let bytes = app.session.create_blank(200.0, 300.0, 1).unwrap();
+            app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+            app.set_view_only(true);
+            app.grant_save_as();
+            app
+        });
+        h.run_steps(3);
+        h.state_mut().dialog = Some(crate::Dialog::Preferences);
+        h.state_mut().toast = None;
+        h.state_mut().save_override = Some(dest.display().to_string());
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        h.run_steps(3);
+        assert_eq!(h.state().dialog, Some(crate::Dialog::Preferences));
+        assert!(h.state().toast.is_none(), "ctrl+s must not reach the document: {:?}", h.state().toast);
+        assert!(h.state().pending_save_copy.is_none());
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S);
+        h.run_steps(3);
+        assert_eq!(h.state().dialog, Some(crate::Dialog::Preferences), "ctrl+shift+s must not open save as");
+        assert!(h.state().pending_save_copy.is_none());
+        assert!(!dest.exists());
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.state().dialog.is_none());
+        h.state_mut().toast = None;
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        h.run_steps(3);
+        assert!(h.state().dialog.is_none());
+        assert_eq!(h.state().toast.as_ref().map(|(text, _)| text.as_str()), Some(crate::command_policy::REFUSED));
+        assert!(!dest.exists());
+        h.state_mut().toast = None;
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S);
+        h.run_steps(3);
+        assert_eq!(h.state().dialog, Some(crate::Dialog::SaveCopy));
+        assert!(!dest.exists(), "save as opens a confirmation and does not write yet");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.state().dialog.is_none(), "escape cancels the save confirmation");
+        assert!(h.state().pending_save_copy.is_none());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

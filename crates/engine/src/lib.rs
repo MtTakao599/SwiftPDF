@@ -999,6 +999,31 @@ fn render_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8) - 1
 }
 
+/// Write `layers`' visibility into the default optional-content configuration of `cos`, a copy
+/// made for printing. `/BaseState` is `/ON`, `/ON` lists the visible groups and `/OFF` the
+/// hidden ones. `/Order`, `/RBGroups` and `/AS` stay as they were. A file with no
+/// `/OCProperties` is left alone. The open document is not this copy.
+///
+/// This renderer decides visibility from `/D` and then the viewer's overrides. It does not
+/// apply `/AS`, so a print-usage `/PrintState` does not turn a group in `/OFF` back on here.
+fn set_default_layer_state(cos: &mut pdfcraft_cos::Document, layers: &[pdfcraft_render::Layer]) {
+    use pdfcraft_cos::{Dict, ObjRef, Object};
+    let Some(root_ref) = cos.trailer().get(b"Root").and_then(Object::as_ref) else { return };
+    let Some(mut root) = cos.get(root_ref).as_dict().cloned() else { return };
+    let Some(properties_obj) = root.get(b"OCProperties").cloned() else { return };
+    let Some(mut properties) = cos.resolve(&properties_obj).as_dict().cloned() else { return };
+    let mut config = properties.get(b"D").and_then(|entry| cos.resolve(entry).as_dict().cloned()).unwrap_or_else(Dict::new);
+    let listed = |visible: bool| {
+        Object::Array(layers.iter().filter(|layer| layer.visible == visible).map(|layer| Object::Ref(ObjRef::new(layer.id.0, layer.id.1))).collect())
+    };
+    config.set(b"BaseState".to_vec(), Object::name("ON"));
+    config.set(b"ON".to_vec(), listed(true));
+    config.set(b"OFF".to_vec(), listed(false));
+    properties.set(b"D".to_vec(), Object::Dict(config));
+    root.set(b"OCProperties".to_vec(), Object::Dict(properties));
+    cos.set(root_ref, Object::Dict(root));
+}
+
 /// Render `doc` with the layer visibility in its `info.layers`.
 fn use_layer_choices(doc: &mut Document) {
     let overrides: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, l.id.1 as i32, l.visible)).collect();
@@ -4769,6 +4794,11 @@ impl Session {
                 if let Some(pending) = pending {
                     bake_pending_text(&mut cos, pending)?;
                 }
+                // The reopened copy has no viewer overrides, so the panel's choices have to be
+                // in its `/D` or a hidden layer comes back in the pictures.
+                if !doc.config.layers.is_empty() {
+                    set_default_layer_state(&mut cos, &doc.info.layers);
+                }
                 let password = doc.password.clone();
                 let written = pdfcraft_cos::write_full(&cos, &pdfcraft_cos::SaveOptions::default()).map_err(|e| EditError::Print(e.to_string()))?;
                 let mut temp = Session::new();
@@ -4781,6 +4811,12 @@ impl Session {
         let mut cos = opened_cos(doc)?;
         if let Some(pending) = pending {
             bake_pending_text(&mut cos, pending)?;
+        }
+        // The imposed file copies `/OCProperties` as they are. Until the panel (or a
+        // set-layer action) changes a layer, that is the file's own configuration. After a
+        // change, the copy's `/D` says which groups are on, so a hidden one stays off on paper.
+        if !doc.config.layers.is_empty() {
+            set_default_layer_state(&mut cos, &doc.info.layers);
         }
         pdfcraft_print::impose(&cos, settings).map_err(|e| EditError::Print(e.to_string()))
     }

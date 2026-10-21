@@ -934,6 +934,20 @@ impl LinkOrigin {
     }
 }
 
+/// Which prompt is drawn above the others. Later arms in [`PdfCraftApp::front_prompt`] sit
+/// further up the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptLayer {
+    Password,
+    Save,
+    Link,
+    RemoteLink,
+    FullScreen,
+    Updates,
+    Dialog,
+    Unlock,
+}
+
 /// An address a document asked to open, waiting for the user to allow or cancel it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingLink {
@@ -2037,13 +2051,37 @@ impl PdfCraftApp {
     /// A dialog or prompt is open over the window: the keyboard is its own, and nothing may act
     /// on the document underneath it.
     pub(crate) fn modal_open(&self) -> bool {
-        self.dialog.is_some()
-            || self.close_request.is_some()
-            || self.password_prompt.is_some()
-            || self.unlock_prompt.is_some()
-            || self.pending_link.is_some()
-            || self.pending_remote_link.is_some()
-            || self.updates.open
+        self.front_prompt().is_some()
+    }
+
+    /// The prompt drawn last. Only that one may take Enter, Escape, or a save shortcut.
+    /// Earlier prompts stay open, but they do not see those keys.
+    pub(crate) fn front_prompt(&self) -> Option<PromptLayer> {
+        if self.unlock_prompt.is_some() {
+            return Some(PromptLayer::Unlock);
+        }
+        if self.dialog.is_some() {
+            return Some(PromptLayer::Dialog);
+        }
+        if self.updates.open {
+            return Some(PromptLayer::Updates);
+        }
+        if self.pending_full_screen.is_some() {
+            return Some(PromptLayer::FullScreen);
+        }
+        if self.pending_remote_link.is_some() {
+            return Some(PromptLayer::RemoteLink);
+        }
+        if self.pending_link.is_some() {
+            return Some(PromptLayer::Link);
+        }
+        if self.close_request.is_some() {
+            return Some(PromptLayer::Save);
+        }
+        if self.password_prompt.is_some() {
+            return Some(PromptLayer::Password);
+        }
+        None
     }
 
     /// Enable the UI control channel on `ctx` (opt-in; see [`control`]). Returns a client that
@@ -3002,17 +3040,17 @@ impl PdfCraftApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::Key;
-        // "Save changes?" is modal: its keys are its own (⌘D is Don't save there, not Document
-        // properties; Escape cancels it rather than clearing a selection), and nothing may run
-        // underneath it. They are read here, before the canvas can consume them.
-        if self.close_request.is_some() {
+        // "Save changes?" owns Enter, Escape and ⌘D only while it is the front prompt. A link
+        // question, the seal window, or any other dialog drawn above it keeps those keys.
+        // One key must not also start a shortcut in the document underneath.
+        if self.front_prompt() == Some(PromptLayer::Save) {
             if let Some(choice) = dialogs::save_prompt_key(ctx) {
                 self.resolve_close(ctx, choice);
             }
             return;
         }
-        // The other dialogs and prompts are modal too (⌘W closed the file behind Preferences,
-        // #870).
+        // Any prompt owns the keyboard (⌘W closed the file behind Preferences, #870). Save
+        // shortcuts are among them: they must not start while a dialog is up.
         if self.modal_open() {
             return;
         }

@@ -38,7 +38,11 @@ fn show_seal_effects_window(app: &mut PdfCraftApp, ctx: &egui::Context) {
             crate::stamps_ui::seal_effects_body(ui, app)
         });
     let close = shown.and_then(|response| response.inner).unwrap_or(false);
-    if !open || close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+    // Escape closes this window only while it is the front prompt. A save question underneath
+    // keeps its own keys for the next frame.
+    let escape =
+        app.front_prompt() == Some(crate::PromptLayer::Dialog) && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    if !open || close || escape {
         app.dialog = None;
     }
 }
@@ -1371,6 +1375,10 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if print_go && !app.print_now() {
         close = false;
     }
+    // Read Escape once, and only while this dialog is in front. `close` can still change
+    // below (a failed print, bulk field properties); the dismiss decision is made after that.
+    let front_dialog = app.front_prompt() == Some(crate::PromptLayer::Dialog);
+    let escape_hit = front_dialog && modal.should_close();
     if revert_now {
         app.revert_active();
     }
@@ -1383,19 +1391,11 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
             app.save_changed_file_elsewhere();
         }
     }
-    if save_copy_now {
+    if save_copy_now && app.front_prompt() == Some(crate::PromptLayer::Dialog) {
         let _ = app.confirm_save_copy();
-    }
-    if dialog == Dialog::SaveCopy && (modal.should_close() || close) {
-        app.cancel_save_copy();
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (overwrite_now, overwrite_elsewhere);
-    // Cancelled or dismissed: the save is dropped.
-    #[cfg(not(target_arch = "wasm32"))]
-    if dialog == Dialog::OverwriteChanged && (modal.should_close() || close) {
-        app.pending_overwrite = None;
-    }
     if summarize_now {
         app.summarize_comments();
     }
@@ -1507,23 +1507,35 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if apply && let Some(edits) = draft_changes(app) {
         app.apply_edit(Edit::Batch { label: "Change document properties".into(), edits });
     }
+    // A click inside a covered dialog does not dismiss it. Escape was read once above.
+    let dismiss = front_dialog && (close || escape_hit);
+    if dialog == Dialog::SaveCopy && dismiss {
+        app.cancel_save_copy();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if dialog == Dialog::OverwriteChanged && dismiss {
+        app.pending_overwrite = None;
+    }
     // Protect / Remove security replace the Properties dialog.
     let replaces = link_command.is_some_and(|c| c.starts_with("protect.")) || open_revision.is_some();
     let hold = std::mem::take(&mut app.font_hold);
-    let return_to_date = (modal.should_close() || close) && dialog == Dialog::FontPicker && app.font_return == Some(Dialog::DateStamp);
+    let return_to_date = dismiss && dialog == Dialog::FontPicker && app.font_return == Some(Dialog::DateStamp);
     if hold {
         app.dialog = Some(Dialog::FontPicker);
     } else if return_to_date {
         app.font_return = None;
         crate::stamps_ui::apply_date_font_choice(app);
         app.dialog = Some(Dialog::DateStamp);
-    } else if app.text_font && dialog == Dialog::FontPicker && (modal.should_close() || close) {
+    } else if app.text_font && dialog == Dialog::FontPicker && dismiss {
         app.text_font = false;
         app.font_return = None;
         app.date_font_row = None;
         crate::content_ui::apply_text_font_choice(app);
         app.dialog = None;
-    } else if modal.should_close() || close || replaces {
+    } else if dismiss || replaces {
+        if dialog == Dialog::ConfirmSeal {
+            app.seal_approval = None;
+        }
         app.font_return = None;
         app.date_font_row = None;
         app.text_font = false;
@@ -1653,10 +1665,13 @@ fn save_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         });
     });
-    if choice.is_none() && modal.should_close() {
+    // A prompt drawn above this one owns Escape. Calling should_close here would take it.
+    if app.front_prompt() == Some(crate::PromptLayer::Save) && choice.is_none() && modal.should_close() {
         choice = Some(None);
     }
-    if let Some(c) = choice {
+    if app.front_prompt() == Some(crate::PromptLayer::Save)
+        && let Some(c) = choice
+    {
         app.resolve_close(ctx, c);
     }
 }
@@ -1731,10 +1746,12 @@ fn link_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         });
     });
-    if choice.is_none() && modal.should_close() {
+    if app.front_prompt() == Some(crate::PromptLayer::Link) && choice.is_none() && modal.should_close() {
         choice = Some(false);
     }
-    if let Some(open) = choice {
+    if app.front_prompt() == Some(crate::PromptLayer::Link)
+        && let Some(open) = choice
+    {
         app.resolve_pending_link(open);
     }
 }
@@ -1773,10 +1790,12 @@ fn full_screen_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         });
     });
-    if choice.is_none() && modal.should_close() {
+    if app.front_prompt() == Some(crate::PromptLayer::FullScreen) && choice.is_none() && modal.should_close() {
         choice = Some(false);
     }
-    if let Some(allow) = choice {
+    if app.front_prompt() == Some(crate::PromptLayer::FullScreen)
+        && let Some(allow) = choice
+    {
         app.resolve_full_screen_prompt(ctx, allow);
     }
 }
@@ -1805,10 +1824,12 @@ fn remote_link_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         });
     });
-    if choice.is_none() && modal.should_close() {
+    if app.front_prompt() == Some(crate::PromptLayer::RemoteLink) && choice.is_none() && modal.should_close() {
         choice = Some(false);
     }
-    if let Some(open) = choice {
+    if app.front_prompt() == Some(crate::PromptLayer::RemoteLink)
+        && let Some(open) = choice
+    {
         app.resolve_pending_remote_link(open);
     }
 }
@@ -1824,6 +1845,9 @@ enum PasswordAnswer {
 }
 
 /// A password box: a lock, a title, a message, the masked field, an error and two buttons.
+/// `accept_keys` is the eighth argument so the box can be shown under another prompt without
+/// taking Enter or Escape.
+#[allow(clippy::too_many_arguments)]
 fn password_modal(
     ctx: &egui::Context,
     id: &str,
@@ -1832,6 +1856,7 @@ fn password_modal(
     input: &mut String,
     error: Option<&str>,
     ok: &str,
+    accept_keys: bool,
 ) -> Option<PasswordAnswer> {
     let t = Tokens::get(ctx);
     let mut answer = None;
@@ -1845,12 +1870,15 @@ fn password_modal(
         ui.add(egui::Label::new(message).wrap());
         ui.add_space(8.0);
         let r = ui.add(widgets::line(input).password(true).hint_text(tl!("Password")).desired_width(f32::INFINITY));
-        // Enter submits. The field keeps focus (we request it every frame), so check the key
-        // while it is focused as well as on the frame focus is lost.
-        if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        // Enter submits only while this box is the front prompt. The field keeps focus then
+        // (we request it every frame), so check the key while it is focused and on the frame
+        // focus is lost. A dialog above this box must not have its Enter taken as a submit.
+        if accept_keys && (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             answer = Some(PasswordAnswer::Submit);
         }
-        r.request_focus();
+        if accept_keys {
+            r.request_focus();
+        }
         if let Some(e) = error {
             ui.add_space(4.0);
             // Known error text is translated; anything else passes through.
@@ -1866,14 +1894,18 @@ fn password_modal(
             }
         });
     });
-    answer.or(modal.should_close().then_some(PasswordAnswer::Cancel))
+    if accept_keys { answer.or(modal.should_close().then_some(PasswordAnswer::Cancel)) } else { None }
 }
 
 /// Password prompt for encrypted documents (Acrobat: "Password" dialog on open).
 fn password(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    if app.password_prompt.is_none() {
+        return;
+    }
+    let front = app.front_prompt() == Some(crate::PromptLayer::Password);
     let Some(prompt) = app.password_prompt.as_mut() else { return };
     let message = crate::i18n::fmt(tl!("“{name}” is protected. Enter a password to open it."), &[("name", &prompt.name)]);
-    match password_modal(ctx, "password", tl!("Password required"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Open")) {
+    match password_modal(ctx, "password", tl!("Password required"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Open"), front) {
         Some(PasswordAnswer::Submit) => {
             let pw = prompt.input.clone();
             app.submit_password(Some(pw));
@@ -1885,10 +1917,14 @@ fn password(app: &mut PdfCraftApp, ctx: &egui::Context) {
 
 /// Permissions password prompt: lifts the restrictions of an open document (#995).
 fn unlock(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    if app.unlock_prompt.is_none() {
+        return;
+    }
+    let front = app.front_prompt() == Some(crate::PromptLayer::Unlock);
     let Some(prompt) = app.unlock_prompt.as_mut() else { return };
     let message =
         crate::i18n::fmt(tl!("“{name}” has security restrictions. Enter its permissions password to lift them."), &[("name", &prompt.name)]);
-    match password_modal(ctx, "unlock", tl!("Permissions password"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Unlock")) {
+    match password_modal(ctx, "unlock", tl!("Permissions password"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Unlock"), front) {
         Some(PasswordAnswer::Submit) => {
             let pw = prompt.input.clone();
             app.submit_unlock(Some(pw));

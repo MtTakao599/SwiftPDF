@@ -482,6 +482,8 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, f
     let mut edit = None;
     let mut close = false;
     let mut next: Option<bool> = None; // Tab / Shift+Tab
+    // A prompt in front owns the keys. Losing focus to it does not commit the field.
+    let page_keys = !view.objects.input_blocked();
     match f.kind {
         FormFieldKind::Text => {
             let multiline = f.has(field_flags::MULTILINE);
@@ -540,11 +542,12 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, f
                 }
                 let (enter, esc, tab, shift) = ui
                     .input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Tab), i.modifiers.shift));
-                if esc {
+                if page_keys && esc {
                     close = true;
-                } else if tab {
+                } else if page_keys && tab {
                     next = Some(!shift);
-                } else if r.lost_focus()
+                } else if page_keys
+                    && r.lost_focus()
                     && (!multiline || !enter)
                     && !fx.calendar_rect.is_some_and(|c| ui.input(|i| i.pointer.interact_pos().is_some_and(|p| c.contains(p))))
                 {
@@ -591,31 +594,35 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, f
                 && !resp.response.contains_pointer()
                 && !ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| rect.contains(p));
             let (tab, shift) = ctx.input(|i| (i.key_pressed(egui::Key::Tab), i.modifiers.shift));
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if page_keys && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close = true;
-            } else if tab {
+            } else if page_keys && tab {
                 next = Some(!shift);
-            } else if clicked_away {
+            } else if page_keys && clicked_away {
                 commit(view, form);
                 close = true;
             }
         }
         FormFieldKind::List => {
-            let (up, down, esc, tab, shift) = ctx.input_mut(|i| {
-                (
-                    // Consumed, so the arrows move the selection without also scrolling the page.
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::Tab),
-                    i.modifiers.shift,
-                )
-            });
-            if esc {
+            let (up, down, esc, tab, shift) = if page_keys {
+                ctx.input_mut(|i| {
+                    (
+                        // Consumed, so the arrows move the selection without also scrolling the page.
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Escape),
+                        i.key_pressed(egui::Key::Tab),
+                        i.modifiers.shift,
+                    )
+                })
+            } else {
+                (false, false, false, false, false)
+            };
+            if page_keys && esc {
                 close = true;
-            } else if tab {
+            } else if page_keys && tab {
                 next = Some(!shift);
-            } else if (up || down) && !f.options.is_empty() {
+            } else if page_keys && (up || down) && !f.options.is_empty() {
                 let current_idx = f.value.last().and_then(|v| f.options.iter().position(|(e, _)| e == v)).unwrap_or(0);
                 let next_idx = if up { current_idx.saturating_sub(1) } else { (current_idx + 1).min(f.options.len().saturating_sub(1)) };
                 if next_idx != current_idx && next_idx < f.options.len() {
@@ -624,7 +631,7 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, f
                 }
             }
             let clicked_away = ctx.input(|i| i.pointer.any_click()) && !ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| rect.contains(p));
-            if clicked_away {
+            if page_keys && clicked_away {
                 close = true;
             }
         }

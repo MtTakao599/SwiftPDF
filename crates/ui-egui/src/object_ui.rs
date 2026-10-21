@@ -49,6 +49,12 @@ impl ObjectSelection {
         }
     }
 
+    /// A dialog, another prompt, the palette, or a window that is not the active one owns the
+    /// page. Editors underneath must not take Escape or treat the focus change as a commit.
+    pub(crate) fn input_blocked(&self) -> bool {
+        self.input_blocked
+    }
+
     fn clear(&mut self) {
         self.page = None;
         self.selected.clear();

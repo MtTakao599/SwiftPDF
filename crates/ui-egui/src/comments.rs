@@ -718,7 +718,7 @@ pub(crate) fn page_input(ui: &egui::Ui, resp: &egui::Response, cx: &PageCx<'_>, 
     let draw_grab = draw_grabs(ui, cx, view);
     let caret_text = if cx.tool == QuickTool::Comment(CommentTool::Caret) { view.page_text(cx.page) } else { None };
     let cv = &mut view.comments;
-    if cv.gesture.is_some() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+    if cv.gesture.is_some() && !view.objects.input_blocked() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         cv.gesture = None;
         cv.cancelled_drag = true;
         return true;
@@ -1368,6 +1368,8 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
         redact_mark: ([0.89, 0.13, 0.13], 1.0),
     };
     let anchor = cx.to_screen(c.at);
+    // A prompt in front owns Escape and the post shortcut. The composer must not consume them.
+    let page_keys = !view.objects.input_blocked();
     let t = Tokens::get(ctx);
     let mut post = false;
     let mut cancel = false;
@@ -1401,8 +1403,8 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
                 edit.request_focus();
                 c.focus = false;
             }
-            let enter = submit_key(ui, &edit, false);
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            let enter = page_keys && submit_key(ui, &edit, false);
+            if page_keys && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 cancel = true;
             }
             ui.add_space(8.0);
@@ -1580,7 +1582,7 @@ pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool
     if !ctx.input(|i| i.pointer.any_down()) {
         view.comments.cancelled_drag = false;
     }
-    if ctx.egui_wants_keyboard_input() {
+    if view.objects.input_blocked() || ctx.egui_wants_keyboard_input() {
         return;
     }
     let cv = &mut view.comments;

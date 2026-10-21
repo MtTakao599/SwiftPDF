@@ -706,6 +706,7 @@ pub(crate) fn type_box(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
     let zoom = xf.rect.width() / xf.pw.max(1.0);
     let mut commit = false;
     let mut cancel = false;
+    let page_keys = !view.objects.input_blocked();
     egui::Area::new(egui::Id::new(("fill-text", view.id.0))).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
         let Some(t) = view.fill_text.as_mut() else { return };
         // The box is white in every theme, so the caret must not follow the theme (pale in dark mode) (#655).
@@ -727,9 +728,9 @@ pub(crate) fn type_box(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
             r.request_focus();
             t.focus = false;
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if page_keys && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
-        } else if r.lost_focus() {
+        } else if page_keys && r.lost_focus() {
             commit = true;
         }
     });

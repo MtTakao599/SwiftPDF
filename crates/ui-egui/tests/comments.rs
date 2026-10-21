@@ -1444,3 +1444,30 @@ fn text_box_properties_change_the_font_size() {
     assert_eq!(doc.comment_props(0, 0).unwrap().font_size, Some(30.0));
     assert_eq!(doc.can_undo(), Some("Change comment properties"));
 }
+
+/// Preferences owns Escape. The note composer keeps its text and does not post.
+#[test]
+fn a_front_prompt_keeps_a_comment_draft() {
+    let mut h = harness(|app| app.set_option("quick", "note").unwrap());
+    click_pt(&mut h, (250.0, 180.0));
+    h.run_steps(2);
+    assert!(h.state().views[0].comments.composer.is_some(), "the note composer opened");
+    h.event(egui::Event::Text("Leave this note".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().views[0].comments.composer.as_ref().unwrap().text, "Leave this note");
+    let n = comments(&h).len();
+    let id = h.state().views[0].id;
+    let undo = h.state().session.get(id).unwrap().can_undo().map(str::to_owned);
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::Preferences);
+    h.run_steps(3);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "escape closes preferences");
+    assert_eq!(h.state().views[0].comments.composer.as_ref().map(|c| c.text.as_str()), Some("Leave this note"));
+    assert_eq!(comments(&h).len(), n, "escape did not post the note");
+    assert_eq!(h.state().session.get(id).unwrap().can_undo().map(str::to_owned), undo);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().views[0].comments.composer.is_none(), "with no prompt, escape still cancels the note");
+    assert_eq!(comments(&h).len(), n);
+}

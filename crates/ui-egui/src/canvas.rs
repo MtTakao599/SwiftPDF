@@ -1994,6 +1994,14 @@ fn annotation_hover_text(a: &pdfcraft_render::Annotation) -> Option<String> {
     Some(if body.is_empty() { who } else { format!("{who}\n{body}") })
 }
 
+/// The scroll offset that puts `point` (content coordinates) at `rel` in the viewport, kept within
+/// the content as egui keeps it. egui clamps only after drawing, so an offset past the end showed
+/// the page misplaced for a frame and then jumped (zooming out beside a page that fits).
+fn anchored_scroll(point: Pos2, rel: Vec2, content: Vec2, viewport: Vec2) -> Vec2 {
+    let max = vec2((content.x - viewport.x).max(0.0), (content.y - viewport.y).max(0.0));
+    vec2((point.x - rel.x).clamp(0.0, max.x), (point.y - rel.y).clamp(0.0, max.y))
+}
+
 /// The request tag for a raster at `scale`: equal tags mean the same scale (to 1/65536).
 fn scale_tag(scale: f32) -> u64 {
     (f64::from(scale) * 65536.0).round() as u64
@@ -2579,7 +2587,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some((page, fx, fy, rel)) = view.zoom_anchor.take() {
         let r = rects[page.min(rects.len() - 1)];
         let point = pos2(r.left() + fx * r.width(), r.top() - y_shift + fy * r.height());
-        scroll = scroll.scroll_offset(vec2((point.x - rel.x).max(0.0), (point.y - rel.y).max(0.0)));
+        scroll = scroll.scroll_offset(anchored_scroll(point, rel, vec2(content_w, content_h), avail.size()));
     } else if edge_turned {
         // The row above was laid out for the page before the turn: place the new one next frame.
         ui.ctx().request_repaint();
@@ -3814,8 +3822,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     }
     let stamp_ui =
         matches!(app.quick_tool, QuickTool::CustomStamp(_) | QuickTool::ChairmanSeal(_) | QuickTool::DateStamp(_)) || view.stamp_place.is_some();
-    let (typed, text_done) =
-        crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, !matches!(app.dialog, Some(crate::Dialog::Print)) && !stamp_ui);
+    // A prompt in front is not a click away, so opening it must not commit the draft. The stamp
+    // bar is not a prompt, but placing a stamp must not commit the text draft either.
+    let commit_on_focus_loss = !view.objects.input_blocked() && !stamp_ui;
+    let (typed, text_done) = crate::content_ui::editor(ui.ctx(), view, info, &added, place_text, commit_on_focus_loss);
     if typed.is_some() {
         view.pending_edit = typed;
     }
@@ -5206,6 +5216,239 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn zoom_anchor_scroll_stays_within_the_content() {
+        let (content, viewport) = (vec2(1000.0, 2000.0), vec2(800.0, 600.0));
+        // Past the end: clamped to the maximum (200, 1400), not left for egui to snap back.
+        assert_eq!(anchored_scroll(pos2(900.0, 1900.0), vec2(0.0, 0.0), content, viewport), vec2(200.0, 1400.0));
+        // Before the start.
+        assert_eq!(anchored_scroll(pos2(10.0, 10.0), vec2(300.0, 300.0), content, viewport), Vec2::ZERO);
+        // Inside: unchanged.
+        assert_eq!(anchored_scroll(pos2(150.0, 800.0), vec2(100.0, 100.0), content, viewport), vec2(50.0, 700.0));
+        // Content smaller than the viewport: no scrolling.
+        assert_eq!(anchored_scroll(pos2(400.0, 400.0), Vec2::ZERO, vec2(500.0, 500.0), viewport), vec2(0.0, 0.0));
+    }
+
+    fn synthetic_page(width: f32, height: f32, rotation: u16) -> pdfcraft_render::PageInfo {
+        pdfcraft_render::PageInfo { width, height, label: String::new(), crop: [0.0, 0.0, width, height], rotation }
+    }
+
+    fn synthetic_info(pages: Vec<pdfcraft_render::PageInfo>) -> DocInfo {
+        DocInfo { pages, ..Default::default() }
+    }
+
+    /// Scroll content for the same rules `document_area` uses when it applies a zoom anchor.
+    fn content_span(view: &DocView, rects: &[Rect]) -> (f32, f32) {
+        if view.continuous {
+            let height = rects.iter().map(|r| r.bottom()).reduce(f32::max).map(|bottom| bottom + MARGIN).unwrap_or(0.0);
+            return (0.0, height);
+        }
+        let last = rects.len().saturating_sub(1);
+        let cur = view.current.min(last);
+        let row: Vec<usize> = match view.layout {
+            PageLayout::Single => vec![cur],
+            PageLayout::TwoUp if view.cover && cur == 0 => vec![0],
+            PageLayout::TwoUp => {
+                let first = if view.cover { cur - (cur + 1) % 2 } else { cur - cur % 2 };
+                if first < last { vec![first, first + 1] } else { vec![first] }
+            }
+        };
+        match row.iter().filter_map(|&i| rects.get(i)).copied().reduce(Rect::union) {
+            Some(r) => (r.top() - MARGIN, r.height() + 2.0 * MARGIN),
+            None => (0.0, 0.0),
+        }
+    }
+
+    struct AnchorPlace {
+        scroll: Vec2,
+        point: Pos2,
+        limit: Vec2,
+        page: Rect,
+        y_shift: f32,
+    }
+
+    fn anchor_place(view: &DocView, info: &DocInfo, avail: Vec2, page: usize, fx: f32, fy: f32, rel: Vec2) -> Option<AnchorPlace> {
+        let content_w = view.content_width(info, avail.x);
+        let rects = view.layout(info, content_w);
+        let page_rect = rects.get(page).copied()?;
+        let (y_shift, content_h) = content_span(view, &rects);
+        let point = pos2(page_rect.left() + fx * page_rect.width(), page_rect.top() - y_shift + fy * page_rect.height());
+        let content = vec2(content_w, content_h);
+        Some(AnchorPlace {
+            scroll: anchored_scroll(point, rel, content, avail),
+            point,
+            limit: vec2((content.x - avail.x).max(0.0), (content.y - avail.y).max(0.0)),
+            page: page_rect,
+            y_shift,
+        })
+    }
+
+    fn within(scroll: Vec2, limit: Vec2) -> bool {
+        (0.0..=limit.x).contains(&scroll.x) && (0.0..=limit.y).contains(&scroll.y)
+    }
+
+    fn user_at(info: &pdfcraft_render::PageInfo, rect: Rect, rot: u16, p: Pos2) -> [f32; 2] {
+        let xf = PageXform { rect, rot, pw: info.width.max(1.0), ph: info.height.max(1.0) };
+        let (vx, vy) = xf.screen_to_view(p);
+        info.view_to_user(vx, vy)
+    }
+
+    #[test]
+    fn zooming_out_keeps_the_point_and_stops_at_both_ends() {
+        let info = synthetic_info(vec![synthetic_page(400.0, 600.0, 0)]);
+        let avail = vec2(800.0, 600.0);
+        let mut view = DocView::new(DocId(1), &info, ViewDefaults { continuous: true, zoom: 2.0, ..Default::default() });
+        view.fit = Fit::None;
+        // Centre, top and bottom of the page, each with the pointer near that part of the window.
+        for (fy, rel_y) in [(0.5, 300.0), (0.02, 40.0), (0.95, 30.0)] {
+            let here = anchor_place(&view, &info, avail, 0, 0.5, fy, vec2(400.0, rel_y)).expect("page");
+            assert!(within(here.scroll, here.limit), "fy {fy}: {:?}", here.scroll);
+            let again = anchor_place(&view, &info, avail, 0, 0.5, fy, vec2(400.0, rel_y)).expect("page");
+            assert_eq!(again.scroll, here.scroll, "repeating the same zoom does not walk the offset");
+            let ideal = here.point.to_vec2() - vec2(400.0, rel_y);
+            if (0.0..=here.limit.x).contains(&ideal.x) && (0.0..=here.limit.y).contains(&ideal.y) {
+                assert_eq!(here.scroll, ideal, "an anchor inside the range stays under the pointer");
+            } else {
+                assert!(here.scroll.y == here.limit.y || here.scroll.y == 0.0, "a bottom or top anchor stops on the end");
+            }
+        }
+        // Zoomed out until the page is smaller than the window: a bottom anchor used to ask for a
+        // positive offset, which egui drew once and then snapped back to zero.
+        view.zoom = 0.5;
+        let shrunk = anchor_place(&view, &info, avail, 0, 0.5, 0.95, vec2(400.0, 30.0)).expect("page");
+        assert_eq!(shrunk.limit, Vec2::ZERO, "the page fits, so there is nothing to scroll");
+        assert_eq!(shrunk.scroll, Vec2::ZERO);
+        // Back in, then out, from the position the first zoom actually showed.
+        view.zoom = 2.0;
+        let close = anchor_place(&view, &info, avail, 0, 0.5, 0.5, vec2(400.0, 300.0)).expect("page");
+        view.zoom = 1.0;
+        let mid = anchor_place(&view, &info, avail, 0, 0.5, 0.5, close.point.to_vec2() - close.scroll).expect("page");
+        view.zoom = 2.0;
+        let back = anchor_place(&view, &info, avail, 0, 0.5, 0.5, mid.point.to_vec2() - mid.scroll).expect("page");
+        assert!((back.scroll - close.scroll).length() < 0.05, "in and out returns to the same offset: {:?} vs {:?}", back.scroll, close.scroll);
+    }
+
+    #[test]
+    fn zoom_anchor_holds_across_pages_rotation_and_the_pointer() {
+        let avail = vec2(900.0, 700.0);
+        for rotation in [0, 90, 180, 270] {
+            let info = synthetic_info(vec![synthetic_page(500.0, 700.0, rotation), synthetic_page(500.0, 700.0, rotation)]);
+            let mut view = DocView::new(DocId(1), &info, ViewDefaults { continuous: true, zoom: 1.6, ..Default::default() });
+            view.fit = Fit::None;
+            view.viewport_screen = Rect::from_min_size(Pos2::ZERO, avail);
+            let rects = view.layout(&info, view.content_width(&info, avail.x));
+            view.screen_rects = rects.iter().enumerate().map(|(i, r)| (i, *r)).collect();
+            // The gap between the two pages, and a point near the bottom of the second page.
+            let gap = pos2(rects[0].center().x, (rects[0].bottom() + rects[1].top()) / 2.0);
+            let bottom = pos2(rects[1].center().x, rects[1].bottom() - 8.0);
+            for pointer in [gap, bottom, rects[0].center()] {
+                view.zoom = 1.6;
+                view.zoom_at(0.4, pointer);
+                let (page, fx, fy, rel) = view.zoom_anchor.expect("the pointer anchors a page");
+                let placed = anchor_place(&view, &info, avail, page, fx, fy, rel).expect("page");
+                assert!(within(placed.scroll, placed.limit), "rotation {rotation} at {pointer:?}");
+                let shown = placed.page.translate(vec2(0.0, -placed.y_shift) - placed.scroll);
+                let before = user_at(&info.pages[page], rects[page], view.rotation, pointer);
+                let after = user_at(&info.pages[page], shown, view.rotation, pointer);
+                let ideal = placed.point.to_vec2() - rel;
+                if (0.0..=placed.limit.x).contains(&ideal.x) && (0.0..=placed.limit.y).contains(&ideal.y) {
+                    assert!(
+                        (before[0] - after[0]).abs() < 0.05 && (before[1] - after[1]).abs() < 0.05,
+                        "rotation {rotation}: the PDF point under the pointer stays"
+                    );
+                }
+                // The document point named by the fraction does not move when the scroll stops early.
+                let fraction_at = shown.min + vec2(fx * shown.width(), fy * shown.height());
+                let named = user_at(&info.pages[page], shown, view.rotation, fraction_at);
+                let named_before = user_at(
+                    &info.pages[page],
+                    rects[page],
+                    view.rotation,
+                    rects[page].min + vec2(fx * rects[page].width(), fy * rects[page].height()),
+                );
+                assert!((named[0] - named_before[0]).abs() < 0.05 && (named[1] - named_before[1]).abs() < 0.05, "rotation {rotation}");
+            }
+        }
+        // View rotation swaps the laid-out page. The pointer's PDF point still agrees when the
+        // anchor fits, at 100% and at 200% display density: the scroll stays in points.
+        for (view_rotation, ppp) in [(90u16, 1.0), (180, 1.25), (270, 1.5), (0, 2.0)] {
+            let info = synthetic_info(vec![synthetic_page(420.0, 640.0, 0)]);
+            let mut view = DocView::new(DocId(1), &info, ViewDefaults { continuous: false, zoom: 2.0, ..Default::default() });
+            view.rotation = view_rotation;
+            view.fit = Fit::None;
+            view.current = 0;
+            view.viewport_w = avail.x;
+            view.viewport_h = avail.y;
+            let rects = view.layout(&info, view.content_width(&info, avail.x));
+            view.viewport_screen = Rect::from_min_size(Pos2::ZERO, avail);
+            view.screen_rects = rects.iter().enumerate().map(|(i, r)| (i, *r)).collect();
+            let pointer = rects[0].center();
+            view.zoom_at(0.8, pointer);
+            let (page, fx, fy, rel) = view.zoom_anchor.expect("centre anchor");
+            let placed = anchor_place(&view, &info, avail, page, fx, fy, rel).expect("page");
+            assert!(within(placed.scroll, placed.limit));
+            assert!((view.render_scale(ppp) - view.zoom * PT * ppp).abs() < 1.0e-4, "density {ppp} scales the raster, not the scroll");
+            let shown = placed.page.translate(vec2(0.0, -placed.y_shift) - placed.scroll);
+            let before = user_at(&info.pages[0], rects[0], view_rotation, pointer);
+            let after = user_at(&info.pages[0], shown, view_rotation, pointer);
+            let ideal = placed.point.to_vec2() - rel;
+            if (0.0..=placed.limit.x).contains(&ideal.x) && (0.0..=placed.limit.y).contains(&ideal.y) {
+                assert!((before[0] - after[0]).abs() < 0.05 && (before[1] - after[1]).abs() < 0.05, "view rotation {view_rotation}");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_commands_anchor_the_centre_and_fit_stays_in_range() {
+        let info = synthetic_info(vec![synthetic_page(300.0, 500.0, 0), synthetic_page(300.0, 500.0, 0)]);
+        let avail = vec2(800.0, 600.0);
+        let mut view = DocView::new(DocId(2), &info, ViewDefaults { continuous: true, zoom: 1.0, ..Default::default() });
+        view.fit = Fit::None;
+        view.viewport_w = avail.x;
+        view.viewport_h = avail.y;
+        view.viewport_screen = Rect::from_min_size(pos2(12.0, 24.0), avail);
+        let rects = view.layout(&info, view.content_width(&info, avail.x));
+        view.screen_rects = rects.iter().enumerate().map(|(i, r)| (i, r.translate(view.viewport_screen.min.to_vec2()))).collect();
+        view.set_zoom(crate::zoom_menu::zoom_from_percent(crate::zoom_menu::parse_percent("150%").expect("percent")));
+        assert!((view.zoom - 1.5).abs() < 1.0e-4);
+        let (page, fx, fy, rel) = view.zoom_anchor.expect("a typed zoom anchors the centre");
+        assert!((rel - avail / 2.0).length() < 1.0, "the anchor is the centre of the viewport");
+        let placed = anchor_place(&view, &info, avail, page, fx, fy, rel).expect("page");
+        assert!(within(placed.scroll, placed.limit));
+
+        view.zoom_step(true);
+        view.zoom_step(false);
+        view.set_zoom(80.0);
+        assert_eq!(view.zoom, 64.0, "the maximum zoom");
+        assert!(view.zoom_anchor.is_some());
+        let stuck = view.zoom;
+        view.zoom_step(true);
+        assert_eq!(view.zoom, stuck, "zoom in at the maximum stays");
+        view.set_zoom(0.01);
+        assert_eq!(view.zoom, 0.08, "the minimum zoom");
+        view.zoom_step(false);
+        assert_eq!(view.zoom, 0.08, "zoom out at the minimum stays");
+
+        view.set_fit(Fit::Width);
+        assert_eq!(view.goto, Some((0, 0.0)), "fit width aligns the current page");
+        view.fit_zoom(&info);
+        assert!(view.zoom.is_finite() && (0.08..=64.0).contains(&view.zoom));
+        view.set_fit(Fit::Page);
+        view.fit_zoom(&info);
+        assert!(view.zoom.is_finite() && (0.08..=64.0).contains(&view.zoom));
+        // A fit that is already on, when the window changes the zoom, anchors the top of the
+        // visible page. That offset still has to land inside the content.
+        view.fit = Fit::Width;
+        view.goto = None;
+        view.zoom_anchor = None;
+        let old = view.zoom;
+        view.viewport_w = 640.0;
+        view.fit_zoom(&info);
+        assert!((view.zoom - old).abs() > 1.0e-3);
+        let placed = anchor_place(&view, &info, vec2(640.0, avail.y), 0, 0.5, 0.0, vec2(320.0, MARGIN)).expect("page");
+        assert!(within(placed.scroll, placed.limit));
+    }
 
     /// A rotated (landscape) page is drawn as wide as the cell allows and centred in the picture
     /// area, as Acrobat draws it, not as a small strip pinned to the top; a portrait page still

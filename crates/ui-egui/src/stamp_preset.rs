@@ -1363,7 +1363,7 @@ mod tests {
         {
             app.set_seal_store(dir.join("seals.bin"));
             app.start_chairman_seal("seal.png".into(), png);
-            app.save_custom_stamp();
+            app.accept_stamp_registration();
             app.views[0].stamp_place = None;
             app.quick_tool = crate::QuickTool::ChairmanSeal(0);
             app.begin_stamp_place(0, 0, [30.0, 30.0], 0).unwrap();

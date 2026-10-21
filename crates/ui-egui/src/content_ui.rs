@@ -582,7 +582,7 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform,
 
 /// Delete removes the selected item; Escape clears the selection.
 pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView) {
-    if view.content.selected.is_none() || view.content.draft.is_some() || ctx.egui_wants_keyboard_input() {
+    if view.objects.input_blocked() || view.content.selected.is_none() || view.content.draft.is_some() || ctx.egui_wants_keyboard_input() {
         return;
     }
     let (del, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));
@@ -686,6 +686,9 @@ pub(crate) fn editor(
     let mut undrawable = None;
     let (mut start_grab, mut editor_size) = (None, view.content.editor_size);
     let dragging = view.content.draft_grab.is_some();
+    // Set for the frame before the editor borrows the draft. A prompt in front owns Escape, and
+    // the focus it takes is not a click away.
+    let page_keys = !view.objects.input_blocked();
     let memo = &view.content.undrawable;
     let margin = egui::vec2(DRAFT_FRAME, DRAFT_FRAME);
     let area = egui::Area::new(egui::Id::new(("added-text", view.id.0))).order(egui::Order::Foreground).fixed_pos(r.min - margin).constrain(false);
@@ -766,10 +769,10 @@ pub(crate) fn editor(
             let ime_composing = ui
                 .input(|i| i.events.iter().any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())));
             // Enter confirms an IME conversion or inserts a line. It is not a way to finish.
-            cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
-            // The print dialog takes focus. That is not a click away, so the draft stays
-            // uncommitted and printing it does not add an undo step.
-            let away = commit_on_focus_loss && resp.lost_focus() && !view.objects.hold_editor;
+            // Escape discards only while this editor has the page. A prompt in front keeps the draft.
+            cancel |= page_keys && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            // Focus leaving for a prompt, including Print, is not a click away.
+            let away = commit_on_focus_loss && page_keys && resp.lost_focus() && !view.objects.hold_editor;
             commit = confirms_text_entry(done, away, on_buttons || hold_focus, ime_composing);
         });
         // Page text is drawn with the standard fonts; anything else would be saved as `?` (#125).

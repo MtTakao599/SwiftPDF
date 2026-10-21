@@ -134,7 +134,7 @@ pub(crate) fn paint(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform, page
 
 /// Delete removes the selected link; Escape clears the selection.
 pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView) {
-    if view.links.selected.is_none() || ctx.egui_wants_keyboard_input() {
+    if view.objects.input_blocked() || view.links.selected.is_none() || ctx.egui_wants_keyboard_input() {
         return;
     }
     let (del, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));

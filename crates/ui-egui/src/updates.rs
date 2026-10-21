@@ -183,11 +183,12 @@ pub(crate) fn dialog(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         });
     });
-    if modal.should_close() {
+    let front = app.front_prompt() == Some(crate::PromptLayer::Updates);
+    if front && modal.should_close() {
         close = true;
         download = None;
     }
-    if close {
+    if front && close {
         app.updates.open = false;
         if let Some(url) = download {
             app.open_url(&url);

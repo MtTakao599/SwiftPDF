@@ -217,6 +217,82 @@ pub(crate) fn attachment_file_name(name: &str) -> String {
     if reserved { format!("_{name}") } else { name.to_string() }
 }
 
+/// Why `name` must not be joined onto a folder the user chose.
+///
+/// `None` means one file in that folder: no parent, no drive, no device name. Ambiguous names are
+/// refused. Callers that suggest a name ([`attachment_file_name`], [`file_stem_from_user`]) may
+/// still rewrite a suggestion; this check is what [`PdfCraftApp::write_files`] enforces.
+pub(crate) fn output_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("the name is empty");
+    }
+    // One path component, under the usual Windows limit, so a long name cannot be truncated into
+    // another file.
+    if name.len() > 255 {
+        return Some("the name is too long");
+    }
+    if name.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+        return Some("the name contains a control character");
+    }
+    if name == "." || name == ".." {
+        return Some("the name is not a single file inside the chosen folder");
+    }
+    if name.starts_with(char::is_whitespace) || name.ends_with([' ', '.']) {
+        return Some("the name begins or ends with a space or a period");
+    }
+    // Separators, drives (`C:`), UNC (`\\server`), device paths (`\\.\`) and alternate data
+    // streams (`name:stream`). `:` is refused on every platform: a stream name is not a file.
+    if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Some("the name is not a single file inside the chosen folder");
+    }
+    if reserved_output_device(name) {
+        return Some("the name is a reserved device name");
+    }
+    let path = std::path::Path::new(name);
+    let single = !path.is_absolute()
+        && path.parent().is_none_or(|parent| parent.as_os_str().is_empty())
+        && path.file_name().and_then(|file| file.to_str()) == Some(name);
+    if !single {
+        return Some("the name is not a single file inside the chosen folder");
+    }
+    None
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9` and `LPT1`–`LPT9`, with or without an extension.
+/// `COM10` is an ordinary name.
+fn reserved_output_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let device = stem.to_ascii_uppercase();
+    matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || device
+            .strip_prefix("COM")
+            .or_else(|| device.strip_prefix("LPT"))
+            .is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+}
+
+/// The key two output names share. Windows treats `File.txt` and `file.txt` as one file.
+fn output_name_key(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        name.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
+}
+
+/// `dest` is `dir` plus exactly `name`, with no `..` left in the joined path.
+fn output_stays_in_folder(dir: &std::path::Path, dest: &std::path::Path, name: &str) -> bool {
+    let Some(file_name) = dest.file_name().and_then(|file| file.to_str()) else {
+        return false;
+    };
+    if file_name != name {
+        return false;
+    }
+    dest.parent().is_some_and(|parent| parent.components().eq(dir.components()))
+}
+
 /// Pages ▸ Rotate Pages.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RotateDraft {
@@ -667,18 +743,26 @@ impl PdfCraftApp {
 
     /// [`Self::write_files`], then `after` once every file is written: now, or on a later frame
     /// when the user chooses the folder. `after` never runs when writing fails or is cancelled.
+    ///
+    /// Every name is checked before anything is written. A name that is not one file inside the
+    /// chosen folder, a repeated name, or a name that already exists (a file, directory, or link)
+    /// refuses the whole batch. Publishing uses [`pdfcraft_platform::save_path::write_new_file`],
+    /// which does not replace an existing name. If a later file fails, only the names this call
+    /// created are removed.
     pub(crate) fn write_files_then(&mut self, named: Vec<(String, Arc<Vec<u8>>)>, title: &str, after: impl FnOnce(&mut Self) + Send + 'static) {
         if self.refuse_output() {
+            return;
+        }
+        if let Some(message) = output_batch_error(&named) {
+            self.notify(message);
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let write = move |app: &mut Self, dir: std::path::PathBuf| {
-                for (name, bytes) in &named {
-                    if let Err(e) = crate::editing::write_atomically(&dir.join(name).to_string_lossy(), bytes) {
-                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e.to_string())]);
-                        return;
-                    }
+                if let Err(message) = publish_output_files(&dir, &named) {
+                    app.notify(message);
+                    return;
                 }
                 if named.len() == 1 {
                     app.notify_fmt("Wrote 1 file to {dir}", &[("dir", &dir.display().to_string())]);
@@ -800,6 +884,98 @@ impl PdfCraftApp {
             Err(e) => self.notify_fmt("Couldn't open the result: {e}", &[("e", &e.to_string())]),
         }
     }
+}
+
+/// A name in `named` that must not be written, or two names that would be the same file.
+fn output_batch_error(named: &[(String, Arc<Vec<u8>>)]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in named {
+        if let Some(why) = output_name_error(name) {
+            return Some(format!("Couldn't write {name}: {why}. Nothing was written."));
+        }
+        if !seen.insert(output_name_key(name)) {
+            return Some(format!("Couldn't write {name}: that name is listed more than once, so nothing was written."));
+        }
+    }
+    None
+}
+
+/// Write every file into `dir`, or write none of the final names.
+///
+/// Names are checked again at the joined path. An existing file, directory, symbolic link or
+/// broken link stops the batch before the first byte is published. A failure after that removes
+/// only the files this call created.
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_output_files(dir: &std::path::Path, named: &[(String, Arc<Vec<u8>>)]) -> Result<(), String> {
+    let mut planned = Vec::with_capacity(named.len());
+    for (name, _) in named {
+        let dest = dir.join(name);
+        if !output_stays_in_folder(dir, &dest, name) {
+            return Err(format!("Couldn't write {name}: the name is not a single file inside the chosen folder. Nothing was written."));
+        }
+        // `symlink_metadata` sees a link itself, including one whose target is missing, and a
+        // directory. Following it would write through the link.
+        if dest.symlink_metadata().is_ok() {
+            return Err(format!("Couldn't write {name}: something is already at that name, so nothing was written."));
+        }
+        planned.push(dest);
+    }
+    let mut published = Vec::new();
+    for ((name, bytes), dest) in named.iter().zip(planned) {
+        if let Err(error) = pdfcraft_platform::save_path::write_new_file(None, &dest, bytes) {
+            return Err(output_failure(name, &error.to_string(), &published));
+        }
+        published.push(dest);
+        if stop_output_batch_for_test(published.len()) {
+            return Err(output_failure(name, "the write was interrupted", &published));
+        }
+    }
+    Ok(())
+}
+
+/// Remove files this batch published. A path that is not removed is returned and left on disk.
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_published(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut left = Vec::new();
+    for path in paths {
+        if std::fs::remove_file(path).is_err() {
+            left.push(path.clone());
+        }
+    }
+    left
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn output_failure(name: &str, why: &str, published: &[std::path::PathBuf]) -> String {
+    let started = !published.is_empty();
+    let left = remove_published(published);
+    if !started {
+        format!("Couldn't write {name}: {why}. Nothing was written.")
+    } else if left.is_empty() {
+        format!("Couldn't write {name}: {why}. Files written earlier in this batch were removed.")
+    } else {
+        let list = left.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ");
+        format!("Couldn't write {name}: {why}. These new files could not be removed: {list}.")
+    }
+}
+
+/// Test hook: after this many files in one batch have been published, fail and roll them back.
+/// Production builds never stop a batch here.
+fn stop_output_batch_for_test(written: usize) -> bool {
+    #[cfg(test)]
+    {
+        FAIL_WRITE_FILES_AFTER.with(|cell| cell.get() == Some(written))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = written;
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_WRITE_FILES_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn strip_pdf(name: &str) -> &str {
@@ -999,7 +1175,7 @@ impl PdfCraftApp {
 
 #[cfg(test)]
 mod stem_tests {
-    use super::{attachment_file_name, file_stem_from_user};
+    use super::{attachment_file_name, file_stem_from_user, output_name_error};
 
     #[test]
     fn user_file_names_stay_inside_the_folder_and_writable_everywhere() {
@@ -1051,5 +1227,209 @@ mod stem_tests {
             let once = attachment_file_name(name);
             assert_eq!(attachment_file_name(&once), once);
         }
+    }
+
+    #[test]
+    fn output_names_are_one_file_in_the_chosen_folder() {
+        for name in ["report.pdf", "archive.tar.gz", "資料.pdf", "報告書.txt", "COM10.txt", "Console"] {
+            assert_eq!(output_name_error(name), None, "{name}");
+        }
+        let refused = [
+            ("../outside.txt", "not a single file"),
+            ("..\\outside.txt", "not a single file"),
+            ("C:\\outside.txt", "not a single file"),
+            ("C:outside.txt", "not a single file"),
+            ("\\\\server\\share\\file.txt", "not a single file"),
+            ("/tmp/outside.txt", "not a single file"),
+            ("file.txt:stream", "not a single file"),
+            ("\\\\.\\C:\\outside.txt", "not a single file"),
+            ("sub/x.pdf", "not a single file"),
+            (".", "not a single file"),
+            ("..", "not a single file"),
+            ("", "empty"),
+            ("CON.txt", "reserved device"),
+            ("nul", "reserved device"),
+            ("NUL", "reserved device"),
+            ("COM1", "reserved device"),
+            ("lpt9.pdf", "reserved device"),
+            ("file.txt ", "space or a period"),
+            ("file.txt.", "space or a period"),
+            (" file.txt", "space or a period"),
+            ("a\nb", "control character"),
+            ("a\u{202e}b.pdf", "control character"),
+        ];
+        for (name, why) in refused {
+            let error = output_name_error(name).unwrap_or("accepted");
+            assert!(error.contains(why), "{name} -> {error}");
+        }
+        assert!(output_name_error(&"a".repeat(256)).unwrap().contains("too long"));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod write_files_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use super::FAIL_WRITE_FILES_AFTER;
+    use crate::PdfCraftApp;
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-out-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        dir
+    }
+
+    fn app_to(out: &Path) -> PdfCraftApp {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.export_dir_override = Some(out.to_string_lossy().into_owned());
+        crate::output_policy::set_blocked(false);
+        app
+    }
+
+    fn bytes(text: &[u8]) -> Arc<Vec<u8>> {
+        Arc::new(text.to_vec())
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            out.push(entry.unwrap().file_name().to_string_lossy().into_owned());
+        }
+        out.sort();
+        out
+    }
+
+    struct ResetFail;
+    impl Drop for ResetFail {
+        fn drop(&mut self) {
+            FAIL_WRITE_FILES_AFTER.with(|cell| cell.set(None));
+        }
+    }
+
+    #[test]
+    fn a_plain_name_is_created_and_a_bad_name_writes_nothing() {
+        let root = scratch("plain");
+        let out = root.join("out");
+        let mut app = app_to(&out);
+        app.write_files(&[("資料.pdf".into(), bytes(b"ja")), ("report.txt".into(), bytes(b"ok"))], "t");
+        assert_eq!(std::fs::read(out.join("資料.pdf")).unwrap(), b"ja");
+        assert_eq!(std::fs::read(out.join("report.txt")).unwrap(), b"ok");
+        for bad in ["../outside.txt", r"..\outside.txt", r"C:\outside.txt", r"\\server\share\file.txt", "/tmp/outside.txt", "file.txt:stream"] {
+            app.write_files(&[("ok.txt".into(), bytes(b"no")), (bad.into(), bytes(b"no"))], "t");
+            let toast = app.toast.as_ref().map(|toast| toast.0.as_str()).unwrap_or("");
+            assert!(toast.contains("Nothing was written"), "{bad}: {toast}");
+            assert!(!out.join("ok.txt").exists(), "{bad}");
+            assert!(!root.join("outside.txt").exists(), "{bad}");
+        }
+        assert_eq!(names(&out), vec!["report.txt".to_string(), "資料.pdf".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_existing_file_directory_or_link_is_left_unchanged() {
+        let root = scratch("exists");
+        let out = root.join("out");
+        std::fs::write(out.join("kept.txt"), b"ORIGINAL").unwrap();
+        std::fs::create_dir(out.join("folder")).unwrap();
+        let mut perms = std::fs::metadata(out.join("kept.txt")).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(out.join("kept.txt"), perms).unwrap();
+        let mut app = app_to(&out);
+        app.write_files(&[("kept.txt".into(), bytes(b"NEW")), ("other.txt".into(), bytes(b"NEW"))], "t");
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("already at that name")));
+        assert_eq!(std::fs::read(out.join("kept.txt")).unwrap(), b"ORIGINAL");
+        assert!(!out.join("other.txt").exists());
+        app.write_files(&[("folder".into(), bytes(b"NEW"))], "t");
+        assert!(out.join("folder").is_dir());
+        assert!(std::fs::read(out.join("folder")).is_err());
+
+        let target = out.join("target.txt");
+        std::fs::write(&target, b"TARGET").unwrap();
+        let link = out.join("link.txt");
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(not(any(windows, unix)))]
+        let created: std::io::Result<()> = Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no symlink"));
+        if created.is_ok() {
+            app.write_files(&[("link.txt".into(), bytes(b"NEW"))], "t");
+            assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("already at that name")));
+            assert_eq!(std::fs::read(&target).unwrap(), b"TARGET");
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        }
+        // This process may not hold the symlink privilege. A junction is the link Windows can
+        // create without it, and it must not be replaced or followed.
+        #[cfg(windows)]
+        {
+            let room = out.join("room");
+            std::fs::create_dir(&room).unwrap();
+            std::fs::write(room.join("inside.txt"), b"INSIDE").unwrap();
+            let gate = out.join("gate");
+            let status = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&gate).arg(&room).status().unwrap();
+            assert!(status.success(), "junction: {status}");
+            app.write_files(&[("gate".into(), bytes(b"NEW"))], "t");
+            assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("already at that name")));
+            assert_eq!(std::fs::read(room.join("inside.txt")).unwrap(), b"INSIDE");
+            let kind = gate.symlink_metadata().unwrap().file_type();
+            assert!(kind.is_symlink() || kind.is_dir(), "the junction is still a link: {kind:?}");
+            let missing = out.join("missing-room");
+            let broken = out.join("broken-link");
+            let status = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&broken).arg(&missing).status().unwrap();
+            assert!(status.success(), "broken junction: {status}");
+            app.write_files(&[("broken-link".into(), bytes(b"NEW"))], "t");
+            assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("already at that name")));
+            assert!(!missing.exists());
+            assert!(broken.symlink_metadata().is_ok());
+        }
+        #[cfg(unix)]
+        {
+            let broken = out.join("broken.txt");
+            std::os::unix::fs::symlink(out.join("missing-target"), &broken).unwrap();
+            app.write_files(&[("broken.txt".into(), bytes(b"NEW"))], "t");
+            assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("already at that name")));
+            assert!(broken.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(std::fs::read(&broken).is_err());
+        }
+
+        let mut perms = std::fs::metadata(out.join("kept.txt")).unwrap().permissions();
+        // The file was marked read-only so the refusal could be checked. Clearing that is only
+        // so the temporary directory can be removed.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(out.join("kept.txt"), perms).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repeated_names_and_a_failed_later_file_leave_nothing_new() {
+        let _reset = ResetFail;
+        let root = scratch("batch");
+        let out = root.join("out");
+        let mut app = app_to(&out);
+        app.write_files(&[("a.txt".into(), bytes(b"1")), ("A.txt".into(), bytes(b"2"))], "t");
+        #[cfg(windows)]
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("more than once")));
+        #[cfg(windows)]
+        assert!(names(&out).is_empty());
+        #[cfg(not(windows))]
+        {
+            assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"1");
+            assert_eq!(std::fs::read(out.join("A.txt")).unwrap(), b"2");
+            let _ = std::fs::remove_file(out.join("a.txt"));
+            let _ = std::fs::remove_file(out.join("A.txt"));
+        }
+
+        FAIL_WRITE_FILES_AFTER.with(|cell| cell.set(Some(1)));
+        app.write_files(&[("first.txt".into(), bytes(b"1")), ("second.txt".into(), bytes(b"2"))], "t");
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.0.contains("were removed")));
+        assert!(names(&out).is_empty(), "{:?}", names(&out));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

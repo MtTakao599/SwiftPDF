@@ -1334,6 +1334,8 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
     let page = view.line_editor.as_ref()?.page;
     let xf = view.page_xform(page)?;
     let hold = view.objects.hold_editor;
+    // A prompt in front owns Escape and Enter. Focus leaving for it does not apply the paragraph.
+    let page_keys = !view.objects.input_blocked();
     // An OCR word is invisible text over a scan: the textless background still shows the scanned
     // word, so the editor covers it, as the applied edit will.
     let background_ready = view
@@ -1432,11 +1434,11 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
                     r.request_focus();
                     ed.focus = false;
                 }
-                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                let apply = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+                let esc = page_keys && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                let apply = page_keys && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
                 if esc {
                     done = Some(false);
-                } else if apply || (r.lost_focus() && !outside && !hold) {
+                } else if apply || (page_keys && r.lost_focus() && !outside && !hold) {
                     done = Some(true);
                 }
             });

@@ -630,3 +630,82 @@ fn released_text_does_not_jump_back_before_the_page_is_redrawn() {
     let (old, new) = ink_at(&mut h, from, to);
     assert!(new > 20 && old == 0, "the redrawn page has the text in its new place ({old} old, {new} new)");
 }
+
+fn type_added(h: &mut Harness<'static, PdfCraftApp>, text: &str) {
+    assert!(h.state_mut().execute("edit.text"));
+    h.run_steps(2);
+    click(h, at(h, 40.0, 80.0));
+    h.event(egui::Event::Text(text.into()));
+    h.run_steps(2);
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some(text));
+}
+
+fn undo_label(h: &Harness<'static, PdfCraftApp>) -> Option<String> {
+    let id = h.state().views[0].id;
+    h.state().session.get(id).unwrap().can_undo().map(str::to_owned)
+}
+
+/// A prompt in front owns Escape and the focus it takes. The added-text draft stays, and the
+/// document does not gain an undo step, until the prompt is gone.
+#[test]
+fn a_front_prompt_keeps_an_added_text_draft() {
+    let mut h = harness();
+    type_added(&mut h, "Keep me");
+    let before = undo_label(&h);
+
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::Preferences);
+    h.run_steps(3);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "escape closes preferences");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Keep me"));
+    assert_eq!(undo_label(&h), before, "closing preferences does not edit the document");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().views[0].content.draft.is_none(), "with no prompt, escape still discards the draft");
+    assert_eq!(undo_label(&h), before);
+
+    type_added(&mut h, "Still here");
+    let id = h.state().views[0].id;
+    h.state_mut().close_request = Some(pdfcraft_ui_egui::CloseRequest::Tab(id));
+    h.run_steps(3);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().close_request.is_none(), "escape cancels the save prompt");
+    assert_eq!(h.state().views.len(), 1, "cancelling the save prompt leaves the document open");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Still here"));
+    assert_eq!(undo_label(&h), before);
+
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::SealEffects);
+    h.run_steps(3);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "escape closes the seal effect window");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Still here"));
+    assert_eq!(undo_label(&h), before);
+
+    // Approval with nothing placed closes itself. That close must not discard the draft or stamp.
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::ConfirmSeal);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "approval without a placement closes itself");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Still here"));
+    assert_eq!(undo_label(&h), before, "closing approval did not write the document");
+
+    let id = h.state().views[0].id;
+    h.state_mut().unlock_prompt =
+        Some(pdfcraft_ui_egui::UnlockPrompt { doc: id, name: "form.pdf".into(), input: String::new(), error: None, then: None });
+    h.run_steps(4);
+    assert!(h.state().unlock_prompt.is_some(), "the permissions password stays up");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Still here"));
+    assert_eq!(undo_label(&h), before, "the password field taking focus does not commit the draft");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().unlock_prompt.is_none(), "escape cancels the permissions password");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Still here"));
+    assert_eq!(undo_label(&h), before);
+
+    h.get_by_label("Done adding text").click();
+    h.run_steps(3);
+    assert!(h.state().views[0].content.draft.is_none(), "Done still commits once no prompt is open");
+    assert!(undo_label(&h).is_some(), "committing the draft is an undo step");
+}

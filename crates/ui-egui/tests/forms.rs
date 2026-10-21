@@ -1008,3 +1008,29 @@ fn auto_size_fields_shrink_and_wrap_typed_text_to_fit_their_box() {
     // An explicit size is kept, as in Acrobat: the text may then run past the box.
     assert_eq!(on_screen_fit(&h, "fixed", long).0, 10.0);
 }
+
+/// Preferences owns Escape. The open field keeps its uncommitted text, and a later Escape
+/// still abandons it.
+#[test]
+fn a_front_prompt_keeps_a_form_draft() {
+    let mut h = harness();
+    click_field(&mut h, "city", 0);
+    h.event(egui::Event::Text("Paris".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().views[0].forms.focus.as_ref().map(|f| f.text.as_str()), Some("Paris"));
+    let id = h.state().views[0].id;
+    let undo = h.state().session.get(id).unwrap().can_undo().map(str::to_owned);
+    h.state_mut().dialog = Some(pdfcraft_ui_egui::Dialog::Preferences);
+    h.run_steps(3);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "escape closes preferences");
+    assert_eq!(h.state().views[0].forms.focus.as_ref().map(|f| f.text.as_str()), Some("Paris"));
+    assert!(value(&h, "city").is_empty(), "the field is not written into the PDF");
+    assert_eq!(h.state().session.get(id).unwrap().can_undo().map(str::to_owned), undo);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().views[0].forms.focus.is_none(), "with no prompt, escape still abandons the field");
+    assert!(value(&h, "city").is_empty());
+    assert_eq!(h.state().session.get(id).unwrap().can_undo().map(str::to_owned), undo);
+}

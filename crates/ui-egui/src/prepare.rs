@@ -584,7 +584,7 @@ fn cancel_marquee(prep: &mut PrepareView) {
 }
 
 pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView) {
-    if ctx.egui_wants_keyboard_input() {
+    if view.objects.input_blocked() || ctx.egui_wants_keyboard_input() {
         return;
     }
     if view.prepare.marquee_before.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
