@@ -156,6 +156,17 @@ impl ContentView {
     pub(crate) fn finish_draft(&mut self, added: &[Added]) -> Option<Edit> {
         self.draft.take().and_then(|d| finish(self, d, added))
     }
+
+    /// The edit the open draft would become. Empty new text is `None`.
+    pub(crate) fn pending_edit(&self, added: &[Added]) -> Option<Edit> {
+        self.draft.as_ref().and_then(|draft| draft_edit(draft, added))
+    }
+
+    /// Added text that is typed but not in the PDF yet. A blank new box is not work. Text the
+    /// current face cannot draw counts too, so closing still asks before it disappears.
+    pub(crate) fn has_unsaved_text(&self, added: &[Added]) -> bool {
+        self.blocked().is_some() || self.pending_edit(added).is_some()
+    }
     /// The draft's first character the standard fonts can't draw. Such a draft is kept open, and
     /// counts as unsaved work, until it is corrected or discarded.
     pub(crate) fn blocked(&self) -> Option<char> {
@@ -819,18 +830,24 @@ pub(crate) fn editor(
 /// A finished draft as an edit: new text is added (and selected once it exists), retyped text
 /// updated, and text emptied by retyping removed. Empty new text adds nothing.
 fn finish(cv: &mut ContentView, d: TextDraft, added: &[Added]) -> Option<Edit> {
+    let edit = draft_edit(&d, added)?;
+    if d.index.is_none() {
+        cv.select_added = Some((d.page, on_page(added, d.page).len()));
+    }
+    Some(edit)
+}
+
+/// The edit [`finish`] would apply, without taking the draft. Empty new text is not an edit.
+fn draft_edit(d: &TextDraft, added: &[Added]) -> Option<Edit> {
     let text = d.text.trim_end().to_string();
     match d.index {
         None if text.trim().is_empty() => None,
-        None => {
-            cv.select_added = Some((d.page, on_page(added, d.page).len()));
-            Some(Edit::AddText { page: d.page, text: AddedText { rect: d.rect, text, ..d.style } })
-        }
+        None => Some(Edit::AddText { page: d.page, text: AddedText { rect: d.rect, text, ..d.style.clone() } }),
         Some(i) if text.trim().is_empty() => Some(Edit::DeleteContent { page: d.page, index: i }),
         Some(i) => {
             let (_, a) = on_page(added, d.page).into_iter().find(|(k, _)| *k == i)?;
             let AddedContent::Text(old) = &a.content else { return None };
-            let updated = AddedText { text, rect: d.rect, ..d.style };
+            let updated = AddedText { text, rect: d.rect, ..d.style.clone() };
             (*old != updated).then_some(Edit::UpdateContent { page: d.page, index: i, content: AddedContent::Text(updated) })
         }
     }

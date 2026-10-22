@@ -1392,7 +1392,11 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         }
     }
     if save_copy_now && app.front_prompt() == Some(crate::PromptLayer::Dialog) {
-        let _ = app.confirm_save_copy();
+        // A draft that cannot be committed keeps the confirmation open. A refused destination
+        // still closes it: nothing was written, and the notice says why.
+        if !app.confirm_save_copy() && app.pending_save_copy.is_some() {
+            close = false;
+        }
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (overwrite_now, overwrite_elsewhere);

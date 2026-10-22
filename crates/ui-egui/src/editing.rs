@@ -36,6 +36,9 @@ pub struct SaveCopyRequest {
     /// The opened file, when it has a path. Empty when the document was opened from bytes.
     pub source_path: Option<String>,
     pub dest: String,
+    /// Close this request after the copy is written. Set when Save on the close prompt starts
+    /// a new-file save. Cancel leaves it unused, so the document stays open.
+    pub then_close: Option<CloseRequest>,
 }
 
 /// Where Save writes.
@@ -539,22 +542,17 @@ impl PdfCraftApp {
     /// panel answering later, Close All). If its tab has typing or a queued edit, the tab is
     /// brought forward first, so the commit and any field scripts act on that document.
     pub(crate) fn commit_typing_in(&mut self, id: pdfcraft_engine::DocId) -> bool {
-        let Some(i) = self.views.iter().position(|v| v.id == id) else { return true };
-        // Added text the standard fonts can't draw can't be saved: show it rather than drop it.
-        // Its page is brought into view, so the text, the warning and Discard are on screen.
-        let blocked = self.views.get_mut(i).and_then(|v| {
-            let c = v.content.blocked()?;
-            v.content.hold_blocked();
-            if let Some(page) = v.content.draft.as_ref().map(|d| d.page) {
-                v.go_to_page(page);
-            }
-            Some(c)
-        });
-        if let Some(c) = blocked {
-            self.active = Some(i);
-            self.notify(crate::content_ui::undrawable_message(c));
+        if self.views.iter().position(|v| v.id == id).is_none() {
+            return true;
+        }
+        // Added text the current face can't draw stays in the editor. Saving must not drop it.
+        if !self.hold_blocked_added_text(id) {
             return false;
         }
+        if !self.commit_open_added_text(id) {
+            return false;
+        }
+        let Some(i) = self.views.iter().position(|v| v.id == id) else { return true };
         let typing = self
             .views
             .get(i)
@@ -566,6 +564,51 @@ impl PdfCraftApp {
             self.active = Some(i);
         }
         self.commit_form_typing() && self.commit_open_fill_text(id)
+    }
+
+    /// Keep an undrawable added-text draft open and say why. Returns false when saving must stop.
+    fn hold_blocked_added_text(&mut self, id: pdfcraft_engine::DocId) -> bool {
+        let Some(i) = self.views.iter().position(|v| v.id == id) else { return true };
+        let blocked = self.views.get_mut(i).and_then(|v| {
+            let c = v.content.blocked()?;
+            v.content.hold_blocked();
+            if let Some(page) = v.content.draft.as_ref().map(|d| d.page) {
+                v.go_to_page(page);
+            }
+            Some(c)
+        });
+        if let Some(c) = blocked {
+            self.active = Some(i);
+            self.notify(crate::content_ui::undrawable_message(c));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Turn a drawable added-text draft into the same edit Done would apply. An empty new box
+    /// stays as it is. On failure the draft is put back and nothing is written.
+    fn commit_open_added_text(&mut self, id: pdfcraft_engine::DocId) -> bool {
+        let Some(i) = self.views.iter().position(|v| v.id == id) else { return true };
+        if self.views[i].content.draft.is_none() {
+            return true;
+        }
+        let added = self.session.get(id).map(|doc| doc.added().to_vec()).unwrap_or_default();
+        if self.views[i].content.pending_edit(&added).is_none() {
+            return true;
+        }
+        let draft = self.views[i].content.draft.clone();
+        if self.active != Some(i) {
+            self.active = Some(i);
+        }
+        let Some(edit) = self.views[i].content.finish_draft(&added) else { return true };
+        if self.apply_edit(edit) {
+            return true;
+        }
+        if let Some(view) = self.views.get_mut(i) {
+            view.content.draft = draft;
+        }
+        false
     }
 
     /// The Fill & Sign type box commits on click-away. Save does that first, so the text is in
@@ -614,16 +657,28 @@ impl PdfCraftApp {
         true
     }
 
-    /// Whether tab `index` has work that isn't saved: edits, or form typing not committed yet.
+    /// Whether tab `index` has work that isn't saved: edits, typed text, or form typing not committed yet.
     pub(crate) fn has_unsaved_work(&self, index: usize) -> bool {
         let Some(v) = self.views.get(index) else { return false };
         let Some(doc) = self.session.get(v.id) else { return false };
         doc.dirty
             || v.pending_edit.is_some()
-            || v.content.blocked().is_some()
+            || v.content.has_unsaved_text(doc.added())
             || v.forms.focus.as_ref().is_some_and(|f| crate::forms_ui::draft_edit(f, &doc.form).is_some())
             || v.fill_text.as_ref().is_some_and(|t| !t.text.trim().is_empty())
             || v.line_editor.as_ref().map_or_else(|| false, |ed| ed.has_unsaved_text())
+    }
+
+    /// View-only close saves a new file when the tab has committed edits or typed added text.
+    /// In-place save stays refused. A form or paragraph that is only typed, and not yet an edit,
+    /// keeps the existing save path.
+    fn close_uses_save_copy(&self, index: usize) -> bool {
+        if !self.save_copy_permitted() {
+            return false;
+        }
+        let Some(view) = self.views.get(index) else { return false };
+        let Some(doc) = self.session.get(view.id) else { return false };
+        doc.dirty || view.content.has_unsaved_text(doc.added())
     }
 
     /// Save the active document. Returns `true` if it was written.
@@ -886,6 +941,21 @@ impl PdfCraftApp {
         match choice {
             None => {} // cancelled: nothing closes
             Some(false) => self.close_and_continue(ctx, index, req),
+            Some(true) if self.close_uses_save_copy(index) => {
+                let Some(id) = self.views.get(index).map(|v| v.id) else { return };
+                self.active = Some(index);
+                // Undrawable text stays in the editor. The prompt stays too, so closing still asks.
+                if !self.hold_blocked_added_text(id) {
+                    self.close_request = Some(req);
+                    return;
+                }
+                // A new file, not the opened path. The tab closes only after that file is written.
+                self.close_after_copy = Some(req);
+                if !self.begin_save_copy() {
+                    self.close_after_copy = None;
+                    self.close_request = Some(req);
+                }
+            }
             Some(true) => {
                 let Some(id) = self.views.get(index).map(|v| v.id) else { return };
                 // Bring the document forward: what's typed in its form is committed and saved
@@ -969,33 +1039,48 @@ impl PdfCraftApp {
     }
 
     /// File ▸ Save as, while view-only: choose a new path, then confirm before anything is written.
-    pub fn begin_save_copy(&mut self) {
+    /// Returns whether a confirmation or a file dialog was started.
+    pub fn begin_save_copy(&mut self) -> bool {
         if !self.save_copy_permitted() {
             self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
-            return;
+            return false;
         }
         let Some((_, id)) = self.active_ids() else {
             self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
-            return;
+            return false;
         };
         let Some(doc) = self.session.get(id) else {
             self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
-            return;
+            return false;
         };
         let name = doc.name.clone();
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(dest) = self.save_override.clone() {
+                let then_close = self.close_after_copy.take();
                 self.offer_save_copy(id, dest);
-                return;
+                if let Some(pending) = self.pending_save_copy.as_mut() {
+                    pending.then_close = then_close;
+                    return true;
+                }
+                self.close_after_copy = then_close;
+                return false;
             }
             let file_name = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
             let dialog = rfd::AsyncFileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(file_name);
             // [`Ask::SaveCopy`], not [`Ask::Save`]: the output block stays on, and an ordinary
             // save panel is refused with the view-only notice before the dialog can open.
-            self.ask_one(crate::pickers::Ask::SaveCopy(dialog), None, move |app, dest| {
+            // Taken now, so cancelling the picker does not close the document on a later save.
+            let then_close = self.close_after_copy.take();
+            let started = self.ask_one(crate::pickers::Ask::SaveCopy(dialog), None, move |app, dest| {
                 app.offer_save_copy(id, dest.to_string_lossy().into_owned());
+                if let Some(pending) = app.pending_save_copy.as_mut() {
+                    pending.then_close = then_close;
+                }
             });
+            // A picker that does not start drops `then_close` with the callback. The caller
+            // still has the close request and puts the prompt back.
+            started
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1004,6 +1089,7 @@ impl PdfCraftApp {
                 "この版では、名前を付けて保存はデスクトップ版だけです。",
                 "Saving a copy is only available in the desktop app.",
             ));
+            false
         }
     }
 
@@ -1014,7 +1100,7 @@ impl PdfCraftApp {
             self.notify(crate::identity::localized("保存する前にPDFが閉じられました。", "The PDF was closed before it could be saved."));
             return;
         };
-        self.pending_save_copy = Some(SaveCopyRequest { id, source_name: doc.name.clone(), source_path: doc.path.clone(), dest });
+        self.pending_save_copy = Some(SaveCopyRequest { id, source_name: doc.name.clone(), source_path: doc.path.clone(), dest, then_close: None });
         self.dialog = Some(crate::Dialog::SaveCopy);
     }
 
@@ -1031,14 +1117,41 @@ impl PdfCraftApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let Some(request) = self.pending_save_copy.clone() else { return false };
+            // Undrawable text stays in the editor, and the confirmation stays open.
+            // A drawable draft is not applied to this document until the new file is written.
+            if !self.hold_blocked_added_text(request.id) {
+                return false;
+            }
             let Some(request) = self.pending_save_copy.take() else { return false };
-            self.write_save_copy(request)
+            let then_close = request.then_close;
+            let id = request.id;
+            let wrote = self.write_save_copy(request);
+            if wrote && self.commit_open_added_text(id) {
+                if self.session.note_saved_copy(id).is_err() {
+                    self.notify(crate::identity::localized(
+                        "保存したファイルは書き込めましたが、このタブの保存状態を記録できませんでした。",
+                        "The file was written, but this tab could not record that it matches the copy.",
+                    ));
+                }
+                if let Some(req) = then_close {
+                    self.close_saved_tab(id, req);
+                }
+            }
+            wrote
         }
     }
 
     /// The confirmation's Cancel, or the dialog being dismissed.
     pub fn cancel_save_copy(&mut self) {
         self.pending_save_copy = None;
+    }
+
+    /// Close the document a copy save just wrote, then continue a quit or close-all.
+    fn close_saved_tab(&mut self, id: pdfcraft_engine::DocId, req: CloseRequest) {
+        let Some(index) = self.views.iter().position(|view| view.id == id) else { return };
+        let ctx = self.ctx.clone().unwrap_or_default();
+        self.close_and_continue(&ctx, index, req);
     }
 
     /// Turn added-text placement on or off. View-only stays on. A restricted PDF is refused.
@@ -1075,6 +1188,86 @@ impl PdfCraftApp {
             && crate::output_policy::blocked()
     }
 
+    /// Bytes for a new file, including a typed added-text draft, without changing this document.
+    /// `Ok(None)` means there is no draft to fold in. `Err` means the draft could not be drawn
+    /// into a copy; the open draft is left as it is.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drafted_copy_bytes(&self, id: pdfcraft_engine::DocId) -> Result<Option<std::sync::Arc<Vec<u8>>>, String> {
+        let Some(index) = self.views.iter().position(|view| view.id == id) else { return Ok(None) };
+        let added = self.session.get(id).map(|doc| doc.added().to_vec()).unwrap_or_default();
+        let Some(edit) = self.views[index].content.pending_edit(&added) else { return Ok(None) };
+        let (name, password) = {
+            let Some(doc) = self.session.get(id) else { return Ok(None) };
+            (doc.name.clone(), doc.password.clone())
+        };
+        let base = if self.session.differs_from_opened(id) { self.session.save_edited_copy_bytes(id) } else { self.session.save_copy_bytes(id) };
+        let base = match base {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+                let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
+                return Err(crate::identity::localized(&ja, &en));
+            }
+        };
+        let mut copy = pdfcraft_engine::Session::new().with_view_only(true);
+        copy.grant(pdfcraft_engine::Capability::SaveAs);
+        copy.grant(pdfcraft_engine::Capability::EditText);
+        let copy_id = match copy.open(name, None, base, password.as_deref()) {
+            Ok(id) => id,
+            Err(error) => {
+                let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+                let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
+                return Err(crate::identity::localized(&ja, &en));
+            }
+        };
+        if let Err(error) = copy.apply(copy_id, edit) {
+            let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+            let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
+            return Err(crate::identity::localized(&ja, &en));
+        }
+        match copy.save_edited_copy_bytes(copy_id) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => {
+                let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+                let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
+                Err(crate::identity::localized(&ja, &en))
+            }
+        }
+    }
+
+    /// The opened file, or the committed added-text revision. Notifies and returns `None` on failure.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn opened_or_edited_copy_bytes(&mut self, id: pdfcraft_engine::DocId) -> Option<std::sync::Arc<Vec<u8>>> {
+        if self.session.differs_from_opened(id) {
+            match self.session.save_edited_copy_bytes(id) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
+                    let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
+                    self.notify(crate::identity::localized(&ja, &en));
+                    None
+                }
+            }
+        } else {
+            match self.session.save_copy_bytes(id) {
+                Ok(bytes) => Some(bytes),
+                Err(pdfcraft_engine::EditError::Invalid(_)) => {
+                    self.notify(crate::identity::localized(
+                        "開いたときの内容だけを保存できます。変更されたPDFは保存しません。",
+                        "Only the file as it was opened can be saved. This PDF has changes, so it was not saved.",
+                    ));
+                    None
+                }
+                Err(error) => {
+                    let ja = format!("保存できませんでした。{error}");
+                    let en = format!("Couldn't save the copy. {error}");
+                    self.notify(crate::identity::localized(&ja, &en));
+                    None
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn write_save_copy(&mut self, request: SaveCopyRequest) -> bool {
         if !self.save_copy_permitted() {
@@ -1088,32 +1281,15 @@ impl PdfCraftApp {
         let source_path = doc.path.clone().or(request.source_path.clone());
         let source_name = doc.name.clone();
         let original_before = source_path.as_deref().and_then(|path| std::fs::read(path).ok());
-        let bytes = if self.session.differs_from_opened(request.id) {
-            match self.session.save_edited_copy_bytes(request.id) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let ja = format!("編集したPDFを保存できませんでした。入力内容はそのままです。{error}");
-                    let en = format!("Couldn't save the edited PDF. The edits you made are still here. {error}");
-                    self.notify(crate::identity::localized(&ja, &en));
-                    return false;
-                }
+        let bytes = match self.drafted_copy_bytes(request.id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                let Some(bytes) = self.opened_or_edited_copy_bytes(request.id) else { return false };
+                bytes
             }
-        } else {
-            match self.session.save_copy_bytes(request.id) {
-                Ok(bytes) => bytes,
-                Err(pdfcraft_engine::EditError::Invalid(_)) => {
-                    self.notify(crate::identity::localized(
-                        "開いたときの内容だけを保存できます。変更されたPDFは保存しません。",
-                        "Only the file as it was opened can be saved. This PDF has changes, so it was not saved.",
-                    ));
-                    return false;
-                }
-                Err(error) => {
-                    let ja = format!("保存できませんでした。{error}");
-                    let en = format!("Couldn't save the copy. {error}");
-                    self.notify(crate::identity::localized(&ja, &en));
-                    return false;
-                }
+            Err(message) => {
+                self.notify(message);
+                return false;
             }
         };
         if let Err(error) = self.session.check_save(request.id, &bytes) {
@@ -1855,5 +2031,374 @@ mod content_page_tests {
         assert_eq!(content_page(&moved), Some(3));
         assert_eq!(content_page(&Edit::RotatePages { pages: vec![0], degrees: 90 }), None);
         assert_eq!(content_page(&Edit::SetInfo { key: "Title".into(), value: "x".into() }), None);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod unsaved_added_text_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    struct PolicyRestore((bool, bool, bool));
+
+    impl Drop for PolicyRestore {
+        fn drop(&mut self) {
+            crate::output_policy::set_blocked(self.0.0);
+            crate::output_policy::set_save_as_allowed(self.0.1);
+            crate::output_policy::set_print_allowed(self.0.2);
+        }
+    }
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("swiftpdf-unsaved-text-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn text_draft(text: &str) -> crate::content_ui::TextDraft {
+        crate::content_ui::TextDraft {
+            page: 0,
+            index: None,
+            rect: [40.0, 200.0, 260.0, 260.0],
+            text: text.to_string(),
+            style: pdfcraft_engine::AddedText { rect: [40.0, 200.0, 260.0, 260.0], size: 16.0, ..pdfcraft_engine::AddedText::default() },
+            focus: true,
+        }
+    }
+
+    fn approval(doc: pdfcraft_engine::DocId) -> crate::stamps_ui::SealApproval {
+        crate::stamps_ui::SealApproval { doc, page: 0, rect: [1.0, 2.0, 3.0, 4.0], opacity: 1.0, preview_gen: 7, sha256: [9; 32] }
+    }
+
+    fn blank_bytes() -> Vec<u8> {
+        let session = pdfcraft_engine::Session::new();
+        session.create_blank(300.0, 300.0, 1).expect("blank page").to_vec()
+    }
+
+    fn open_view_only(bytes: &[u8], path: &Path) -> PdfCraftApp {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.run_inline = true;
+        app.set_view_only(true);
+        app.grant_save_as();
+        app.grant_edit_text();
+        app.open_bytes("opened.pdf", Some(path.to_string_lossy().into_owned()), bytes.to_vec()).unwrap();
+        app
+    }
+
+    fn added_texts(app: &PdfCraftApp, id: pdfcraft_engine::DocId) -> Vec<String> {
+        app.session
+            .get(id)
+            .unwrap()
+            .added()
+            .iter()
+            .filter_map(|item| match &item.content {
+                pdfcraft_engine::AddedContent::Text(text) => Some(text.text.clone()),
+                pdfcraft_engine::AddedContent::Image(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quitting_asks_and_cancel_keeps_the_draft_without_extra_history() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("cancel");
+        let original = dir.join("opened.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        let id = app.views[0].id;
+        app.views[0].content.draft = Some(text_draft("Keep 世界"));
+        app.seal_approval = Some(approval(id));
+        app.active = None;
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        let ctx = egui::Context::default();
+        assert!(!app.request_quit(&ctx));
+        assert_eq!(app.close_request, Some(CloseRequest::Quit));
+        app.resolve_close(&ctx, None);
+        assert!(app.close_request.is_none());
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界");
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        assert_eq!(app.seal_approval.as_ref().map(|seal| seal.sha256), Some([9; 32]));
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        app.views[0].content.draft.as_mut().unwrap().text.push('!');
+        assert!(!app.request_quit(&ctx));
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界!");
+    }
+
+    #[test]
+    fn a_blank_draft_does_not_ask_before_close() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("blank");
+        let original = dir.join("opened.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        app.views[0].content.draft = Some(text_draft(" \n\t"));
+        let ctx = egui::Context::default();
+        assert!(app.request_quit(&ctx), "whitespace is not unsaved work");
+        assert!(app.close_request.is_none());
+        app.views[0].content.draft = Some(text_draft(""));
+        app.request_close_tab(0);
+        assert!(app.close_request.is_none());
+        assert!(app.views.is_empty());
+    }
+
+    #[test]
+    fn discard_closes_only_the_tab_that_was_asked_about() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("discard");
+        let bytes = blank_bytes();
+        let first_path = dir.join("first.pdf");
+        let second_path = dir.join("second.pdf");
+        std::fs::write(&first_path, &bytes).unwrap();
+        std::fs::write(&second_path, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &first_path);
+        let first = app.views[0].id;
+        app.views[0].content.draft = Some(text_draft("first draft"));
+        app.seal_approval = Some(approval(first));
+        app.open_bytes("second.pdf", Some(second_path.to_string_lossy().into_owned()), bytes.clone()).unwrap();
+        let second = app.views[1].id;
+        app.views[1].content.draft = Some(text_draft("second draft"));
+        app.active = Some(0);
+        app.request_close_tab(1);
+        assert_eq!(app.close_request, Some(CloseRequest::Tab(second)));
+        let ctx = egui::Context::default();
+        app.resolve_close(&ctx, None);
+        assert_eq!(app.views.len(), 2);
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "first draft");
+        assert_eq!(app.views[1].content.draft.as_ref().unwrap().text, "second draft");
+        assert_eq!(app.seal_approval.as_ref().map(|seal| seal.sha256), Some([9; 32]));
+        app.request_close_tab(1);
+        app.resolve_close(&ctx, Some(false));
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].id, first);
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "first draft");
+        assert_eq!(app.seal_approval.as_ref().map(|seal| (seal.doc, seal.sha256)), Some((first, [9; 32])));
+        assert!(app.session.get(second).is_none());
+    }
+
+    #[test]
+    fn save_writes_the_draft_into_a_new_pdf_and_leaves_the_original() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let probe = pdfcraft_engine::AddedText {
+            text: "Keep 世界".into(),
+            rect: [40.0, 200.0, 260.0, 260.0],
+            size: 16.0,
+            ..pdfcraft_engine::AddedText::default()
+        };
+        assert!(pdfcraft_engine::first_undrawable(&probe).is_none(), "embedded Japanese faces must draw this draft");
+        let dir = Dir::new("save");
+        let original = dir.join("opened.pdf");
+        let other_path = dir.join("other.pdf");
+        let dest = dir.join("noted.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        std::fs::write(&other_path, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        let id = app.views[0].id;
+        app.open_bytes("other.pdf", Some(other_path.to_string_lossy().into_owned()), bytes.clone()).unwrap();
+        let other = app.views[1].id;
+        app.views[0].content.draft = Some(text_draft("Keep 世界"));
+        app.views[1].content.draft = Some(text_draft("other tab"));
+        app.seal_approval = Some(approval(other));
+        app.active = Some(1);
+        assert!(!app.execute("file.save"));
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界");
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        app.save_override = Some(dest.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        let ctx = egui::Context::default();
+        app.resolve_close(&ctx, Some(true));
+        assert!(matches!(app.dialog, Some(crate::Dialog::SaveCopy)));
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界", "choosing Save does not commit before confirmation");
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        app.cancel_save_copy();
+        app.dialog = None;
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界");
+        assert_eq!(app.views[1].content.draft.as_ref().unwrap().text, "other tab");
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        assert!(!dest.exists());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(app.confirm_save_copy());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(std::fs::read(&other_path).unwrap(), bytes);
+        assert!(app.views.iter().all(|view| view.id != id), "the saved tab closes");
+        assert_eq!(
+            app.views.iter().find(|view| view.id == other).and_then(|view| view.content.draft.as_ref()).map(|draft| draft.text.as_str()),
+            Some("other tab")
+        );
+        assert_eq!(app.seal_approval.as_ref().map(|seal| (seal.doc, seal.sha256)), Some((other, [9; 32])));
+        let saved = std::fs::read(&dest).unwrap();
+        let mut again = pdfcraft_engine::Session::new();
+        let copy = again.open("noted.pdf", None, std::sync::Arc::new(saved), None).unwrap();
+        let shown = again
+            .get(copy)
+            .unwrap()
+            .added()
+            .iter()
+            .filter_map(|item| match &item.content {
+                pdfcraft_engine::AddedContent::Text(text) => Some(text.text.clone()),
+                pdfcraft_engine::AddedContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec!["Keep 世界".to_string()]);
+    }
+
+    #[test]
+    fn an_existing_destination_keeps_the_text_and_does_not_overwrite() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("taken");
+        let original = dir.join("opened.pdf");
+        let taken = dir.join("taken.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        std::fs::write(&taken, b"KEEP").unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        let id = app.views[0].id;
+        app.views[0].content.draft = Some(text_draft("Keep 世界"));
+        app.seal_approval = Some(approval(id));
+        app.save_override = Some(taken.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        let ctx = egui::Context::default();
+        app.resolve_close(&ctx, Some(true));
+        assert!(!app.confirm_save_copy(), "an existing destination is not overwritten");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"KEEP");
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(added_texts(&app, id).is_empty(), "a refused save does not commit the draft");
+        assert_eq!(app.views[0].content.draft.as_ref().unwrap().text, "Keep 世界");
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        assert!(app.views.iter().any(|view| view.id == id), "a refused save does not close the document");
+        assert_eq!(app.seal_approval.as_ref().map(|seal| seal.sha256), Some([9; 32]));
+        app.dialog = None;
+        let dest = dir.join("noted.pdf");
+        app.save_override = Some(dest.to_string_lossy().into_owned());
+        assert!(app.execute("file.save_as"));
+        assert!(app.confirm_save_copy(), "a later new name can still be saved");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"KEEP");
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        let saved = std::fs::read(&dest).unwrap();
+        let mut again = pdfcraft_engine::Session::new();
+        let copy = again.open("noted.pdf", None, std::sync::Arc::new(saved), None).unwrap();
+        let shown = again
+            .get(copy)
+            .unwrap()
+            .added()
+            .iter()
+            .filter_map(|item| match &item.content {
+                pdfcraft_engine::AddedContent::Text(text) => Some(text.text.clone()),
+                pdfcraft_engine::AddedContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec!["Keep 世界".to_string()]);
+        assert!(app.session.get(id).unwrap().can_undo().is_some());
+        assert!(app.views[0].content.draft.is_none());
+        assert!(!app.session.get(id).unwrap().dirty);
+    }
+
+    #[test]
+    fn a_committed_edit_closes_through_a_new_file_and_not_the_original() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("committed");
+        let original = dir.join("opened.pdf");
+        let same = dir.join("opened.pdf");
+        let dest = dir.join("noted.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        let id = app.views[0].id;
+        assert!(app.apply_edit(pdfcraft_engine::Edit::AddText {
+            page: 0,
+            text: pdfcraft_engine::AddedText {
+                rect: [40.0, 200.0, 260.0, 260.0],
+                text: "Committed 世界".into(),
+                size: 16.0,
+                ..pdfcraft_engine::AddedText::default()
+            },
+        }));
+        let generation = app.session.get(id).unwrap().edit_generation();
+        assert!(app.session.get(id).unwrap().dirty);
+        assert!(app.session.get(id).unwrap().can_undo().is_some());
+        assert!(!app.execute("file.save"));
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(app.session.get(id).unwrap().edit_generation(), generation);
+        let ctx = egui::Context::default();
+        assert!(!app.request_quit(&ctx));
+        assert_eq!(app.close_request, Some(CloseRequest::Quit));
+        app.request_close_tab(0);
+        assert!(app.close_request.is_some());
+        assert!(app.dialog.is_none(), "one close question is open, not a second dialog");
+        app.resolve_close(&ctx, None);
+        assert_eq!(app.session.get(id).unwrap().edit_generation(), generation);
+        assert_eq!(added_texts(&app, id), vec!["Committed 世界".to_string()]);
+        app.save_override = Some(same.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(matches!(app.dialog, Some(crate::Dialog::SaveCopy)));
+        assert!(app.close_request.is_none());
+        assert!(!app.confirm_save_copy(), "the original path is not a destination");
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(app.session.get(id).unwrap().edit_generation(), generation);
+        assert!(app.views.iter().any(|view| view.id == id));
+        app.dialog = None;
+        app.save_override = Some(dest.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(app.confirm_save_copy());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(app.views.iter().all(|view| view.id != id));
+        let saved = std::fs::read(&dest).unwrap();
+        let mut again = pdfcraft_engine::Session::new();
+        let copy = again.open("noted.pdf", None, std::sync::Arc::new(saved), None).unwrap();
+        let shown = again
+            .get(copy)
+            .unwrap()
+            .added()
+            .iter()
+            .filter_map(|item| match &item.content {
+                pdfcraft_engine::AddedContent::Text(text) => Some(text.text.clone()),
+                pdfcraft_engine::AddedContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec!["Committed 世界".to_string()]);
+    }
+
+    #[test]
+    fn a_clean_document_quits_without_a_save_prompt() {
+        let _policy =
+            PolicyRestore((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        let dir = Dir::new("clean");
+        let original = dir.join("opened.pdf");
+        let bytes = blank_bytes();
+        std::fs::write(&original, &bytes).unwrap();
+        let mut app = open_view_only(&bytes, &original);
+        let ctx = egui::Context::default();
+        assert!(app.request_quit(&ctx));
+        assert!(app.close_request.is_none());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
     }
 }

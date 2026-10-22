@@ -696,6 +696,9 @@ pub struct PdfCraftApp {
     pub host_dirty: Option<HostDirtyFn>,
     /// A pending "save changes?" question (closing a dirty tab or quitting).
     pub close_request: Option<CloseRequest>,
+    /// Close this after a view-only copy of uncommitted added text is written.
+    /// Moved onto [`editing::SaveCopyRequest`] once a destination is chosen.
+    pub(crate) close_after_copy: Option<CloseRequest>,
     /// A save waiting behind [`Dialog::OverwriteChanged`] (the web build has no files to check).
     #[cfg(not(target_arch = "wasm32"))]
     pub pending_overwrite: Option<editing::PendingOverwrite>,
@@ -1082,6 +1085,7 @@ impl PdfCraftApp {
             host_save: None,
             host_dirty: None,
             close_request: None,
+            close_after_copy: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_overwrite: None,
             pending_save_copy: None,
