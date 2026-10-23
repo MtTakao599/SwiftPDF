@@ -110,10 +110,18 @@ pub fn pages(doc: &Document) -> Result<Vec<PageRef>, OrganizeError> {
 }
 
 /// Effective inherited page rotation, clockwise in degrees.
+///
+/// A direct integer, an indirect reference, and a value inherited from a parent `/Pages` node
+/// all count. A missing or non-numeric value is 0.
 pub fn page_rotation(doc: &Document, index: usize) -> Result<i64, OrganizeError> {
     let pages = walk(doc)?;
     let (_, attrs) = pages.get(index).ok_or(OrganizeError::NoSuchPage(index))?;
-    Ok(attrs.int(b"Rotate").unwrap_or(0).rem_euclid(360))
+    Ok(resolved_rotation(doc, attrs).rem_euclid(360))
+}
+
+/// `/Rotate` on `attrs`, following one indirect reference. The referenced object is not changed.
+fn resolved_rotation(doc: &Document, attrs: &Dict) -> i64 {
+    attrs.get(b"Rotate").and_then(|value| doc.resolve(value).as_int()).unwrap_or(0)
 }
 
 pub fn page_count(doc: &Document) -> Result<usize, OrganizeError> {
@@ -192,6 +200,11 @@ fn check(indices: &[usize], n: usize) -> Result<(), OrganizeError> {
 }
 
 /// Rotate pages by a multiple of 90° (positive = clockwise), adjusting `/Rotate` (§7.7.3.3).
+///
+/// Each page is turned once, even when `indices` names it again. An out-of-range index is
+/// refused before any page is changed. The current angle is the page's own `/Rotate` when it
+/// has one, otherwise the inherited value, and either may be an indirect number. The result is
+/// written on that page as a direct integer, so a shared angle object is left as it was.
 pub fn rotate_pages(doc: &mut Document, indices: &[usize], degrees: i64) -> Result<(), OrganizeError> {
     if degrees % 90 != 0 {
         return Err(OrganizeError::Invalid("rotation must be a multiple of 90 degrees".into()));
@@ -199,11 +212,23 @@ pub fn rotate_pages(doc: &mut Document, indices: &[usize], degrees: i64) -> Resu
     let all = walk(doc)?;
     check(indices, all.len())?;
     let delta = degrees.rem_euclid(360);
+    let mut seen = vec![false; all.len()];
+    let mut planned = Vec::new();
     for &i in indices {
-        let (page, inherited) = &all[i];
-        let current = doc.get(*page).as_dict().and_then(|d| d.int(b"Rotate")).or_else(|| inherited.int(b"Rotate")).unwrap_or(0);
+        let Some(slot) = seen.get_mut(i) else { continue };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        let Some((page, inherited)) = all.get(i) else { continue };
+        let live = doc.get(*page);
+        let source = live.as_dict().filter(|dict| dict.get(b"Rotate").is_some()).unwrap_or(inherited);
+        let current = resolved_rotation(doc, source);
         let new = (current.rem_euclid(360) + delta).rem_euclid(360);
-        doc.update_dict(*page, |d| d.set(b"Rotate".to_vec(), Object::Int(new)))?;
+        planned.push((*page, new));
+    }
+    for (page, new) in planned {
+        doc.update_dict(page, |d| d.set(b"Rotate".to_vec(), Object::Int(new)))?;
     }
     Ok(())
 }

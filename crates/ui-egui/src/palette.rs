@@ -57,7 +57,9 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
             continue;
         }
         let label = pdfcraft_engine::commands::current_label(spec, &app.session, active);
-        let translated = if app.session.view_only() && spec.id == "help.about" {
+        let translated = if let Some(name) = crate::commands::page_rotate_menu_label(spec.id) {
+            name
+        } else if app.session.view_only() && spec.id == "help.about" {
             crate::identity::localized("SwiftPDF について", "About SwiftPDF")
         } else {
             crate::i18n::command_label(&label)

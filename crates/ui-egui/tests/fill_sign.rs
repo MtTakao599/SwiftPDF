@@ -13,6 +13,33 @@ const FIXTURE: &[u8] = b"%PDF-1.7
 trailer << /Root 1 0 R >>
 %%EOF";
 
+/// `body` with a cross-reference table in place of its bare trailer, written for the objects it
+/// already has. Page rotation refuses a file whose cross-references had to be rebuilt.
+fn with_xref(body: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(body).unwrap();
+    let objects = &text[..text.rfind("trailer").unwrap()];
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut at = 0;
+    for line in objects.split_inclusive('\n') {
+        if let Some((num, rest)) = line.split_once(' ')
+            && rest.starts_with("0 obj")
+        {
+            offsets.insert(num.parse::<u32>().unwrap(), at);
+        }
+        at += line.len();
+    }
+    let size = offsets.keys().max().unwrap() + 1;
+    let mut out = format!("{objects}xref\n0 {size}\n0000000000 65535 f \n");
+    for num in 1..size {
+        match offsets.get(&num) {
+            Some(off) => out += &format!("{off:010} 00000 n \n"),
+            None => out += "0000000000 65535 f \n",
+        }
+    }
+    out += &format!("trailer << /Size {size} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", objects.len());
+    out.into_bytes()
+}
+
 /// Tests that render pixels (`h.render()`) take this first, so only one wgpu device compiles
 /// shaders at a time: WARP's ARM64 pixel-shader JIT crashes when two do (see `tests/view.rs`).
 /// Declared before the harness, so it is released after the device is dropped.
@@ -522,7 +549,7 @@ fn image_signature_preview_follows_pointer_at_page_size_with_zoom_and_rotation()
     // The block above the stroke is at its right end, away from the pointer's own cursor.
     let path = signature_file_with_mark("pointer", 100..110);
     let image = pdfcraft_engine::SignatureImage::read(std::fs::File::open(&path).unwrap()).unwrap();
-    let mut h = harness();
+    let mut h = harness_bytes(&with_xref(FIXTURE));
     // A link under the placement point must not replace the image with a hand cursor.
     h.state_mut().apply_edit(pdfcraft_engine::Edit::AddLink {
         page: 0,

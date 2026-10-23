@@ -2644,3 +2644,10 @@ certificate	Key usage	Utilizzo chiave
 certificate	Self-signed	Autofirmato
 certificate	SHA-1 digest	Impronta SHA-1
 certificate	SHA-256 digest	Impronta SHA-256
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Ruota la vista di 90° in senso orario (non viene salvata nel PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Ruota la vista di 90° in senso orario (non viene salvata nel PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Ruota la vista di 90° in senso antiorario (non viene salvata nel PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Ruota la vista di 90° in senso antiorario (non viene salvata nel PDF)
+	Rotate current page clockwise 90°	Ruota la pagina corrente di 90° in senso orario
+	Rotate current page counterclockwise 90°	Ruota la pagina corrente di 90° in senso antiorario
+	Turns the current page by 90°. You can save the result as a new PDF.	Ruota la pagina corrente di 90°. Il risultato si può salvare in un nuovo PDF.

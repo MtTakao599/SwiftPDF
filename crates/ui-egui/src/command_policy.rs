@@ -116,6 +116,15 @@ impl PdfCraftApp {
         if id == "comment.stamp" && self.session.allows(pdfcraft_engine::Capability::Stamp) {
             return true;
         }
+        // Current-page rotation. Not on the reading list. The engine still refuses every other
+        // page edit, and refuses this one when the open file is signed or its permissions say no.
+        if matches!(id, "page.rotate" | "page.rotate_ccw") && self.session.allows(pdfcraft_engine::Capability::PageRotate) {
+            return true;
+        }
+        // Undo and redo of a page rotation, as well as added text or a session stamp.
+        if matches!(id, "edit.undo" | "edit.redo") && self.session.allows(pdfcraft_engine::Capability::PageRotate) {
+            return true;
+        }
         // Printing. It is not on the reading list: it runs only when [`pdfcraft_engine::Capability::Print`]
         // was granted, and the output block stays on for every other file.
         if id == "print.dialog" && self.session.allows(pdfcraft_engine::Capability::Print) && crate::output_policy::print_allowed() {

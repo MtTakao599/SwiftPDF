@@ -1870,4 +1870,58 @@ mod tests {
         assert_ne!(row_bytes(&bottom_rgba, side, 0.62, 0.86), row_bytes(&bottom_heavy, side, 0.62, 0.86));
         assert_eq!(row_bytes(&bottom_rgba, side, 0.18, 0.38), row_bytes(&bottom_heavy, side, 0.18, 0.38));
     }
+
+    #[test]
+    fn a_date_stamp_stays_on_its_page_when_that_page_is_rotated() {
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-date-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = crate::PdfCraftApp::new();
+        let original = app.session.create_blank(200.0, 300.0, 1).unwrap();
+        let original_path = dir.join("opened.pdf");
+        std::fs::write(&original_path, original.as_ref()).unwrap();
+        use sha2::Digest;
+        let original_sha = sha2::Sha256::digest(original.as_ref());
+        app.open_bytes("opened.pdf", Some(original_path.to_string_lossy().into_owned()), original.to_vec()).unwrap();
+        app.set_view_only(true);
+        app.grant_stamp();
+        app.start_date_stamp("date.png".into(), gray_png());
+        app.save_date_stamp();
+        app.dialog = None;
+        app.quick_tool = crate::QuickTool::DateStamp(0);
+        app.begin_stamp_place(0, 0, [100.0, 80.0], 0).unwrap();
+        app.commit_stamp_place();
+        assert_eq!(stamp_count(&app), 1, "{:?}", app.toast);
+        assert!(app.seal_store.library.history.is_empty(), "a date stamp is not a chairman approval");
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        app.session.grant(pdfcraft_engine::Capability::SaveAs);
+        assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        let id = app.views[0].id;
+        let doc = app.session.get(id).unwrap();
+        assert_eq!(doc.info.pages[0].rotation, 90);
+        assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
+        assert!(page_has_ink(&doc.bytes, 0), "the date stamp is still drawn after rotation");
+        assert!(app.seal_store.library.history.is_empty());
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        assert_eq!(sha2::Sha256::digest(std::fs::read(&original_path).unwrap()), original_sha);
+        let mut again = crate::PdfCraftApp::new();
+        again.open_bytes("copy.pdf", None, saved.to_vec()).unwrap();
+        let copy = again.session.get(again.views[0].id).unwrap();
+        assert_eq!(copy.info.pages[0].rotation, 90);
+        assert_eq!(copy.info.annotations.iter().filter(|a| a.subtype == "Stamp").count(), 1);
+        assert!(page_has_ink(&copy.bytes, 0), "reopening the copy still draws the date stamp");
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert_eq!(app.session.get(id).unwrap().info.pages[0].rotation, 0);
+        assert_eq!(stamp_count(&app), 1, "undoing the rotation leaves the date stamp");
+        assert!(page_has_ink(&app.session.get(id).unwrap().bytes, 0), "undoing the rotation keeps the date stamp visible");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn page_has_ink(bytes: &[u8], page: usize) -> bool {
+        let mut renderer = pdfcraft_render::PageRenderer::new(std::sync::Arc::new(bytes.to_vec()), Default::default());
+        let shot = renderer.render(pdfcraft_render::RenderRequest { page, scale: 2.0, ..Default::default() });
+        assert!(shot.error.is_none(), "{:?}", shot.error);
+        shot.rgba.chunks_exact(4).any(|px| px[0] < 230 || px[1] < 230 || px[2] < 230)
+    }
 }

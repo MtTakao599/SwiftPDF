@@ -2408,3 +2408,10 @@ animation effects	Off	Wyłączone
 	Make properties default	Ustaw właściwości jako domyślne
 	Pages selected	Zaznaczone strony
 	Page properties	Właściwości strony
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Obróć widok o 90° w prawo (nie zapisuje się w PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Obróć widok o 90° w prawo (nie zapisuje się w PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Obróć widok o 90° w lewo (nie zapisuje się w PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Obróć widok o 90° w lewo (nie zapisuje się w PDF)
+	Rotate current page clockwise 90°	Obróć bieżącą stronę o 90° w prawo
+	Rotate current page counterclockwise 90°	Obróć bieżącą stronę o 90° w lewo
+	Turns the current page by 90°. You can save the result as a new PDF.	Obraca bieżącą stronę o 90°. Wynik można zapisać jako nowy PDF.

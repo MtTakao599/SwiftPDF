@@ -2433,3 +2433,10 @@ animation effects	Off	Aus
 	Make properties default	Eigenschaften als Standard festlegen
 	Pages selected	Ausgewählte Seiten
 	Page properties	Seiteneigenschaften
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Ansicht um 90° im Uhrzeigersinn drehen (wird nicht in der PDF gespeichert) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Ansicht um 90° im Uhrzeigersinn drehen (wird nicht in der PDF gespeichert)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Ansicht um 90° gegen den Uhrzeigersinn drehen (wird nicht in der PDF gespeichert) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Ansicht um 90° gegen den Uhrzeigersinn drehen (wird nicht in der PDF gespeichert)
+	Rotate current page clockwise 90°	Aktuelle Seite um 90° im Uhrzeigersinn drehen
+	Rotate current page counterclockwise 90°	Aktuelle Seite um 90° gegen den Uhrzeigersinn drehen
+	Turns the current page by 90°. You can save the result as a new PDF.	Dreht die aktuelle Seite um 90°. Das Ergebnis lässt sich als neues PDF speichern.

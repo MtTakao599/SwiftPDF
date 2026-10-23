@@ -2685,3 +2685,10 @@ key	Space	Space
 # Historical snapshot notice bar (View signed version / View revision).
 	You are viewing the signed version of “{from}” (revision {rev}). It is a snapshot: changes here won't affect the original.	Bạn đang xem phiên bản đã ký của “{from}” (bản sửa đổi {rev}). Đây là ảnh nhanh: các thay đổi ở đây không được áp dụng đến bản gốc.
 	You are viewing revision {rev} of “{from}”. It is a snapshot: changes here won't affect the original.	Bạn đang xem bản sửa đổi {rev} của “{from}”. Đây là ảnh nhanh: các thay đổi ở đây không được áp dụng đến bản gốc.
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Xoay chế độ xem 90° theo chiều kim đồng hồ (không lưu vào PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Xoay chế độ xem 90° theo chiều kim đồng hồ (không lưu vào PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Xoay chế độ xem 90° ngược chiều kim đồng hồ (không lưu vào PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Xoay chế độ xem 90° ngược chiều kim đồng hồ (không lưu vào PDF)
+	Rotate current page clockwise 90°	Xoay trang hiện tại 90° theo chiều kim đồng hồ
+	Rotate current page counterclockwise 90°	Xoay trang hiện tại 90° ngược chiều kim đồng hồ
+	Turns the current page by 90°. You can save the result as a new PDF.	Xoay trang hiện tại 90°. Có thể lưu kết quả vào một PDF mới.

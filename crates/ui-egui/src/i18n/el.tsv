@@ -2438,3 +2438,10 @@ animation effects	Off	Ανενεργά
 	Make properties default	Ορισμός ιδιοτήτων ως προεπιλογή
 	Pages selected	Επιλεγμένες σελίδες
 	Page properties	Ιδιότητες σελίδας
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Περιστροφή προβολής 90° δεξιόστροφα (δεν αποθηκεύεται στο PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Περιστροφή προβολής 90° δεξιόστροφα (δεν αποθηκεύεται στο PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Περιστροφή προβολής 90° αριστερόστροφα (δεν αποθηκεύεται στο PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Περιστροφή προβολής 90° αριστερόστροφα (δεν αποθηκεύεται στο PDF)
+	Rotate current page clockwise 90°	Περιστροφή της τρέχουσας σελίδας 90° δεξιόστροφα
+	Rotate current page counterclockwise 90°	Περιστροφή της τρέχουσας σελίδας 90° αριστερόστροφα
+	Turns the current page by 90°. You can save the result as a new PDF.	Περιστρέφει την τρέχουσα σελίδα κατά 90°. Το αποτέλεσμα μπορεί να αποθηκευτεί σε νέο PDF.

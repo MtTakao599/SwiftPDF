@@ -746,10 +746,16 @@ fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 if widgets::menu_item(ui, tl!("Zoom out"), &key(ZOOM_OUT)).clicked() {
                     v.zoom_step(false);
                 }
-                if widgets::menu_item(ui, tl!("Rotate view clockwise"), &key(ROTATE_CW)).clicked() {
+                if widgets::menu_item(ui, tl!("Rotate view clockwise"), &key(ROTATE_CW))
+                    .on_hover_text(crate::commands::view_rotate_tip(true, None))
+                    .clicked()
+                {
                     v.rotate_view(true);
                 }
-                if widgets::menu_item(ui, tl!("Rotate view counterclockwise"), &key(ROTATE_CCW)).clicked() {
+                if widgets::menu_item(ui, tl!("Rotate view counterclockwise"), &key(ROTATE_CCW))
+                    .on_hover_text(crate::commands::view_rotate_tip(false, None))
+                    .clicked()
+                {
                     v.rotate_view(false);
                 }
                 ui.separator();
@@ -859,7 +865,8 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         rail_view_menu(ui, view)
                     })
                     .and_then(|r| r.inner);
-                let tip = crate::commands::key_tip(ui.ctx(), tl!("Rotate view clockwise ({key})"), crate::commands::ROTATE_CW);
+                let key = crate::commands::shortcut_label(ui.ctx(), crate::commands::ROTATE_CW);
+                let tip = crate::commands::view_rotate_tip(true, Some(&key));
                 if icons::button(ui, "rotate-cw", 32.0, false, &tip).clicked() {
                     view.rotate_view(true);
                 }

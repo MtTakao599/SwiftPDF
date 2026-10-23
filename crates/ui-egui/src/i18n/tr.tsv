@@ -2428,3 +2428,10 @@ animation effects	Off	Kapalı
 	Make properties default	Özellikleri varsayılan yap
 	Pages selected	Seçilen sayfalar
 	Page properties	Sayfa özellikleri
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Görünümü saat yönünde 90° döndür (PDF'e kaydedilmez) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Görünümü saat yönünde 90° döndür (PDF'e kaydedilmez)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Görünümü saat yönünün tersine 90° döndür (PDF'e kaydedilmez) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Görünümü saat yönünün tersine 90° döndür (PDF'e kaydedilmez)
+	Rotate current page clockwise 90°	Geçerli sayfayı saat yönünde 90° döndür
+	Rotate current page counterclockwise 90°	Geçerli sayfayı saat yönünün tersine 90° döndür
+	Turns the current page by 90°. You can save the result as a new PDF.	Geçerli sayfayı 90° döndürür. Sonucu yeni bir PDF olarak kaydedebilirsiniz.

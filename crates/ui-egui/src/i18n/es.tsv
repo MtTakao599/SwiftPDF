@@ -2572,3 +2572,10 @@ animation effects	Off	Desactivados
 # Historical snapshot notice bar (View signed version / View revision).
 	You are viewing the signed version of “{from}” (revision {rev}). It is a snapshot: changes here won't affect the original.	Estás viendo la versión firmada de «{from}» (revisión {rev}). Es una instantánea: los cambios aquí no afectarán al original.
 	You are viewing revision {rev} of “{from}”. It is a snapshot: changes here won't affect the original.	Estás viendo la revisión {rev} de «{from}». Es una instantánea: los cambios aquí no afectarán al original.
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Girar la vista 90° a la derecha (no se guarda en el PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Girar la vista 90° a la derecha (no se guarda en el PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Girar la vista 90° a la izquierda (no se guarda en el PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Girar la vista 90° a la izquierda (no se guarda en el PDF)
+	Rotate current page clockwise 90°	Girar esta página 90° a la derecha
+	Rotate current page counterclockwise 90°	Girar esta página 90° a la izquierda
+	Turns the current page by 90°. You can save the result as a new PDF.	Gira esta página 90°. El resultado se puede guardar en un PDF nuevo.

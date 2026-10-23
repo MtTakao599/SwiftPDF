@@ -30,6 +30,7 @@ pub mod ocr;
 pub mod optimizer;
 pub mod print_raster;
 pub mod printcheck;
+mod rotate_guard;
 mod scan_colours;
 mod scan_fields;
 pub mod signature_image;
@@ -39,6 +40,26 @@ mod text_preview;
 mod upright_image;
 mod view_only;
 pub use view_only::Capability;
+
+/// Whether the open document may have its current page rotated into the PDF.
+/// This is not a cryptographic signature check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageRotateAvailability {
+    /// No signature-shaped structure, and page changes are allowed.
+    Available,
+    /// No document is open.
+    NoDocument,
+    /// The file could not be read for editing.
+    Unreadable,
+    /// The document's permissions do not allow page changes.
+    NotPermitted,
+    /// A signature is present, or a signature cannot be ruled out.
+    Signature,
+}
+
+/// Shown when rotation is refused because of a signature-shaped structure.
+/// It does not say the signature verifies.
+pub const PAGE_ROTATE_SIGNATURE: &str = rotate_guard::MESSAGE;
 pub mod word_count;
 pub mod xfa;
 
@@ -296,8 +317,33 @@ fn scope_of(edit: &Edit) -> Scope {
     }
 }
 
-/// One undo/redo step: its label, the document state, its passwords, and what it changed.
-type Snapshot = (Label, pdfcraft_cos::Document, Keys, Scope);
+/// What an undo step changed, recorded from the [`Edit`] rather than from its label.
+///
+/// A new-file save allows added text, a session stamp, and page rotation only when the step's
+/// kind says so. A label that merely reads "Rotate pages" is not enough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryKind {
+    AddedText,
+    SessionStamp,
+    PageRotate,
+    Other,
+}
+
+fn history_kind(edit: &Edit, text_step: bool) -> HistoryKind {
+    if matches!(edit, Edit::RotatePages { .. }) {
+        HistoryKind::PageRotate
+    } else if text_step {
+        HistoryKind::AddedText
+    } else if is_stamp_edit(edit) {
+        HistoryKind::SessionStamp
+    } else {
+        HistoryKind::Other
+    }
+}
+
+/// One undo/redo step: its label, the document state, its passwords, what it changed, and which
+/// view-only save may include it.
+type Snapshot = (Label, pdfcraft_cos::Document, Keys, Scope, HistoryKind);
 
 /// Editing state of a document (absent when the document cannot be edited yet, e.g. encrypted).
 #[derive(Clone)]
@@ -3798,6 +3844,36 @@ impl Session {
         doc.editor.is_some() && doc.read_only_reason.is_none() && doc.permissions().is_none_or(|p| p.modify())
     }
 
+    /// Whether pages of `id` may be rotated. View-only stays on. The PDF must allow assembly and
+    /// the rotation guard must call it unsigned. Delete, reorder and extract stay refused.
+    /// A grant does not skip the guard: [`Self::page_rotate_availability`] is checked again.
+    pub fn allows_page_rotate(&self, id: DocId) -> bool {
+        if !self.view_only || !self.allows(Capability::PageRotate) {
+            return false;
+        }
+        self.page_rotate_availability(id) == PageRotateAvailability::Available
+    }
+
+    /// Why the current document can or cannot be rotated, apart from the session grant.
+    /// The apply path checks this again and does not trust an earlier answer.
+    pub fn page_rotate_availability(&self, id: DocId) -> PageRotateAvailability {
+        let Some(doc) = self.get(id) else { return PageRotateAvailability::NoDocument };
+        if doc.is_signed() {
+            return PageRotateAvailability::Signature;
+        }
+        let Some(editor) = doc.editor.as_ref() else { return PageRotateAvailability::Unreadable };
+        if rotate_guard::blocks_page_rotation(&editor.cos) {
+            return PageRotateAvailability::Signature;
+        }
+        if doc.read_only_reason.is_some() {
+            return PageRotateAvailability::Unreadable;
+        }
+        if doc.permissions().is_some_and(|permissions| !permissions.assemble()) {
+            return PageRotateAvailability::NotPermitted;
+        }
+        PageRotateAvailability::Available
+    }
+
     /// Whether an image stamp may be placed on `id`. View-only stays on and the document stays
     /// [`Document::editable`] false, so other comments stay refused. The PDF's own comment
     /// permission still applies, and a signed file is refused.
@@ -3840,6 +3916,33 @@ impl Session {
         let Some(editor) = self.get(id).and_then(|doc| doc.editor.as_ref()) else { return Vec::new() };
         let live = stamp_obj_refs(&editor.cos);
         editor.owned_stamps.iter().copied().filter(|refer| live.contains(refer)).collect()
+    }
+
+    /// Page rotation. A signed document is refused before the view-only error, including when
+    /// view-only is off. Without [`Capability::PageRotate`], a view-only session still refuses.
+    fn allow_page_rotate(&self, id: DocId, edit: &Edit) -> Result<(), EditError> {
+        if !matches!(edit, Edit::RotatePages { .. }) {
+            return Ok(());
+        }
+        let Some(doc) = self.get(id) else { return Err(EditError::NoDocument) };
+        if doc.is_signed() {
+            return Err(EditError::NotPermitted("page rotation on a signed document"));
+        }
+        if doc.editor.as_ref().is_some_and(|editor| rotate_guard::blocks_page_rotation(&editor.cos)) {
+            return Err(EditError::Invalid(rotate_guard::MESSAGE.into()));
+        }
+        if !self.view_only {
+            return Ok(());
+        }
+        if !self.allows(Capability::PageRotate) {
+            return Err(EditError::ViewOnly);
+        }
+        if doc.editor.is_none() || doc.read_only_reason.is_some() {
+            return Err(EditError::ReadOnly(
+                doc.read_only_reason.clone().unwrap_or_else(|| "the document structure could not be read for editing".into()),
+            ));
+        }
+        Ok(())
     }
 
     /// View-only stamp edits pass; every other view-only edit is [`EditError::ViewOnly`].
@@ -3918,24 +4021,74 @@ impl Session {
         label.is_some_and(|label| is_added_text_label(label.as_str()))
     }
 
-    /// Undo and redo are only added text, session stamps, or both, matching the grants.
-    fn copy_history_ok(&self, doc: &Document, text: bool, stamp: bool) -> bool {
+    /// The undo or redo step about to move, when the document is still open.
+    fn pending_history(&self, id: DocId, redo: bool) -> Option<HistoryKind> {
+        let doc = self.get(id)?;
+        let editor = doc.editor.as_ref()?;
+        let step = if redo { editor.redo.last() } else { editor.undo.last() };
+        step.map(|(_, _, _, _, kind)| *kind)
+    }
+
+    /// View-only undo or redo of a page rotation this session applied.
+    fn allow_page_rotate_step(&self, id: DocId) -> Result<(), EditError> {
+        if !self.view_only {
+            return Ok(());
+        }
+        if !self.allows(Capability::PageRotate) {
+            return Err(EditError::ViewOnly);
+        }
+        let Some(doc) = self.get(id) else { return Err(EditError::NoDocument) };
+        if doc.editor.is_none() || doc.read_only_reason.is_some() {
+            return Err(EditError::ReadOnly(
+                doc.read_only_reason.clone().unwrap_or_else(|| "the document structure could not be read for editing".into()),
+            ));
+        }
+        if doc.is_signed() {
+            return Err(EditError::NotPermitted("page rotation on a signed document"));
+        }
+        if doc.editor.as_ref().is_some_and(|editor| rotate_guard::blocks_page_rotation(&editor.cos)) {
+            return Err(EditError::Invalid(rotate_guard::MESSAGE.into()));
+        }
+        Ok(())
+    }
+
+    /// View-only history moves. Text, page rotation and session stamps each require their grant.
+    /// Any other step is refused. A session that is not view-only is unchanged.
+    fn allow_history_step(&self, id: DocId, redo: bool) -> Result<(), EditError> {
+        if !self.view_only {
+            return Ok(());
+        }
+        if self.view_only_text_step(id, redo) {
+            return Ok(());
+        }
+        if self.pending_history(id, redo) == Some(HistoryKind::PageRotate) {
+            return self.allow_page_rotate_step(id);
+        }
+        self.allow_stamp_step(id, redo)
+    }
+
+    /// Undo and redo are only added text, session stamps, page rotation, or a mix of those, matching the grants.
+    fn copy_history_ok(&self, doc: &Document, text: bool, stamp: bool, rotate: bool) -> bool {
         let Some(editor) = doc.editor.as_ref() else { return false };
         !editor.undo.is_empty()
-            && editor.undo.iter().chain(editor.redo.iter()).all(|(label, ..)| {
-                let label = label.as_str();
-                (text && is_added_text_label(label)) || (stamp && is_owned_stamp_label(label))
+            && editor.undo.iter().chain(editor.redo.iter()).all(|(_, _, _, _, kind)| match kind {
+                HistoryKind::AddedText => text,
+                HistoryKind::SessionStamp => stamp,
+                HistoryKind::PageRotate => rotate,
+                HistoryKind::Other => false,
             })
     }
 
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     ///
     /// A view-only session still refuses every edit, except added text when
-    /// [`Capability::EditText`] is granted, and a custom-image stamp placed in this session when
-    /// [`Capability::Stamp`] is granted. The document's own permissions still apply. A signed
-    /// document refuses the stamp before the view-only error, so the reason stays visible.
+    /// [`Capability::EditText`] is granted, a custom-image stamp placed in this session when
+    /// [`Capability::Stamp`] is granted, and [`Edit::RotatePages`] when
+    /// [`Capability::PageRotate`] is granted. The document's own permissions still apply. A
+    /// signed document refuses the stamp, and refuses page rotation, before the view-only error.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
-        if !self.view_only_text_edit(id, &edit) {
+        self.allow_page_rotate(id, &edit)?;
+        if !matches!(edit, Edit::RotatePages { .. }) && !self.view_only_text_edit(id, &edit) {
             self.allow_view_only_stamp(id, &edit)?;
         }
         let now = self.now();
@@ -3954,6 +4107,7 @@ impl Session {
         cx.today = today;
         let reason = doc.read_only_reason.clone().unwrap_or_default();
         let signed = doc.is_signed();
+        let text_step = added_text_edit(doc, &edit);
         let editor = doc.editor.as_mut().ok_or(EditError::ReadOnly(reason))?;
         if let Some(p) = editor.cos.permissions() {
             check_permission(&edit, &p)?;
@@ -4084,7 +4238,8 @@ impl Session {
         let keys = keys_after(&edit).unwrap_or_else(|| editor.keys.clone());
         let previous_keys = std::mem::replace(&mut editor.keys, keys);
         let scope = scope_of(&edit);
-        editor.undo.push((label, previous, previous_keys, scope));
+        let kind = history_kind(&edit, text_step);
+        editor.undo.push((label, previous, previous_keys, scope, kind));
         if editor.undo.len() > MAX_UNDO {
             editor.undo.remove(0);
         }
@@ -4095,7 +4250,7 @@ impl Session {
         if let Err(e) = refreshed {
             // Roll back: the edit produced something we cannot display.
             if let Some(ed) = doc.editor.as_mut()
-                && let Some((_, prev, keys, _)) = ed.undo.pop()
+                && let Some((_, prev, keys, _, _)) = ed.undo.pop()
             {
                 ed.cos = prev;
                 ed.keys = keys;
@@ -4120,7 +4275,7 @@ impl Session {
             && let Some(editor) = doc.editor.as_mut()
         {
             if matches!(edit, Edit::AddCustomStamp { .. }) {
-                let old = editor.undo.last().map(|(_, previous, _, _)| stamp_obj_refs(previous)).unwrap_or_default();
+                let old = editor.undo.last().map(|(_, previous, _, _, _)| stamp_obj_refs(previous)).unwrap_or_default();
                 let added: Vec<pdfcraft_cos::ObjRef> =
                     stamp_obj_refs(&editor.cos).into_iter().filter(|refer| !old.contains(refer) && !editor.owned_stamps.contains(refer)).collect();
                 editor.owned_stamps.extend(added);
@@ -4144,17 +4299,15 @@ impl Session {
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<Label, EditError> {
-        if !self.view_only_text_step(id, false) {
-            self.allow_stamp_step(id, false)?;
-        }
+        self.allow_history_step(id, false)?;
         let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToUndo)?;
-        let (label, prev, keys, scope) = editor.undo.pop().ok_or(EditError::NothingToUndo)?;
+        let (label, prev, keys, scope, kind) = editor.undo.pop().ok_or(EditError::NothingToUndo)?;
         let current = std::mem::replace(&mut editor.cos, prev);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
-        editor.redo.push((label.clone(), current, current_keys, scope));
+        editor.redo.push((label.clone(), current, current_keys, scope, kind));
         let stamp = view_only && is_owned_stamp_label(label.as_str());
         if stamp {
             editor.stamp_depth = editor.stamp_depth.saturating_sub(1);
@@ -4168,17 +4321,15 @@ impl Session {
     }
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {
-        if !self.view_only_text_step(id, true) {
-            self.allow_stamp_step(id, true)?;
-        }
+        self.allow_history_step(id, true)?;
         let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
         doc.edit_notices.clear();
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToRedo)?;
-        let (label, next, keys, scope) = editor.redo.pop().ok_or(EditError::NothingToRedo)?;
+        let (label, next, keys, scope, kind) = editor.redo.pop().ok_or(EditError::NothingToRedo)?;
         let current = std::mem::replace(&mut editor.cos, next);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
-        editor.undo.push((label.clone(), current, current_keys, scope));
+        editor.undo.push((label.clone(), current, current_keys, scope, kind));
         let stamp = view_only && is_owned_stamp_label(label.as_str());
         if stamp {
             editor.stamp_redo = editor.stamp_redo.saturating_sub(1);
@@ -4428,24 +4579,33 @@ impl Session {
         self.working_bytes(doc)
     }
 
-    /// Bytes of a document changed by added text or a session stamp, for a new file.
+    /// Bytes of a document changed by added text, a session stamp, or page rotation, for a new file.
     ///
-    /// Requires [`Capability::SaveAs`] and [`Capability::EditText`] or [`Capability::Stamp`].
-    /// A stamp is included only when [`Capability::Stamp`] is granted, and added text only when
-    /// [`Capability::EditText`] is granted. It does not write, does not change the open
-    /// document's path, and does not mark it saved. [`Self::save_copy_bytes`] stays the opened
-    /// file only. [`Self::save_bytes`] stays refused while view-only. A copy already recorded
-    /// with [`Self::note_saved_copy`] is still returned: the working file differs from the opened
-    /// file, even when closing would not ask again.
+    /// Requires [`Capability::SaveAs`] and at least one of [`Capability::EditText`],
+    /// [`Capability::Stamp`] and [`Capability::PageRotate`]. Each kind of history is included
+    /// only when its own grant is present. Page deletion, reordering and every other edit stay
+    /// out. It does not write, does not change the open document's path, and does not mark it
+    /// saved. [`Self::save_copy_bytes`] stays the opened file only. [`Self::save_bytes`] stays
+    /// refused while view-only. A copy already recorded with [`Self::note_saved_copy`] is still
+    /// returned: the working file differs from the opened file, even when closing would not ask
+    /// again. Rotation is an incremental update of the opened bytes: the previous revision stays
+    /// in the file, and the new `/Rotate` is what a reader opens.
     pub fn save_edited_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
         let text = self.allows(Capability::EditText);
         let stamp = self.allows(Capability::Stamp);
-        if !self.allows(Capability::SaveAs) || (!text && !stamp) {
+        let rotate = self.allows(Capability::PageRotate);
+        if !self.allows(Capability::SaveAs) || (!text && !stamp && !rotate) {
             return Err(EditError::ViewOnly);
         }
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
-        if !differs_from_opened(doc) || !self.copy_history_ok(doc, text, stamp) {
-            let message = if stamp { "there is no added text or stamp to save" } else { "there is no added text to save" };
+        if !differs_from_opened(doc) || !self.copy_history_ok(doc, text, stamp, rotate) {
+            let message = if rotate {
+                "there is no added text, stamp, or page rotation to save"
+            } else if stamp {
+                "there is no added text or stamp to save"
+            } else {
+                "there is no added text to save"
+            };
             return Err(EditError::Invalid(message.into()));
         }
         self.working_bytes(doc)
@@ -4593,7 +4753,7 @@ impl Session {
         reopen_as_owner(&editor.cos, &mut editor.keys);
         // Other states with the same restricted access are unlocked too; states opened with
         // other passwords (protection changed and saved since) stay as they are.
-        for (_, cos, keys, _) in editor.undo.iter_mut().chain(editor.redo.iter_mut()) {
+        for (_, cos, keys, _, _) in editor.undo.iter_mut().chain(editor.redo.iter_mut()) {
             if cos.permissions().is_some_and(|p| !p.owner) && cos.unlock(password).is_ok() {
                 reopen_as_owner(cos, keys);
             }

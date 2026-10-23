@@ -2437,3 +2437,10 @@ animation effects	Off	Izklopljeni
 	Make properties default	Nastavi lastnosti kot privzete
 	Pages selected	Izbrane strani
 	Page properties	Lastnosti strani
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Zavrti pogled za 90° v desno (ni shranjeno v PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Zavrti pogled za 90° v desno (ni shranjeno v PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Zavrti pogled za 90° v levo (ni shranjeno v PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Zavrti pogled za 90° v levo (ni shranjeno v PDF)
+	Rotate current page clockwise 90°	Zavrti to stran za 90° v desno
+	Rotate current page counterclockwise 90°	Zavrti to stran za 90° v levo
+	Turns the current page by 90°. You can save the result as a new PDF.	Zavrti to stran za 90°. Rezultat lahko shranite v nov PDF.

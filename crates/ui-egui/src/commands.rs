@@ -94,6 +94,15 @@ impl PdfCraftApp {
         if spec.id == "comment.stamp" && self.active_ids().is_some_and(|(_, id)| self.session.allows_stamp(id)) {
             return true;
         }
+        // Current-page rotation is granted on its own. `allows_assembly` stays false while
+        // view-only, which is this app's mode. The PDF's page permission and the signature
+        // guard are what [`pdfcraft_engine::Session::allows_page_rotate`] still checks.
+        if matches!(spec.id, "page.rotate" | "page.rotate_ccw")
+            && self.session.view_only()
+            && self.active_ids().is_some_and(|(_, id)| self.session.allows_page_rotate(id))
+        {
+            return true;
+        }
         // Undo and Redo act on the Combine files list while its tab shows.
         if self.combine_showing() && matches!(spec.needs, commands::Needs::Undo | commands::Needs::Redo) {
             return self.combine_can_undo(spec.needs == commands::Needs::Undo);
@@ -107,6 +116,21 @@ impl PdfCraftApp {
                 "view.next_view" => self.active.and_then(|i| self.views.get(i)).is_some_and(|v| !v.forward.is_empty()),
                 _ => true,
             }
+    }
+
+    /// Why the current document cannot have its page rotated into the PDF.
+    pub(crate) fn page_rotate_block_message(&self) -> String {
+        let availability = self.active_ids().map(|(_, id)| self.session.page_rotate_availability(id));
+        match availability {
+            Some(pdfcraft_engine::PageRotateAvailability::Signature) => page_rotate_signature_message(),
+            Some(pdfcraft_engine::PageRotateAvailability::NotPermitted) => {
+                crate::identity::localized("この PDF の権限ではページを変更できません。", "The document's security settings don't allow this change")
+            }
+            Some(pdfcraft_engine::PageRotateAvailability::Unreadable) => {
+                crate::identity::localized("この PDF はページを回転できる状態で開けていません。", "This PDF could not be opened for page rotation.")
+            }
+            _ => tl!("Open a document first").to_string(),
+        }
     }
 
     /// Run a registered command by id. Returns `false` when the id is unknown or the command
@@ -131,6 +155,13 @@ impl PdfCraftApp {
         }
         let Some(spec) = commands::command(id) else { return false };
         if !self.command_enabled(spec) {
+            if matches!(id, "page.rotate" | "page.rotate_ccw")
+                && self.session.view_only()
+                && self.session.allows(pdfcraft_engine::Capability::PageRotate)
+            {
+                self.notify(self.page_rotate_block_message());
+                return false;
+            }
             let why = match spec.needs {
                 commands::Needs::Undo => tl!("Nothing to undo").to_string(),
                 commands::Needs::Redo => tl!("Nothing to redo").to_string(),
@@ -362,11 +393,12 @@ impl PdfCraftApp {
                     }
                 }
             }
-            "page.rotate" => {
-                self.apply_edit(Edit::RotatePages { pages: targets, degrees: 90 });
-            }
-            "page.rotate_ccw" => {
-                self.apply_edit(Edit::RotatePages { pages: targets, degrees: -90 });
+            "page.rotate" | "page.rotate_ccw" => {
+                // The page on screen, not the thumbnail selection. Other page commands keep `targets`.
+                let degrees = if id == "page.rotate" { 90 } else { -90 };
+                if let Some(page) = active.and_then(|i| self.views.get(i)).map(|view| view.current) {
+                    self.apply_edit(Edit::RotatePages { pages: vec![page], degrees });
+                }
             }
             "page.delete" => {
                 self.apply_edit(Edit::DeletePages { pages: targets });
@@ -797,6 +829,44 @@ fn tab_after(current: Option<usize>, count: usize, forward: bool) -> Option<usiz
     })
 }
 
+/// Name shared by the Pages menu and the command palette. The command id stays `page.rotate`.
+pub(crate) fn page_rotate_menu_label(id: &str) -> Option<String> {
+    let source = match id {
+        "page.rotate" => "Rotate current page clockwise 90°",
+        "page.rotate_ccw" => "Rotate current page counterclockwise 90°",
+        _ => return None,
+    };
+    Some(crate::i18n::t(source).to_string())
+}
+
+pub(crate) fn page_rotate_menu_tip() -> String {
+    crate::i18n::t("Turns the current page by 90°. You can save the result as a new PDF.").to_string()
+}
+
+/// Tooltip for display-only rotation. `key` is the shortcut when the control shows one.
+/// This does not change `/Rotate`. A missing translation falls back to the English sentence.
+pub(crate) fn view_rotate_tip(clockwise: bool, key: Option<&str>) -> String {
+    let template = match (clockwise, key.is_some()) {
+        (true, true) => crate::i18n::t("Rotate the view 90° clockwise (not saved in the PDF) ({key})"),
+        (true, false) => crate::i18n::t("Rotate the view 90° clockwise (not saved in the PDF)"),
+        (false, false) => crate::i18n::t("Rotate the view 90° counterclockwise (not saved in the PDF)"),
+        (false, true) => crate::i18n::t("Rotate the view 90° counterclockwise (not saved in the PDF) ({key})"),
+    };
+    match key {
+        Some(key) => crate::i18n::fmt(template, &[("key", key)]),
+        None => template.to_string(),
+    }
+}
+
+/// Refusal text for a signature-shaped PDF, or one whose repaired structure leaves that open.
+/// It does not say the signature verifies.
+pub(crate) fn page_rotate_signature_message() -> String {
+    crate::identity::localized(
+        "ページの回転はできません。この PDF には電子署名があるか、その可能性があります。内部構造が修復された PDF も、署名の有無を確かめられないため、安全のため回転できません。署名が有効かどうかは確認していません。",
+        pdfcraft_engine::PAGE_ROTATE_SIGNATURE,
+    )
+}
+
 /// Render a top-level menu's registered commands (with live labels, shortcuts and enablement).
 pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str) {
     for spec in commands::menu(menu) {
@@ -804,7 +874,9 @@ pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str
             continue;
         }
         let label = commands::current_label(spec, &app.session, app.active_ids().map(|(_, id)| id));
-        let label = if app.session.view_only() && spec.id == "help.about" {
+        let label = if let Some(rotated) = page_rotate_menu_label(spec.id) {
+            rotated
+        } else if app.session.view_only() && spec.id == "help.about" {
             crate::identity::localized("SwiftPDF について", "About SwiftPDF")
         } else {
             crate::i18n::menu_label(spec.id, &label)
@@ -844,7 +916,11 @@ pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str
         }
         let shortcut = spec.shortcut.or((spec.id == "edit.copy").then_some(COPY)).map(|s| shortcut_label(ui.ctx(), s)).unwrap_or_default();
         let enabled = app.command_enabled(spec);
-        let resp = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut));
+        let mut resp = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut));
+        if matches!(spec.id, "page.rotate" | "page.rotate_ccw") {
+            let tip = if enabled { page_rotate_menu_tip() } else { app.page_rotate_block_message() };
+            resp = resp.on_hover_text(&tip).on_disabled_hover_text(&tip);
+        }
         if resp.clicked() {
             app.execute(spec.id);
             ui.close();

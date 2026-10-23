@@ -2454,3 +2454,10 @@ animation effects	Off	Вимкнено
 	Make properties default	Зробити властивості типовими
 	Pages selected	Вибрані сторінки
 	Page properties	Властивості сторінки
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Повернути вигляд на 90° за годинниковою стрілкою (не зберігається в PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Повернути вигляд на 90° за годинниковою стрілкою (не зберігається в PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Повернути вигляд на 90° проти годинникової стрілки (не зберігається в PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Повернути вигляд на 90° проти годинникової стрілки (не зберігається в PDF)
+	Rotate current page clockwise 90°	Повернути поточну сторінку на 90° за годинниковою стрілкою
+	Rotate current page counterclockwise 90°	Повернути поточну сторінку на 90° проти годинникової стрілки
+	Turns the current page by 90°. You can save the result as a new PDF.	Повертає поточну сторінку на 90°. Результат можна зберегти в новий PDF.

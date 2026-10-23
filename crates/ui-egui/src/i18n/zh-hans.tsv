@@ -2396,3 +2396,10 @@ animation effects	Off	关
 	Make properties default	将属性设为默认
 	Pages selected	选定的页面
 	Page properties	页面属性
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	顺时针将视图旋转90°（不会保存到 PDF）（{key}）
+	Rotate the view 90° clockwise (not saved in the PDF)	顺时针将视图旋转90°（不会保存到 PDF）
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	逆时针将视图旋转90°（不会保存到 PDF）（{key}）
+	Rotate the view 90° counterclockwise (not saved in the PDF)	逆时针将视图旋转90°（不会保存到 PDF）
+	Rotate current page clockwise 90°	将当前页面顺时针旋转90°
+	Rotate current page counterclockwise 90°	将当前页面逆时针旋转90°
+	Turns the current page by 90°. You can save the result as a new PDF.	将当前页面旋转90°。旋转结果可以另存为新的 PDF。

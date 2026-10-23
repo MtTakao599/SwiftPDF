@@ -240,7 +240,7 @@ fn the_palette_lists_commands_with_shortcuts_and_runs_them() {
     let mut h = harness();
     h.state_mut().set_option("palette", "rotate pages clockwise").unwrap();
     h.run_steps(3);
-    h.get_by_label("Rotate pages clockwise");
+    h.get_by_label("Rotate current page clockwise 90°");
     h.key_press(Key::Enter);
     h.run_steps(3);
     let app = h.state();
@@ -253,10 +253,11 @@ fn the_palette_lists_commands_with_shortcuts_and_runs_them() {
 #[test]
 fn palette_arrow_keys_select_results_and_enter_runs_the_selection() {
     let mut h = harness();
-    h.state_mut().set_option("palette", "rotate pages").unwrap();
+    // The shared display name. "rotate pages" also matches the still-disabled batch dialog.
+    h.state_mut().set_option("palette", "rotate current page").unwrap();
     h.run_steps(2);
-    h.get_by_label("Rotate pages clockwise");
-    h.get_by_label("Rotate pages counterclockwise");
+    h.get_by_label("Rotate current page clockwise 90°");
+    h.get_by_label("Rotate current page counterclockwise 90°");
     h.key_press(Key::ArrowDown);
     h.run_steps(2);
     h.key_press(Key::Enter);
@@ -456,7 +457,7 @@ fn view_menu_and_tooltips_write_shortcuts_for_the_platform() {
     let h = view_menu(OperatingSystem::Mac);
     h.get_by_label("Actual size ⌘1");
     h.get_by_label("Fit visible ⌘3");
-    h.get_by_label("Rotate view clockwise (⇧⌘+)");
+    h.get_by_label("Rotate the view 90° clockwise (not saved in the PDF) (⇧⌘+)");
     assert_eq!(h.query_all_by_label_contains("Ctrl+").count(), 0, "no Ctrl+ on macOS");
 }
 

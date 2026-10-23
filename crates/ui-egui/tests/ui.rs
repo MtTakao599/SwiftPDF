@@ -19,6 +19,33 @@ const FIXTURE: &[u8] = b"%PDF-1.7
 trailer << /Root 1 0 R >>
 %%EOF";
 
+/// `body` with a cross-reference table in place of its bare trailer, written for the objects it
+/// already has. Page rotation refuses a file whose cross-references had to be rebuilt.
+fn with_xref(body: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(body).unwrap();
+    let objects = &text[..text.rfind("trailer").unwrap()];
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut at = 0;
+    for line in objects.split_inclusive('\n') {
+        if let Some((num, rest)) = line.split_once(' ')
+            && rest.starts_with("0 obj")
+        {
+            offsets.insert(num.parse::<u32>().unwrap(), at);
+        }
+        at += line.len();
+    }
+    let size = offsets.keys().max().unwrap() + 1;
+    let mut out = format!("{objects}xref\n0 {size}\n0000000000 65535 f \n");
+    for num in 1..size {
+        match offsets.get(&num) {
+            Some(off) => out += &format!("{off:010} 00000 n \n"),
+            None => out += "0000000000 65535 f \n",
+        }
+    }
+    out += &format!("trailer << /Size {size} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", objects.len());
+    out.into_bytes()
+}
+
 fn harness(setup: impl FnOnce(&mut PdfCraftApp) + 'static) -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
         let mut app = PdfCraftApp::new();
@@ -304,8 +331,8 @@ fn a_tab_with_an_arabic_file_name_keeps_its_logical_accessible_name() {
 #[test]
 fn a_middle_click_closes_the_tab() {
     let mut h = harness(|app| {
-        app.open_bytes("first.pdf", None, FIXTURE.to_vec()).unwrap();
-        app.open_bytes("second.pdf", None, FIXTURE.to_vec()).unwrap();
+        app.open_bytes("first.pdf", None, with_xref(FIXTURE)).unwrap();
+        app.open_bytes("second.pdf", None, with_xref(FIXTURE)).unwrap();
     });
     h.get_by_label("first.pdf").click_button(egui::PointerButton::Middle);
     h.run_steps(3);

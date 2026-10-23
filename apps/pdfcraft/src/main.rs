@@ -355,12 +355,16 @@ fn app_creator<'a>(
         let mut app = PdfCraftApp::new();
         // SwiftPDF stays view-only. v0.2.0 grants a copy to a new path. v0.3.0 also grants
         // adding text. v0.4.0 grants printing. v0.5.0 grants image stamps placed in this
-        // session. Nothing turns view-only off. In-place save and export stay refused.
+        // session. v0.9.0 grants rotating the page on screen. Nothing turns view-only off.
+        // In-place save and export stay refused.
         app.set_view_only(true);
         app.grant_save_as();
         app.grant_edit_text();
         app.grant_print();
         app.grant_stamp();
+        // v0.9.0 grants rotation of the current page only. View-only stays on, and the signature
+        // guard still runs when the command is shown and again when it is applied.
+        app.grant_page_rotate();
         // Chairman seals live in this folder (LOCALAPPDATA\SwiftPDF, or Data beside a portable
         // exe). They are DPAPI ciphertext, not an entry in app.ron.
         if let Some(dir) = settings_dir() {

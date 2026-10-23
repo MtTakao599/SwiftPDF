@@ -1285,4 +1285,84 @@ startxref
         assert_eq!(ok.library.seals[0].data, sample().data);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn rotating_the_page_does_not_move_a_chairman_approval() {
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seal-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = crate::PdfCraftApp::new();
+        app.set_seal_store(dir.join("seals.bin"));
+        app.open_bytes("opened.pdf", None, one_page()).unwrap();
+        place_chairman(&mut app);
+        let approved = app.seal_store.library.history.clone();
+        assert_eq!(approved.last().map(|event| (event.page, event.event.as_str())), Some((1, "confirmed")));
+        let uses = app.seal_uses.clone();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].page, 1);
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        assert!(app.command_allowed("page.rotate"));
+        assert!(!app.command_allowed("page.delete"));
+        assert!(app.apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: 90 }));
+        let id = app.views[0].id;
+        let doc = app.session.get(id).unwrap();
+        assert_eq!(doc.info.pages[0].rotation, 90);
+        assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
+        assert_eq!(app.seal_store.library.history.len(), approved.len(), "rotation must not write another approval");
+        assert_eq!(app.seal_store.library.history.last().map(|event| event.page), Some(1));
+        assert_eq!(app.seal_uses.iter().map(|use_| use_.page).collect::<Vec<_>>(), vec![1]);
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert_eq!(app.session.get(id).unwrap().info.pages[0].rotation, 0);
+        assert_eq!(stamp_count(&app), 1);
+        assert_eq!(app.seal_uses[0].page, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SealUse.page` is 1-based. The colour has to be on that same page after rotation, and not on the other page.
+    #[test]
+    #[cfg(windows)]
+    fn chairman_colour_stays_on_the_approved_page_after_rotation() {
+        let _policy = policy();
+        let dir = std::env::temp_dir().join(format!("swiftpdf-seal-rotate-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = crate::PdfCraftApp::new();
+        let bytes = app.session.create_blank(200.0, 300.0, 2).unwrap();
+        app.set_seal_store(dir.join("seals.bin"));
+        app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+        place_chairman(&mut app);
+        let approved = app.seal_store.library.history.len();
+        assert_eq!(app.seal_uses.len(), 1);
+        assert_eq!(app.seal_uses[0].page, 1, "the approval names the first page");
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        assert!(app.apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: 90 }));
+        let id = app.views[0].id;
+        let doc = app.session.get(id).unwrap();
+        assert_eq!(doc.info.pages[0].rotation, 90);
+        assert_eq!(doc.info.pages[1].rotation, 0);
+        assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
+        assert!(page_has_colour_at(&doc.bytes, 0), "the seal is drawn on the approved page");
+        assert!(!page_has_colour_at(&doc.bytes, 1), "the seal is not drawn on the other page");
+        assert_eq!(app.seal_store.library.history.len(), approved, "rotation must not write another approval");
+        assert_eq!(app.seal_uses[0].page, 1);
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        let doc = app.session.get(id).unwrap();
+        assert_eq!(doc.info.pages[0].rotation, 0);
+        assert!(page_has_colour_at(&doc.bytes, 0));
+        assert!(!page_has_colour_at(&doc.bytes, 1));
+        assert_eq!(app.seal_uses.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn page_has_colour_at(bytes: &[u8], page: usize) -> bool {
+        let mut renderer = pdfcraft_render::PageRenderer::new(std::sync::Arc::new(bytes.to_vec()), Default::default());
+        let shot = renderer.render(pdfcraft_render::RenderRequest { page, scale: 2.0, ..Default::default() });
+        assert!(shot.error.is_none(), "{:?}", shot.error);
+        shot.rgba.chunks_exact(4).any(|px| {
+            let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+            a > 20 && (r != g || g != b)
+        })
+    }
 }

@@ -2709,3 +2709,10 @@ certificate	Version	الإصدار
 	Make properties default	جعل الخصائص افتراضية
 	Pages selected	الصفحات المحددة
 	Page properties	خصائص الصفحة
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	تدوير العرض 90° مع عقارب الساعة (لا يُحفظ في PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	تدوير العرض 90° مع عقارب الساعة (لا يُحفظ في PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	تدوير العرض 90° عكس عقارب الساعة (لا يُحفظ في PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	تدوير العرض 90° عكس عقارب الساعة (لا يُحفظ في PDF)
+	Rotate current page clockwise 90°	تدوير الصفحة الحالية 90° مع عقارب الساعة
+	Rotate current page counterclockwise 90°	تدوير الصفحة الحالية 90° عكس عقارب الساعة
+	Turns the current page by 90°. You can save the result as a new PDF.	يدوّر الصفحة الحالية 90°. يمكن حفظ النتيجة في PDF جديد.

@@ -42,6 +42,52 @@ fn rotate_handles_large_quarter_turns() {
     }
 }
 
+#[test]
+fn rotate_turns_each_page_once_and_reads_indirect_or_inherited_angles() {
+    let mut doc = open(fixture());
+    let angle = doc.add(Object::Int(90));
+    let first = pages(&doc).unwrap()[0].obj;
+    doc.update_dict(first, |d| d.set(b"Rotate".to_vec(), Object::Ref(angle))).unwrap();
+    assert!(rotate_pages(&mut doc, &[0, 9], 90).is_err(), "an unknown page must change nothing");
+    assert_eq!(page_rotation(&doc, 0).unwrap(), 90);
+    assert_eq!(*doc.get(angle), Object::Int(90));
+
+    rotate_pages(&mut doc, &[0, 0, 1, 0], 90).unwrap();
+    assert_eq!(page_rotation(&doc, 0).unwrap(), 180, "a repeated index turns the page once");
+    assert_eq!(page_rotation(&doc, 1).unwrap(), 180, "an inherited 90° plus 90°");
+    assert_eq!(page_rotation(&doc, 2).unwrap(), 90);
+    assert_eq!(pages(&doc).unwrap()[0].obj, first);
+    assert_eq!(*doc.get(angle), Object::Int(90), "the shared angle object stays 90");
+
+    let inherited = doc.add(Object::Int(180));
+    let root = pages_root(&doc).unwrap();
+    doc.update_dict(root, |d| d.set(b"Rotate".to_vec(), Object::Ref(inherited))).unwrap();
+    rotate_pages(&mut doc, &[2], 90).unwrap();
+    assert_eq!(page_rotation(&doc, 2).unwrap(), 270);
+    assert_eq!(page_rotation(&doc, 1).unwrap(), 180, "a page already given its own angle does not pick up the new parent");
+    assert_eq!(*doc.get(inherited), Object::Int(180));
+}
+
+#[test]
+fn four_quarter_turns_return_to_the_starting_angle() {
+    let mut doc = open(fixture());
+    let start = page_rotation(&doc, 0).unwrap();
+    for _ in 0..4 {
+        rotate_pages(&mut doc, &[0], 90).unwrap();
+    }
+    assert_eq!(page_rotation(&doc, 0).unwrap(), start);
+    for (current, clockwise, left) in [(0, 90, 270), (90, 180, 0), (180, 270, 90), (270, 0, 180)] {
+        let mut doc = open(fixture());
+        let page = pages(&doc).unwrap()[0].obj;
+        doc.update_dict(page, |d| d.set(b"Rotate".to_vec(), Object::Int(current))).unwrap();
+        let mut right = doc.clone();
+        rotate_pages(&mut right, &[0], 90).unwrap();
+        rotate_pages(&mut doc, &[0], -90).unwrap();
+        assert_eq!(page_rotation(&right, 0).unwrap(), clockwise);
+        assert_eq!(page_rotation(&doc, 0).unwrap(), left);
+    }
+}
+
 /// A 3-page document with a nested page tree. MediaBox and Rotate are inherited from the root,
 /// Resources from an intermediate node; each page's content says which page it is.
 fn fixture() -> Vec<u8> {

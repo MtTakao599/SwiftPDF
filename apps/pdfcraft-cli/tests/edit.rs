@@ -274,20 +274,19 @@ fn a_document_whose_page_tree_is_missing_edits_the_pages_the_reader_shows() {
     std::fs::write(&input, fixture_without_page_tree()).unwrap();
     let before = pdfcraft_render::inspect(std::sync::Arc::new(fixture_without_page_tree()), None).unwrap();
     assert_eq!(before.pages.iter().map(|p| (p.width, p.height)).collect::<Vec<_>>(), [(200.0, 300.0), (300.0, 200.0)]);
-    for (name, args, expected) in [
-        // Width and height are as displayed: the turned page reads 200 x 300.
-        ("rotate.pdf", ["--rotate", "2:90"], &[(200.0, 300.0, 0), (200.0, 300.0, 90)][..]),
-        ("delete.pdf", ["--delete", "1"], &[(300.0, 200.0, 0)][..]),
-    ] {
-        let output = tmp("no-page-tree", name);
-        let mut all = vec!["edit", input.to_str().unwrap(), "--out", output.to_str().unwrap()];
-        all.extend(args);
-        let out = Command::new(BIN).args(&all).output().unwrap();
-        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
-        let info = pdfcraft_render::inspect(std::sync::Arc::new(std::fs::read(&output).unwrap()), None).unwrap();
-        let pages: Vec<_> = info.pages.iter().map(|p| (p.width, p.height, p.rotation)).collect();
-        assert_eq!(pages, expected, "{name}");
-    }
+    // A rebuilt page tree means two readers disagreed about the file, so page rotation refuses.
+    let rotated = tmp("no-page-tree", "rotate.pdf");
+    let out = Command::new(BIN).args(["edit", input.to_str().unwrap(), "--out", rotated.to_str().unwrap(), "--rotate", "2:90"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Page rotation is unavailable"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!rotated.exists());
+    assert_eq!(std::fs::read(&input).unwrap(), fixture_without_page_tree());
+    let output = tmp("no-page-tree", "delete.pdf");
+    let out = Command::new(BIN).args(["edit", input.to_str().unwrap(), "--out", output.to_str().unwrap(), "--delete", "1"]).output().unwrap();
+    assert!(out.status.success(), "delete.pdf: {}", String::from_utf8_lossy(&out.stderr));
+    let info = pdfcraft_render::inspect(std::sync::Arc::new(std::fs::read(&output).unwrap()), None).unwrap();
+    let pages: Vec<_> = info.pages.iter().map(|p| (p.width, p.height, p.rotation)).collect();
+    assert_eq!(pages, [(300.0, 200.0, 0)], "delete.pdf");
 }
 
 /// Like [`fixture_without_page_tree`], but the scanning reader shows different pages from the

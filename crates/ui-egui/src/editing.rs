@@ -140,6 +140,12 @@ impl PdfCraftApp {
                     for page in changed_pages {
                         view.page_changed(page);
                     }
+                } else if let Edit::RotatePages { pages, .. } = &edit
+                    && let [page] = pages.as_slice()
+                {
+                    // One saved page turn: update that page's height and pictures. Undo still
+                    // refreshes the whole document, which is the existing history path.
+                    view.page_geometry_changed(*page, info);
                 } else {
                     view.document_changed(info);
                 }
@@ -203,6 +209,8 @@ impl PdfCraftApp {
                 }
                 let message = if matches!(e, pdfcraft_engine::EditError::NotPermitted("stamps on a signed document")) {
                     "電子署名がある PDF にはスタンプを押せません".into()
+                } else if rotation_refused_for_signature(&e) {
+                    crate::commands::page_rotate_signature_message()
                 } else if matches!(edit, Edit::MoveObjects { .. }) {
                     crate::object_ui::move_error(&e)
                 } else {
@@ -1408,6 +1416,14 @@ pub(crate) fn save_copy_message(error: &pdfcraft_platform::save_path::NewFileErr
     }
 }
 
+fn rotation_refused_for_signature(error: &pdfcraft_engine::EditError) -> bool {
+    match error {
+        pdfcraft_engine::EditError::NotPermitted("page rotation on a signed document") => true,
+        pdfcraft_engine::EditError::Invalid(text) => text == pdfcraft_engine::PAGE_ROTATE_SIGNATURE,
+        _ => false,
+    }
+}
+
 /// The single page a content edit changes (`None` for other edits). Like comment edits,
 /// these leave every other page's bytes, geometry and text alone, so their rasters stay valid.
 fn content_page(edit: &Edit) -> Option<usize> {
@@ -2400,5 +2416,353 @@ mod unsaved_added_text_tests {
         assert!(app.request_quit(&ctx));
         assert!(app.close_request.is_none());
         assert_eq!(std::fs::read(&original).unwrap(), bytes);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod page_rotate_foundation_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("swiftpdf-page-rotate-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn page_rotate_command_turns_the_current_page_and_writes_only_a_new_file() {
+        let dir = Dir::new("save");
+        let original = dir.0.join("opened.pdf");
+        let made = PdfCraftApp::new();
+        let bytes = made.session.create_blank(200.0, 300.0, 1).unwrap().to_vec();
+        std::fs::write(&original, &bytes).unwrap();
+        let existing = dir.0.join("kept.pdf");
+        std::fs::write(&existing, b"KEEP").unwrap();
+        let mut app = PdfCraftApp::new();
+        app.set_view_only(true);
+        app.open_bytes("opened.pdf", Some(original.to_string_lossy().into_owned()), bytes.clone()).unwrap();
+        assert!(app.session.view_only());
+        assert!(!app.command_allowed("page.rotate"));
+        assert!(!app.execute("page.rotate"));
+        assert_eq!(app.toast.as_ref().map(|(text, _)| text.as_str()), Some(crate::command_policy::REFUSED));
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        app.session.grant(pdfcraft_engine::Capability::SaveAs);
+        assert!(app.session.view_only());
+        assert!(app.command_allowed("page.rotate"));
+        assert!(app.command_allowed("page.rotate_ccw"));
+        assert!(!app.command_allowed("page.delete"));
+        assert!(!app.command_allowed("page.extract"));
+        assert!(!app.command_allowed("page.organize"));
+        assert!(!app.command_allowed("page.insert"));
+        assert!(!app.command_allowed("page.move"));
+        assert!(!app.command_allowed("file.save"));
+        assert!(!crate::command_policy::allowed_in_view_only("page.rotate"));
+        assert!(!crate::command_policy::allowed_in_view_only("page.delete"));
+        let id = app.views[0].id;
+        assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        assert_eq!(app.session.get(id).unwrap().info.pages[0].rotation, 90);
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        let same = pdfcraft_platform::save_path::write_new_file(Some(&original), &original, &saved);
+        assert!(matches!(same, Err(pdfcraft_platform::save_path::NewFileError::SameAsOriginal)));
+        let kept = pdfcraft_platform::save_path::write_new_file(Some(&original), &existing, &saved);
+        assert!(matches!(kept, Err(pdfcraft_platform::save_path::NewFileError::DestinationExists)));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"KEEP");
+        let dest = dir.0.join("rotated.pdf");
+        pdfcraft_platform::save_path::write_new_file(Some(&original), &dest, &saved).unwrap();
+        let mut again = PdfCraftApp::new();
+        again.set_view_only(true);
+        again.open_bytes("rotated.pdf", None, std::fs::read(&dest).unwrap()).unwrap();
+        assert_eq!(again.session.get(again.views[0].id).unwrap().info.pages[0].rotation, 90);
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert!(app.session.get(id).unwrap().can_undo().is_some());
+        assert_eq!(app.session.get(id).unwrap().can_undo(), Some("Rotate page"));
+    }
+
+    #[test]
+    fn page_rotate_menu_names_the_saved_turn_and_leaves_other_page_edits_closed() {
+        let previous = crate::i18n::current();
+        crate::i18n::set_current(crate::i18n::Lang::from_code("ja").unwrap());
+        assert_eq!(crate::commands::page_rotate_menu_label("page.rotate").as_deref(), Some("このページを右に90°回転"));
+        assert_eq!(crate::commands::page_rotate_menu_label("page.rotate_ccw").as_deref(), Some("このページを左に90°回転"));
+        assert!(crate::commands::page_rotate_menu_tip().contains("新しいPDFに別名保存できます"));
+        assert_eq!(crate::commands::view_rotate_tip(true, Some("Ctrl+Shift++")), "表示を右に90°回転（PDFには保存されません）（Ctrl+Shift++）");
+        assert_eq!(crate::commands::view_rotate_tip(false, None), "表示を左に90°回転（PDFには保存されません）");
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        assert_eq!(crate::commands::page_rotate_menu_label("page.rotate").as_deref(), Some("Rotate current page clockwise 90°"));
+        assert_eq!(crate::commands::page_rotate_menu_label("page.rotate_ccw").as_deref(), Some("Rotate current page counterclockwise 90°"));
+        crate::i18n::set_current(crate::i18n::Lang::from_code("te").unwrap());
+        assert_eq!(crate::commands::page_rotate_menu_label("page.rotate").as_deref(), Some("Rotate current page clockwise 90°"));
+        assert_eq!(crate::commands::view_rotate_tip(true, None), "Rotate the view 90° clockwise (not saved in the PDF)");
+        assert!(crate::commands::page_rotate_menu_label("page.delete").is_none());
+        crate::i18n::set_current(previous);
+
+        let mut app = open_blank(2);
+        app.views[0].select_pages(&[0]);
+        app.views[0].current = 1;
+        let zoom = app.views[0].zoom;
+        assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        let id = app.views[0].id;
+        assert_eq!(rotations(&app, id), vec![0, 90]);
+        assert!((app.views[0].zoom - zoom).abs() < f32::EPSILON);
+        let undo_before = app.session.get(id).unwrap().can_undo().map(str::to_string);
+        let dirty_before = app.session.get(id).unwrap().dirty;
+        app.views[0].rotate_view(true);
+        assert_eq!(app.views[0].rotation, 90);
+        assert_eq!(rotations(&app, id), vec![0, 90], "view rotation does not write /Rotate");
+        assert_eq!(app.session.get(id).unwrap().dirty, dirty_before);
+        assert_eq!(app.session.get(id).unwrap().can_undo().map(str::to_string), undo_before);
+        let saved = app.session.save_edited_copy_bytes(id).unwrap();
+        let mut again = PdfCraftApp::new();
+        again.set_view_only(true);
+        again.open_bytes("view-turn.pdf", None, saved.to_vec()).unwrap();
+        assert_eq!(rotations(&again, again.views[0].id), vec![0, 90], "a view turn is not in the saved PDF");
+        assert!(app.execute("page.rotate_ccw"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![0, 0]);
+        assert_eq!(app.views[0].rotation, 90, "undoing the saved turn is not the same as the view turn");
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![0, 90]);
+        assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![0, 0]);
+        for _ in 0..4 {
+            assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        }
+        assert_eq!(rotations(&app, id), vec![0, 0]);
+        for id in
+            ["page.delete", "page.extract", "page.organize", "page.insert", "page.insert_blank", "page.rotate_dialog", "page.duplicate", "file.save"]
+        {
+            assert!(!app.command_allowed(id), "{id}");
+            assert!(!app.execute(id), "{id}");
+        }
+        assert!(app.session.view_only());
+        assert_eq!(rotations(&app, id), vec![0, 0]);
+    }
+
+    #[test]
+    fn page_rotate_refuses_signature_structures_and_restricted_permissions_without_changing_the_file() {
+        let plain = open_blank(1);
+        let base = plain.session.get(plain.views[0].id).unwrap().bytes.clone();
+        let signed = signed_shape(base.as_ref());
+        let mut app = PdfCraftApp::new();
+        app.set_view_only(true);
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        let opened = signed.clone();
+        app.open_bytes("signed-shape.pdf", None, signed).unwrap();
+        let id = app.views[0].id;
+        let spec = pdfcraft_engine::commands::command("page.rotate").unwrap();
+        assert!(!app.command_enabled(spec));
+        assert!(!app.execute("page.rotate"));
+        let toast = app.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        assert!(toast.contains("電子署名") || toast.contains("may contain a digital signature"), "{toast}");
+        assert!(!toast.to_lowercase().contains("valid signature"));
+        assert_eq!(rotations(&app, id), vec![0]);
+        assert!(!app.session.get(id).unwrap().dirty);
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+        assert_eq!(app.session.get(id).unwrap().bytes.as_slice(), opened.as_slice());
+        app.views[0].rotate_view(false);
+        assert_eq!(app.views[0].rotation, 270);
+        assert_eq!(rotations(&app, id), vec![0]);
+        assert!(!app.session.get(id).unwrap().dirty);
+        assert!(app.session.get(id).unwrap().can_undo().is_none());
+
+        let locked = restricted_pdf();
+        let mut limited = PdfCraftApp::new();
+        limited.set_view_only(true);
+        limited.session.grant(pdfcraft_engine::Capability::PageRotate);
+        limited.open_bytes("locked.pdf", None, locked.to_vec()).unwrap();
+        let locked_id = limited.views[0].id;
+        assert!(!limited.execute("page.rotate_ccw"));
+        let why = limited.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        assert!(why.contains("権限") || why.contains("security settings"), "{why}");
+        assert_eq!(rotations(&limited, locked_id), vec![0]);
+        assert!(!limited.session.get(locked_id).unwrap().dirty);
+        assert!(limited.session.get(locked_id).unwrap().can_undo().is_none());
+        assert_eq!(limited.session.get(locked_id).unwrap().bytes.as_slice(), locked.as_slice());
+    }
+
+    #[test]
+    fn page_rotate_keeps_text_stamps_and_close_saving_on_the_existing_copy_path() {
+        let _policy = Policy((crate::output_policy::blocked(), crate::output_policy::save_as_allowed(), crate::output_policy::print_allowed()));
+        crate::output_policy::set_blocked(true);
+        crate::output_policy::set_save_as_allowed(true);
+        let dir = Dir::new("together");
+        let original = dir.0.join("opened.pdf");
+        let existing = dir.0.join("kept.pdf");
+        std::fs::write(&existing, b"KEEP").unwrap();
+        let made = PdfCraftApp::new();
+        let bytes = made.session.create_blank(200.0, 400.0, 1).unwrap().to_vec();
+        std::fs::write(&original, &bytes).unwrap();
+        let mut app = PdfCraftApp::new();
+        app.set_view_only(true);
+        app.open_bytes("opened.pdf", Some(original.to_string_lossy().into_owned()), bytes.clone()).unwrap();
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        app.session.grant(pdfcraft_engine::Capability::SaveAs);
+        app.grant_edit_text();
+        app.grant_stamp();
+        let id = app.views[0].id;
+        assert!(app.apply_edit(text_edit("東京")));
+        assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert_eq!(added_text(&app, id), vec!["東京".to_string()]);
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![0]);
+        assert_eq!(added_text(&app, id), vec!["東京".to_string()]);
+        assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        assert!(app.apply_edit(stamp_edit()));
+        assert_eq!(stamp_pages(&app, id), vec![0]);
+        assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert_eq!(stamp_pages(&app, id), Vec::<usize>::new());
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert!(app.execute("page.rotate_ccw"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![0]);
+        assert!(app.apply_edit(stamp_edit()));
+        assert!(app.execute("page.rotate"), "{:?}", app.toast);
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert_eq!(stamp_pages(&app, id), vec![0]);
+        assert!(app.session.get(id).unwrap().dirty);
+        assert!(!app.execute("file.save"));
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        let ctx = egui::Context::default();
+        assert!(!app.request_quit(&ctx));
+        app.resolve_close(&ctx, None);
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert_eq!(added_text(&app, id), vec!["東京".to_string()]);
+        app.save_override = Some(original.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(!app.confirm_save_copy());
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert!(app.views.iter().any(|view| view.id == id));
+        app.dialog = None;
+        app.save_override = Some(existing.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(!app.confirm_save_copy());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"KEEP");
+        assert_eq!(rotations(&app, id), vec![90]);
+        assert!(app.session.get(id).unwrap().can_undo().is_some());
+        app.dialog = None;
+        let dest = dir.0.join("rotated.pdf");
+        app.save_override = Some(dest.to_string_lossy().into_owned());
+        app.request_close_tab(0);
+        app.resolve_close(&ctx, Some(true));
+        assert!(app.confirm_save_copy(), "{:?}", app.toast);
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"KEEP");
+        let mut again = PdfCraftApp::new();
+        again.set_view_only(true);
+        again.open_bytes("rotated.pdf", None, std::fs::read(&dest).unwrap()).unwrap();
+        let copy = again.views[0].id;
+        assert_eq!(rotations(&again, copy), vec![90]);
+        assert_eq!(added_text(&again, copy), vec!["東京".to_string()]);
+        assert_eq!(stamp_pages(&again, copy), vec![0]);
+    }
+
+    struct Policy((bool, bool, bool));
+
+    impl Drop for Policy {
+        fn drop(&mut self) {
+            crate::output_policy::set_blocked(self.0.0);
+            crate::output_policy::set_save_as_allowed(self.0.1);
+            crate::output_policy::set_print_allowed(self.0.2);
+        }
+    }
+
+    fn open_blank(pages: usize) -> PdfCraftApp {
+        let bytes = pdfcraft_engine::Session::new().create_blank(200.0, 400.0, pages).unwrap();
+        let mut app = PdfCraftApp::new();
+        app.set_view_only(true);
+        app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
+        app.session.grant(pdfcraft_engine::Capability::PageRotate);
+        app.session.grant(pdfcraft_engine::Capability::SaveAs);
+        app
+    }
+
+    fn rotations(app: &PdfCraftApp, id: pdfcraft_engine::DocId) -> Vec<u16> {
+        app.session.get(id).unwrap().info.pages.iter().map(|page| page.rotation).collect()
+    }
+
+    fn added_text(app: &PdfCraftApp, id: pdfcraft_engine::DocId) -> Vec<String> {
+        app.session
+            .get(id)
+            .unwrap()
+            .added()
+            .iter()
+            .filter_map(|item| match &item.content {
+                pdfcraft_engine::AddedContent::Text(text) => Some(text.text.clone()),
+                pdfcraft_engine::AddedContent::Image(_) => None,
+            })
+            .collect()
+    }
+
+    fn stamp_pages(app: &PdfCraftApp, id: pdfcraft_engine::DocId) -> Vec<usize> {
+        app.session.get(id).unwrap().info.annotations.iter().filter(|note| note.subtype == "Stamp").map(|note| note.page).collect()
+    }
+
+    fn text_edit(text: &str) -> pdfcraft_engine::Edit {
+        pdfcraft_engine::Edit::AddText {
+            page: 0,
+            text: pdfcraft_engine::AddedText {
+                rect: [40.0, 200.0, 260.0, 260.0],
+                text: text.into(),
+                size: 16.0,
+                ..pdfcraft_engine::AddedText::default()
+            },
+        }
+    }
+
+    fn stamp_edit() -> pdfcraft_engine::Edit {
+        pdfcraft_engine::Edit::AddCustomStamp {
+            page: 0,
+            rect: [40.0, 40.0, 100.0, 100.0],
+            name: "Probe".into(),
+            file: pdfcraft_engine::MarkFile { name: "probe.png".into(), bytes: std::sync::Arc::new(pdfcraft_xfa::fixtures::tiny_png()), page: 0 },
+            author: "Test".into(),
+            opacity: 1.0,
+        }
+    }
+
+    fn signed_shape(base: &[u8]) -> Vec<u8> {
+        use pdfcraft_cos::{Dict, Document, Object, SaveOptions, write_incremental};
+        let mut doc = Document::open(std::sync::Arc::new(base.to_vec())).unwrap();
+        let mut dict = Dict::new();
+        dict.set(b"ByteRange".to_vec(), Object::Array(vec![0.into(), 10.into(), 20.into(), 30.into()]));
+        let extra = doc.add(dict);
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |page| page.set(b"Extra".to_vec(), Object::Ref(extra))).unwrap();
+        write_incremental(&doc, &SaveOptions::default()).unwrap()
+    }
+
+    fn restricted_pdf() -> std::sync::Arc<Vec<u8>> {
+        use pdfcraft_engine::{Changes, Printing, Protection};
+        let mut author = pdfcraft_engine::Session::new();
+        let blank = author.create_blank(200.0, 300.0, 1).unwrap();
+        let id = author.open("plain.pdf", None, blank, None).unwrap();
+        author
+            .apply(
+                id,
+                pdfcraft_engine::Edit::Protect(Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::High,
+                    changes: Changes::None,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        author.save_bytes(id).unwrap()
     }
 }

@@ -2506,3 +2506,10 @@ animation effects	Off	Vypnuto
 	Make properties default	Nastavit vlastnosti jako výchozí
 	Pages selected	Vybrané stránky
 	Page properties	Vlastnosti stránky
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Otočit zobrazení o 90° doprava (neukládá se do PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Otočit zobrazení o 90° doprava (neukládá se do PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Otočit zobrazení o 90° doleva (neukládá se do PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Otočit zobrazení o 90° doleva (neukládá se do PDF)
+	Rotate current page clockwise 90°	Otočit tuto stránku o 90° doprava
+	Rotate current page counterclockwise 90°	Otočit tuto stránku o 90° doleva
+	Turns the current page by 90°. You can save the result as a new PDF.	Otočí tuto stránku o 90°. Výsledek lze uložit jako nové PDF.

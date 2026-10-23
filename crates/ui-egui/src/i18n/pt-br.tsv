@@ -2446,3 +2446,10 @@ animation effects	Off	Desativados
 	Make properties default	Tornar propriedades padrão
 	Pages selected	Páginas selecionadas
 	Page properties	Propriedades da página
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Girar a exibição 90° no sentido horário (não é salva no PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Girar a exibição 90° no sentido horário (não é salva no PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Girar a exibição 90° no sentido anti-horário (não é salva no PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Girar a exibição 90° no sentido anti-horário (não é salva no PDF)
+	Rotate current page clockwise 90°	Girar a página atual 90° no sentido horário
+	Rotate current page counterclockwise 90°	Girar a página atual 90° no sentido anti-horário
+	Turns the current page by 90°. You can save the result as a new PDF.	Gira a página atual em 90°. O resultado pode ser salvo em um novo PDF.

@@ -118,7 +118,14 @@ fn menus_grey_out_what_changes_or_writes_files() {
     }
     h.get_by_label("Pages ⏵").hover();
     h.run_steps(3);
-    for label in ["Rotate pages clockwise", "Delete pages", "Extract pages…", "Split document…", "New bookmark"] {
+    for label in [
+        "Rotate current page clockwise 90°",
+        "Rotate current page counterclockwise 90°",
+        "Delete pages",
+        "Extract pages…",
+        "Split document…",
+        "New bookmark",
+    ] {
         assert!(disabled(&h, label), "Pages ▸ {label} is disabled");
     }
     // A disabled item does nothing when clicked.
@@ -262,7 +269,8 @@ fn reading_commands_still_work() {
     h.run_steps(2);
     h.get_by_label("View ⏵").hover();
     h.run_steps(3);
-    // The menu item, not the toolbar's button ("Rotate view clockwise (Ctrl+Shift++)").
+    // The menu item, not the toolbar button
+    // ("Rotate the view 90° clockwise (not saved in the PDF) (Ctrl+Shift++)").
     h.get_by(|n| n.label().is_some_and(|l| l.starts_with("Rotate view clockwise ") && !l.contains('('))).click();
     h.run_steps(3);
     assert_eq!(h.state().views[0].rotation, 90, "the view turned");

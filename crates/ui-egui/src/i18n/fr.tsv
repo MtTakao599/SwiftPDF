@@ -2432,3 +2432,10 @@ animation effects	Off	Désactivés
 	Make properties default	Définir comme propriétés par défaut
 	Pages selected	Pages sélectionnées
 	Page properties	Propriétés de la page
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Pivoter l'affichage de 90° vers la droite (non enregistré dans le PDF) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Pivoter l'affichage de 90° vers la droite (non enregistré dans le PDF)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Pivoter l'affichage de 90° vers la gauche (non enregistré dans le PDF) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Pivoter l'affichage de 90° vers la gauche (non enregistré dans le PDF)
+	Rotate current page clockwise 90°	Pivoter la page affichée de 90° vers la droite
+	Rotate current page counterclockwise 90°	Pivoter la page affichée de 90° vers la gauche
+	Turns the current page by 90°. You can save the result as a new PDF.	Fait pivoter la page affichée de 90°. Le résultat peut être enregistré dans un nouveau PDF.

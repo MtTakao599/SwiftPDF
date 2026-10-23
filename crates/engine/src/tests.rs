@@ -5794,8 +5794,17 @@ fn a_recovered_page_tree_opens_unmodified_and_edits_the_pages_shown() {
     assert_eq!(doc.info.pages.len(), 2);
     assert!(!doc.editor.as_ref().unwrap().cos.is_modified(), "the repair is a revision of the opened file, not an unsaved edit");
     assert!(doc.repair_log().iter().any(|l| l.contains("page tree is missing")), "{:?}", doc.repair_log());
-    s.apply(id, Edit::RotatePages { pages: vec![1], degrees: 90 }).unwrap();
-    assert_eq!(s.get(id).unwrap().info.pages.iter().map(|p| p.rotation).collect::<Vec<_>>(), [0, 90]);
+    let refused = s.apply(id, Edit::RotatePages { pages: vec![1], degrees: 90 });
+    assert!(matches!(&refused, Err(EditError::Invalid(m)) if m == PAGE_ROTATE_SIGNATURE), "{refused:?}");
+    let doc = s.get(id).unwrap();
+    assert_eq!(doc.info.pages.iter().map(|p| p.rotation).collect::<Vec<_>>(), [0, 0]);
+    assert!(!doc.dirty && doc.can_undo().is_none());
+    s.apply(
+        id,
+        Edit::AddText { page: 1, text: AddedText { text: "On the second page".into(), rect: [20.0, 240.0, 140.0, 265.0], ..Default::default() } },
+    )
+    .unwrap();
+    assert_eq!(s.get(id).unwrap().added().iter().map(|a| a.page).collect::<Vec<_>>(), [1]);
 }
 
 #[test]

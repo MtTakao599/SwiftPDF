@@ -164,6 +164,13 @@ impl PdfCraftApp {
         self.session.grant(pdfcraft_engine::Capability::Stamp);
     }
 
+    /// Grant rotating the page that is on screen. View-only stays on. Delete, reorder, extract
+    /// and in-place save stay refused. The grant does not skip the signature guard: each document
+    /// is judged again when the command is shown and when it runs.
+    pub fn grant_page_rotate(&mut self) {
+        self.session.grant(pdfcraft_engine::Capability::PageRotate);
+    }
+
     /// Tell the user and return `true` when outputs are refused; for the start of an output, so
     /// nothing is prepared and no file dialog opens.
     pub(crate) fn refuse_output(&mut self) -> bool {

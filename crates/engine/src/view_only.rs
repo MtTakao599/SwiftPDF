@@ -26,6 +26,10 @@
 //!   stamps, other comments, forms or pages. A document that already has a signature, or whose
 //!   signature state cannot be read, is refused. A document that forbids comments is still
 //!   refused. Stamps that were already in the file are not editable.
+//!   [`Capability::PageRotate`] is also separate. With it, only [`crate::Edit::RotatePages`] may
+//!   be applied, undone and redone, and only when the PDF allows assembly and has no signature
+//!   field that holds a signature. Delete, move, extract and every other page edit stay refused.
+//!   The grant does not turn view-only off and does not by itself enable a page-rotate command.
 //!
 //! Reading stays as it is: opening (with a password too) and reloading, rendering, text, search,
 //! forms and signature validation as displayed, layers, hiding comments, reading colours, and
@@ -47,6 +51,8 @@ pub enum Capability {
     Stamp,
     /// Combine, split or extract pages.
     Organize,
+    /// Turn pages by writing `/Rotate`. Not delete, reorder, or extract.
+    PageRotate,
 }
 
 impl Capability {
@@ -57,6 +63,7 @@ impl Capability {
             Self::Print => 1 << 2,
             Self::Stamp => 1 << 3,
             Self::Organize => 1 << 4,
+            Self::PageRotate => 1 << 5,
         }
     }
 }
@@ -314,7 +321,7 @@ mod tests {
         s.grant(Capability::SaveAs);
         assert!(s.view_only());
         assert!(s.allows(Capability::SaveAs));
-        for other in [Capability::EditText, Capability::Print, Capability::Stamp, Capability::Organize] {
+        for other in [Capability::EditText, Capability::Print, Capability::Stamp, Capability::Organize, Capability::PageRotate] {
             assert!(!s.allows(other));
         }
         let opened = s.get(id).unwrap().bytes.clone();
@@ -753,6 +760,7 @@ mod tests {
         assert!(!s.allows(Capability::EditText));
         assert!(!s.allows(Capability::Stamp));
         assert!(!s.allows(Capability::Organize));
+        assert!(!s.allows(Capability::PageRotate));
         let before = s.get(id).unwrap().bytes.clone();
         let generation = s.get(id).unwrap().edit_generation();
         let printed = s.print_pdf(id, &settings).unwrap();
@@ -861,6 +869,7 @@ mod tests {
         assert!(!s.get(id).unwrap().allows_annotation());
         assert!(s.allows_stamp(id), "no security handler still allows a session stamp");
         assert!(!s.allows(Capability::Organize));
+        assert!(!s.allows(Capability::PageRotate));
         s.apply(id, stamp_edit(0, [40.0, 40.0, 100.0, 100.0], 0.5)).unwrap();
         s.apply(id, stamp_edit(1, [20.0, 20.0, 80.0, 80.0], 1.0)).unwrap();
         let doc = s.get(id).unwrap();
@@ -980,6 +989,145 @@ mod tests {
         scanned.apply(id, stamp_edit(0, [4.0, 4.0, 20.0, 20.0], 1.0)).unwrap();
         assert_eq!(scanned.get(id).unwrap().info.annotations.len(), 1);
         assert!(scanned.owns_stamp(id, 0, 0));
+    }
+
+    #[test]
+    fn view_only_page_rotation_saves_a_new_file_and_refuses_everything_else() {
+        use crate::AddedText;
+        let (mut s, id) = view_only_session(3);
+        let original = s.opened_bytes(id).unwrap();
+        let rotate = |pages: Vec<usize>, degrees: i64| Edit::RotatePages { pages, degrees };
+        assert_eq!(s.apply(id, rotate(vec![0], 90)), Err(EditError::ViewOnly));
+        assert!(!s.allows_page_rotate(id));
+        s.grant(Capability::PageRotate);
+        assert!(s.view_only());
+        assert!(!s.get(id).unwrap().editable());
+        assert!(s.allows_page_rotate(id));
+        assert_eq!(s.apply(id, Edit::DeletePages { pages: vec![1] }), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, Edit::MovePages { pages: vec![2], to: 0 }), Err(EditError::ViewOnly));
+        assert_eq!(s.extract(id, &[0]), Err(EditError::ViewOnly));
+        assert_eq!(s.apply(id, rotate(vec![0, 9], 90)), Err(EditError::Organize(pdfcraft_organize::OrganizeError::NoSuchPage(9))));
+        assert_eq!(s.get(id).unwrap().info.pages[0].rotation, 0);
+        assert!(s.get(id).unwrap().can_undo().is_none());
+
+        s.apply(id, rotate(vec![0, 0], 90)).unwrap();
+        assert_eq!(s.get(id).unwrap().info.pages.iter().map(|page| page.rotation).collect::<Vec<_>>(), [90, 0, 0]);
+        assert_eq!(s.undo(id).unwrap().as_str(), "Rotate pages");
+        assert_eq!(s.get(id).unwrap().info.pages[0].rotation, 0);
+        assert_eq!(s.redo(id).unwrap().as_str(), "Rotate pages");
+        assert_eq!(s.get(id).unwrap().info.pages[0].rotation, 90);
+        s.apply(id, rotate(vec![1], -90)).unwrap();
+        s.apply(id, rotate(vec![0, 2], 90)).unwrap();
+        assert_eq!(s.get(id).unwrap().info.pages.iter().map(|page| page.rotation).collect::<Vec<_>>(), [180, 270, 90]);
+        let before_turns = s.get(id).unwrap().info.pages[2].rotation;
+        for _ in 0..4 {
+            s.apply(id, rotate(vec![2], 90)).unwrap();
+        }
+        assert_eq!(s.get(id).unwrap().info.pages[2].rotation, before_turns);
+
+        assert_eq!(s.save_edited_copy_bytes(id), Err(EditError::ViewOnly));
+        s.grant(Capability::SaveAs);
+        let saved = s.save_edited_copy_bytes(id).unwrap();
+        assert!(saved.starts_with(original.as_ref()), "rotation is an incremental update");
+        assert!(std::sync::Arc::ptr_eq(&s.opened_bytes(id).unwrap(), &original));
+        assert_eq!(s.save_bytes(id), Err(EditError::ViewOnly));
+        let mut again = Session::new().with_view_only(true);
+        let copy = again.open("copy.pdf", None, saved, None).unwrap();
+        assert_eq!(again.get(copy).unwrap().info.pages.iter().map(|page| page.rotation).collect::<Vec<_>>(), [180, 270, 90]);
+        assert_eq!(page_text(&again, copy, 0), "Page 1");
+
+        if pdfcraft_fonts::document_japanese_font().is_some() {
+            s.grant(Capability::EditText);
+            s.apply(
+                id,
+                Edit::AddText {
+                    page: 0,
+                    text: AddedText { rect: [10.0, 200.0, 80.0, 240.0], text: "東京".into(), size: 18.0, ..AddedText::default() },
+                },
+            )
+            .unwrap();
+            s.revoke(Capability::EditText);
+            assert!(s.save_edited_copy_bytes(id).is_err(), "text in the history is not saved by the rotation grant");
+            s.grant(Capability::EditText);
+            let with_text = s.save_edited_copy_bytes(id).unwrap();
+            let mut reopened = Session::new().with_view_only(true);
+            let rid = reopened.open("rotated.pdf", None, with_text, None).unwrap();
+            let doc = reopened.get(rid).unwrap();
+            assert_eq!(doc.info.pages[0].rotation, 180);
+            assert!(
+                doc.added()
+                    .iter()
+                    .any(|item| { matches!(&item.content, pdfcraft_edit::Content::Text(text) if text.text == "東京" && item.page == 0) })
+            );
+            assert_eq!(s.undo(id).unwrap().as_str(), "Add text");
+            assert_eq!(s.get(id).unwrap().info.pages[0].rotation, 180, "undoing the text leaves the rotation");
+            assert!(s.get(id).unwrap().added().is_empty());
+            assert_eq!(s.redo(id).unwrap().as_str(), "Add text");
+            assert!(s.get(id).unwrap().added().iter().any(|item| item.page == 0));
+        }
+
+        s.grant(Capability::Stamp);
+        s.apply(id, stamp_edit(0, [20.0, 20.0, 80.0, 80.0], 1.0)).unwrap();
+        s.apply(id, rotate(vec![0], 90)).unwrap();
+        let doc = s.get(id).unwrap();
+        assert_eq!(doc.info.pages[0].rotation, 270);
+        assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
+        s.undo(id).unwrap();
+        assert_eq!(s.get(id).unwrap().info.pages[0].rotation, 180);
+        assert_eq!(s.get(id).unwrap().info.annotations.len(), 1);
+    }
+
+    #[test]
+    fn signed_and_restricted_documents_refuse_page_rotation_before_it_changes_them() {
+        use crate::{Changes, Printing, Protection};
+        let mut signer = Session::new().with_clock(|| 1_800_000_000);
+        let id = signer.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let signed = signer.sign(id, &digital_id(), SignOptions { rect: None, ..SignOptions::default() }).unwrap();
+        let mut open = Session::new().with_clock(|| 1_800_000_000);
+        let id = open.open("signed.pdf", None, signed.clone(), None).unwrap();
+        assert!(open.get(id).unwrap().is_signed());
+        assert!(!open.view_only());
+        assert_eq!(
+            open.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }),
+            Err(EditError::NotPermitted("page rotation on a signed document"))
+        );
+        assert!(!open.get(id).unwrap().dirty);
+        assert!(open.get(id).unwrap().can_undo().is_none());
+
+        let mut view = Session::new().with_view_only(true).with_clock(|| 1_800_000_000);
+        view.grant(Capability::PageRotate);
+        view.grant(Capability::SaveAs);
+        let id = view.open("signed.pdf", None, signed, None).unwrap();
+        assert_eq!(
+            view.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }),
+            Err(EditError::NotPermitted("page rotation on a signed document"))
+        );
+        assert_eq!(
+            view.save_edited_copy_bytes(id).unwrap_err(),
+            EditError::Invalid("there is no added text, stamp, or page rotation to save".into())
+        );
+
+        let mut author = Session::new().with_clock(|| 1_700_000_000);
+        let id = author.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        author
+            .apply(
+                id,
+                Edit::Protect(Protection {
+                    permissions_password: Some("owner".into()),
+                    printing: Printing::High,
+                    changes: Changes::None,
+                    ..Protection::default()
+                }),
+            )
+            .unwrap();
+        let locked = author.save_bytes(id).unwrap();
+        let mut reader = Session::new().with_view_only(true);
+        reader.grant(Capability::PageRotate);
+        let id = reader.open("locked.pdf", None, locked.clone(), None).unwrap();
+        assert!(!reader.allows_page_rotate(id));
+        assert_eq!(reader.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }), Err(EditError::NotPermitted("page changes")));
+        assert!(std::sync::Arc::ptr_eq(&reader.get(id).unwrap().bytes, &locked));
+        assert!(!reader.get(id).unwrap().dirty);
     }
 
     fn text_of(bytes: Vec<u8>) -> String {

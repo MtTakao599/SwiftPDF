@@ -964,6 +964,17 @@ impl DocView {
         }
     }
 
+    /// One page's stored rotation changed its width and height. Refresh that page's layout slot
+    /// and its picture, thumbnail and print preview. Zoom and the other pages stay.
+    pub fn page_geometry_changed(&mut self, page: usize, info: &DocInfo) {
+        if let Some(slot) = self.page_heights.get_mut(page)
+            && let Some(page_info) = info.pages.get(page)
+        {
+            *slot = page_info.height;
+        }
+        self.page_changed(page);
+    }
+
     /// Only `page` changed (a comment was added, edited or removed): re-render that page and
     /// re-read its text, keep everything else. Out-of-date tiles stay on screen until replacements arrive.
     pub fn page_changed(&mut self, page: usize) {
@@ -5236,6 +5247,21 @@ mod tests {
 
     fn synthetic_info(pages: Vec<pdfcraft_render::PageInfo>) -> DocInfo {
         DocInfo { pages, ..Default::default() }
+    }
+
+    #[test]
+    fn one_page_rotation_updates_that_page_height_and_leaves_the_other_page() {
+        let info = synthetic_info(vec![synthetic_page(200.0, 300.0, 0), synthetic_page(200.0, 300.0, 0)]);
+        let mut view = DocView::new(DocId(1), &info, ViewDefaults { zoom: 1.25, ..Default::default() });
+        view.errors.insert(0, "keep".into());
+        view.errors.insert(1, "drop".into());
+        let turned = synthetic_info(vec![synthetic_page(200.0, 300.0, 0), synthetic_page(300.0, 200.0, 90)]);
+        view.page_geometry_changed(1, &turned);
+        assert_eq!(view.page_heights, vec![300.0, 200.0]);
+        assert!((view.zoom - 1.25).abs() < f32::EPSILON);
+        assert_eq!(view.rotation, 0);
+        assert_eq!(view.errors.get(&0).map(String::as_str), Some("keep"));
+        assert!(!view.errors.contains_key(&1));
     }
 
     /// Scroll content for the same rules `document_area` uses when it applies a zoom anchor.

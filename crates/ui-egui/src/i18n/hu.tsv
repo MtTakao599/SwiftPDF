@@ -2431,3 +2431,10 @@ animation effects	Off	Ki
 	Make properties default	Tulajdonságok beállítása alapértelmezettként
 	Pages selected	Kijelölt oldalak
 	Page properties	Oldaltulajdonságok
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Nézet forgatása 90°-kal jobbra (nem kerül a PDF-be) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Nézet forgatása 90°-kal jobbra (nem kerül a PDF-be)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Nézet forgatása 90°-kal balra (nem kerül a PDF-be) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Nézet forgatása 90°-kal balra (nem kerül a PDF-be)
+	Rotate current page clockwise 90°	Az aktuális oldal forgatása 90°-kal jobbra
+	Rotate current page counterclockwise 90°	Az aktuális oldal forgatása 90°-kal balra
+	Turns the current page by 90°. You can save the result as a new PDF.	Az aktuális oldalt 90°-kal elforgatja. Az eredmény új PDF-ként menthető.

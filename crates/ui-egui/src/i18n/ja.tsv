@@ -2432,3 +2432,10 @@ animation effects	Off	オフ
 	Make properties default	プロパティをデフォルトに設定
 	Pages selected	選択したページ
 	Page properties	ページのプロパティ
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	表示を右に90°回転（PDFには保存されません）（{key}）
+	Rotate the view 90° clockwise (not saved in the PDF)	表示を右に90°回転（PDFには保存されません）
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	表示を左に90°回転（PDFには保存されません）（{key}）
+	Rotate the view 90° counterclockwise (not saved in the PDF)	表示を左に90°回転（PDFには保存されません）
+	Rotate current page clockwise 90°	このページを右に90°回転
+	Rotate current page counterclockwise 90°	このページを左に90°回転
+	Turns the current page by 90°. You can save the result as a new PDF.	このページを90°回転します。回転結果は新しいPDFに別名保存できます。

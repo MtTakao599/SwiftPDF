@@ -2430,3 +2430,10 @@ animation effects	Off	Өшірулі
 	Make properties default	Қасиеттерді әдепкі ету
 	Pages selected	Таңдалған беттер
 	Page properties	Бет қасиеттері
+	Rotate the view 90° clockwise (not saved in the PDF) ({key})	Көріністі сағат тілімен 90° бұру (PDF-ке сақталмайды) ({key})
+	Rotate the view 90° clockwise (not saved in the PDF)	Көріністі сағат тілімен 90° бұру (PDF-ке сақталмайды)
+	Rotate the view 90° counterclockwise (not saved in the PDF) ({key})	Көріністі сағат тіліне қарсы 90° бұру (PDF-ке сақталмайды) ({key})
+	Rotate the view 90° counterclockwise (not saved in the PDF)	Көріністі сағат тіліне қарсы 90° бұру (PDF-ке сақталмайды)
+	Rotate current page clockwise 90°	Ағымдағы бетті сағат тілімен 90° бұру
+	Rotate current page counterclockwise 90°	Ағымдағы бетті сағат тіліне қарсы 90° бұру
+	Turns the current page by 90°. You can save the result as a new PDF.	Ағымдағы бетті 90° бұрады. Нәтижені жаңа PDF ретінде сақтауға болады.

@@ -231,7 +231,8 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
                     continue;
                 }
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!(item.label)));
+                let shown = crate::commands::page_rotate_menu_label(item.command).unwrap_or_else(|| tl!(item.label).to_string());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &shown));
                 let ready = item.availability == Availability::Ready;
                 let press = theme::Press::track(ui, &resp);
                 press.wash(ui, rect, 6, false);
@@ -253,10 +254,10 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
                 let chip_label = tl!(chip).to_string();
                 let w = crate::widgets::text_width(ui, &chip_label, &font);
                 let r = Rect::from_center_size(body.right_center() - vec2(w / 2.0 + 10.0, 0.0), vec2(w + 10.0, 16.0));
-                row_label(ui, tl!(item.label), theme::regular(13.0), fg, body.left_center() + vec2(34.0, 0.0), r.left() - body.left() - 42.0);
+                row_label(ui, &shown, theme::regular(13.0), fg, body.left_center() + vec2(34.0, 0.0), r.left() - body.left() - 42.0);
                 ui.painter().rect_filled(r, CornerRadius::same(4), fill);
                 ui.painter().text(r.center(), Align2::CENTER_CENTER, chip_label, font, cfg);
-                let resp = theme::hand(resp).on_hover_text(format!("{} — {}", tl!(item.label), item.command));
+                let resp = theme::hand(resp).on_hover_text(format!("{shown} — {}", item.command));
                 if item.actions.is_empty() {
                     if resp.clicked() {
                         run = Some(item.command);
