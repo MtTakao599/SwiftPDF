@@ -485,58 +485,47 @@ impl std::fmt::Display for VaultError {
 
 impl std::error::Error for VaultError {}
 
-/// Last store I/O failures seen in this process. Test-only: stage, OS error and sizes. Never the
-/// ciphertext, the plaintext, a seal image or a path that is not the folder's own name.
-#[cfg(test)]
+/// Last store I/O failures seen in this process. Stage, class, sizes and OS code only.
+/// Never the ciphertext, the plaintext, a seal image, an approval, or a user path.
 mod io_note {
-    use std::path::Path;
     use std::sync::Mutex;
     use std::time::Instant;
 
     #[derive(Clone, Debug)]
     pub struct Note {
         pub stage: &'static str,
-        pub folder: String,
+        pub class: &'static str,
+        pub op: &'static str,
         pub io_kind: Option<String>,
         pub raw_os: Option<i32>,
         pub generation: u64,
         pub wrote_len: u64,
         pub back_len: Option<u64>,
-        pub v2_exists: bool,
-        pub magic_ok: Option<bool>,
         pub elapsed_ms: u128,
     }
 
     static LAST: Mutex<Vec<Note>> = Mutex::new(Vec::new());
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-    fn folder_name(path: &Path) -> String {
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("?").chars().take(80).collect()
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn record(
         stage: &'static str,
-        dir: &Path,
-        v2: &Path,
+        class: &'static str,
+        op: &'static str,
         generation: u64,
         wrote_len: u64,
         back_len: Option<u64>,
         error: Option<&std::io::Error>,
-        magic_ok: Option<bool>,
     ) {
-        let note = Note {
-            stage,
-            folder: folder_name(dir),
-            io_kind: error.map(|e| format!("{:?}", e.kind())),
-            raw_os: error.and_then(std::io::Error::raw_os_error),
-            generation,
-            wrote_len,
-            back_len,
-            v2_exists: v2.symlink_metadata().is_ok(),
-            magic_ok,
-            elapsed_ms: START.get_or_init(Instant::now).elapsed().as_millis(),
-        };
+        let io_kind = error.map(|e| format!("{:?}", e.kind()));
+        let raw_os = error.and_then(std::io::Error::raw_os_error);
+        let elapsed_ms = START.get_or_init(Instant::now).elapsed().as_millis();
+        log::warn!(
+            "swseal2_io stage={stage} class={class} op={op} gen={generation} wrote={wrote_len} back={} file=seals.v2.bin kind={} os={}",
+            back_len.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            io_kind.as_deref().unwrap_or("-"),
+            raw_os.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        );
+        let note = Note { stage, class, op, io_kind, raw_os, generation, wrote_len, back_len, elapsed_ms };
         if let Ok(mut slot) = LAST.lock() {
             if slot.len() >= 16 {
                 slot.remove(0);
@@ -545,8 +534,8 @@ mod io_note {
         }
     }
 
-    pub fn record_io(stage: &'static str, dir: &Path, v2: &Path, generation: u64, wrote_len: u64, error: &std::io::Error) {
-        record(stage, dir, v2, generation, wrote_len, None, Some(error), None);
+    pub fn record_io(stage: &'static str, class: &'static str, op: &'static str, generation: u64, wrote_len: u64, error: &std::io::Error) {
+        record(stage, class, op, generation, wrote_len, None, Some(error));
     }
 
     pub fn summary() -> String {
@@ -556,8 +545,8 @@ mod io_note {
                 .iter()
                 .map(|n| {
                     format!(
-                        "{} folder={} gen={} wrote={} back={:?} exists={} magic={:?} kind={:?} os={:?} t={}ms",
-                        n.stage, n.folder, n.generation, n.wrote_len, n.back_len, n.v2_exists, n.magic_ok, n.io_kind, n.raw_os, n.elapsed_ms
+                        "stage={} class={} op={} gen={} wrote={} back={:?} file=seals.v2.bin kind={:?} os={:?} t={}ms",
+                        n.stage, n.class, n.op, n.generation, n.wrote_len, n.back_len, n.io_kind, n.raw_os, n.elapsed_ms
                     )
                 })
                 .collect::<Vec<_>>()
@@ -567,7 +556,6 @@ mod io_note {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn last_store_io_notes() -> String {
     io_note::summary()
 }
@@ -689,6 +677,8 @@ pub struct SealVault {
     limits: Limits,
     #[cfg(test)]
     hook: std::sync::Mutex<Option<Hook>>,
+    #[cfg(test)]
+    fail_stage: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl std::fmt::Debug for SealVault {
@@ -753,6 +743,8 @@ impl SealVault {
             limits,
             #[cfg(test)]
             hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_stage: std::sync::Mutex::new(None),
         }
     }
 
@@ -769,6 +761,19 @@ impl SealVault {
         if let Ok(mut slot) = self.hook.lock() {
             *slot = hook;
         }
+    }
+
+    /// Next `seals.v2.bin` write fails at `stage` before touching the file. Production never sets this.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_at(&self, stage: &'static str) {
+        if let Ok(mut slot) = self.fail_stage.lock() {
+            *slot = Some(stage);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_fail_stage(&self) -> Option<&'static str> {
+        self.fail_stage.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Run the test hook. `Err` stands for the process stopping at `point`.
@@ -887,7 +892,7 @@ impl SealVault {
         }
         self.at(Point::LegacyRead)?;
         self.at(Point::BeforeV2Write)?;
-        self.store(&paths, &snapshot, false, Budget::Final)?;
+        self.store(&paths, &snapshot, false, Budget::Final, "migrate")?;
         self.at(Point::AfterV2Write)?;
         let snapshot = self.finish_migration(&paths, snapshot, &mut notices)?;
         let backup = snapshot.migrated_from.as_ref().map(|from| from.backup.clone()).unwrap_or_default();
@@ -911,7 +916,7 @@ impl SealVault {
             return Err(VaultError::Rejected(RECORD_ERROR.into()));
         }
         let mut created = None;
-        let mut applied = self.apply(Budget::General, |next| {
+        let mut applied = self.apply(Budget::General, "register", |next| {
             if next.seals.len() >= MAX_SEALS {
                 return Err(OpError::Conflict(Conflict::TooManySeals));
             }
@@ -950,7 +955,7 @@ impl SealVault {
 
     /// Change one seal, if it is still at `base_revision`.
     pub fn update(&self, seal_id: &str, base_revision: u64, change: SealChange) -> Result<Applied, VaultError> {
-        self.apply(Budget::General, |next| {
+        self.apply(Budget::General, "update", |next| {
             let index = current_seal(next, seal_id, base_revision)?;
             let Some(seal) = next.seals.get_mut(index) else { return Err(OpError::Conflict(Conflict::SealMissing)) };
             let mut changed = seal.clone();
@@ -978,7 +983,7 @@ impl SealVault {
 
     /// Delete one seal, if it is still at `base_revision`. Its id is kept and never reused.
     pub fn delete(&self, seal_id: &str, base_revision: u64) -> Result<Applied, VaultError> {
-        self.apply(Budget::Final, |next| {
+        self.apply(Budget::Final, "delete", |next| {
             let index = current_seal(next, seal_id, base_revision)?;
             if index >= next.seals.len() {
                 return Err(OpError::Conflict(Conflict::SealMissing));
@@ -1002,7 +1007,7 @@ impl SealVault {
         if !id_ok(&approval.op_id, "op") {
             return Err(VaultError::Rejected(RECORD_ERROR.into()));
         }
-        self.apply(Budget::General, |next| {
+        self.apply(Budget::General, "record_approval", |next| {
             match next.use_state(&approval.op_id) {
                 UseState::Unknown => {}
                 UseState::Approved => {
@@ -1031,7 +1036,7 @@ impl SealVault {
     /// left for the committed or cancelled line. The caller places the stamp only after `Ok`.
     pub fn prepare_use(&self, approval: &ApprovalRef, details: &UseDetails) -> Result<Applied, VaultError> {
         check_details(details).map_err(|_| VaultError::Rejected(RECORD_ERROR.into()))?;
-        self.apply(Budget::General, |next| {
+        self.apply(Budget::General, "prepare_use", |next| {
             match next.use_state(&approval.op_id) {
                 UseState::Unknown => return Err(OpError::Conflict(Conflict::NotApproved)),
                 UseState::Approved => {}
@@ -1085,7 +1090,7 @@ impl SealVault {
     }
 
     fn finish_use(&self, op_id: &str, finish: &'static str) -> Result<Applied, VaultError> {
-        self.apply(Budget::Final, |next| {
+        self.apply(Budget::Final, finish, |next| {
             match (next.use_state(op_id), finish) {
                 (UseState::Prepared, _) => {}
                 (UseState::Committed(_), kind::USE_COMMITTED) | (UseState::Cancelled, kind::USE_CANCELLED) => {
@@ -1105,7 +1110,7 @@ impl SealVault {
         if !id_ok(step_id, "step") {
             return Err(VaultError::Rejected(RECORD_ERROR.into()));
         }
-        self.apply(Budget::Final, |next| {
+        self.apply(Budget::Final, "note_use_step", |next| {
             if let Some(event) = next.use_events(op_id).find(|event| event.step_id == step_id) {
                 return if event.kind == step.kind() { Ok(Change::Unchanged) } else { Err(OpError::Conflict(Conflict::StepIdReused)) };
             }
@@ -1120,7 +1125,7 @@ impl SealVault {
     }
 
     /// The transaction every change goes through.
-    fn apply(&self, budget: Budget, op: impl FnOnce(&mut Snapshot) -> Result<Change, OpError>) -> Result<Applied, VaultError> {
+    fn apply(&self, budget: Budget, kind: &'static str, op: impl FnOnce(&mut Snapshot) -> Result<Change, OpError>) -> Result<Applied, VaultError> {
         let Some(paths) = self.paths(true)? else { return Err(VaultError::Io(FOLDER_ERROR)) };
         let _lock = self.lock(&paths)?;
         let mut notices = Vec::new();
@@ -1158,7 +1163,7 @@ impl SealVault {
         for event in next.events.iter_mut().skip(before) {
             event.seq = generation;
         }
-        let size = self.store(&paths, &next, existed, budget)?;
+        let size = self.store(&paths, &next, existed, budget, kind)?;
         if !existed {
             self.ensure_tombstone(&paths, &mut notices);
         }
@@ -1186,7 +1191,7 @@ impl SealVault {
 
     /// Encode, check the size, write, and read the file back. `existed` picks atomic replacement
     /// of the current file or creation of a new one that replaces nothing.
-    fn store(&self, paths: &Paths, snapshot: &Snapshot, existed: bool, budget: Budget) -> Result<u64, VaultError> {
+    fn store(&self, paths: &Paths, snapshot: &Snapshot, existed: bool, budget: Budget, op: &'static str) -> Result<u64, VaultError> {
         validate(snapshot).map_err(|_| VaultError::Rejected(RECORD_ERROR.into()))?;
         let bytes = encode(snapshot)?;
         let size = bytes.len() as u64;
@@ -1194,64 +1199,56 @@ impl SealVault {
             return Err(VaultError::Full { limit: self.limits.max_file_bytes });
         }
         self.at(Point::BeforeWrite)?;
+        #[cfg(test)]
+        if let Some(stage) = self.take_fail_stage() {
+            io_note::record(stage, "Io", op, snapshot.generation, size, None, None);
+            return Err(VaultError::Io(WRITE_ERROR));
+        }
         if existed {
-            if let Err(_error) =
-                with_retry(|| pdfcraft_platform::staging::write_atomically(&paths.v2, &bytes, pdfcraft_platform::staging::StagingName::TagThenSuffix))
-            {
-                #[cfg(test)]
-                io_note::record_io("atomic_write", &paths.dir, &paths.v2, snapshot.generation, size, &_error);
+            let mut last_stage = pdfcraft_platform::staging::AtomicWriteStage::Create;
+            if let Err(_error) = with_retry(|| {
+                match pdfcraft_platform::staging::write_atomically_detailed(
+                    &paths.v2,
+                    &bytes,
+                    pdfcraft_platform::staging::StagingName::TagThenSuffix,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        last_stage = error.stage;
+                        Err(error.source)
+                    }
+                }
+            }) {
+                io_note::record_io(last_stage.as_str(), "Io", op, snapshot.generation, size, &_error);
                 return Err(VaultError::Io(WRITE_ERROR));
             }
-        } else {
-            create_new_file(&paths.v2, &bytes, snapshot.generation)?;
+        } else if let Err(error) = create_new_file(&paths.v2, &bytes, snapshot.generation, op) {
+            return Err(error);
         }
         self.at(Point::AfterWrite)?;
         let back = match read_opt(&paths.v2) {
             Ok(Some(back)) => back,
             Ok(None) => {
-                #[cfg(test)]
-                io_note::record("verify_missing", &paths.dir, &paths.v2, snapshot.generation, size, None, None, None);
+                io_note::record("reread", "Verify", op, snapshot.generation, size, None, None);
                 return Err(VaultError::Verify);
             }
             Err(error) => {
-                #[cfg(test)]
-                io_note::record("verify_read", &paths.dir, &paths.v2, snapshot.generation, size, None, None, None);
+                io_note::record("reread", "Verify", op, snapshot.generation, size, None, None);
                 return Err(error);
             }
         };
         if back != bytes {
-            #[cfg(test)]
-            io_note::record(
-                "verify_bytes",
-                &paths.dir,
-                &paths.v2,
-                snapshot.generation,
-                size,
-                Some(back.len() as u64),
-                None,
-                Some(back.starts_with(MAGIC)),
-            );
+            io_note::record("verify_bytes", "Verify", op, snapshot.generation, size, Some(back.len() as u64), None);
             return Err(VaultError::Verify);
         }
         match decode(&back) {
             Ok(got) if got == *snapshot => Ok(size),
             Ok(_) => {
-                #[cfg(test)]
-                io_note::record("verify_decode", &paths.dir, &paths.v2, snapshot.generation, size, Some(back.len() as u64), None, Some(true));
+                io_note::record("verify_decode", "Verify", op, snapshot.generation, size, Some(back.len() as u64), None);
                 Err(VaultError::Verify)
             }
             Err(_) => {
-                #[cfg(test)]
-                io_note::record(
-                    "verify_undecodable",
-                    &paths.dir,
-                    &paths.v2,
-                    snapshot.generation,
-                    size,
-                    Some(back.len() as u64),
-                    None,
-                    Some(back.starts_with(MAGIC)),
-                );
+                io_note::record("verify_undecodable", "Verify", op, snapshot.generation, size, Some(back.len() as u64), None);
                 Err(VaultError::Verify)
             }
         }
@@ -1330,7 +1327,7 @@ impl SealVault {
             {
                 note.backup = name.clone();
             }
-            self.store(paths, &rebuilt, true, Budget::Final)?;
+            self.store(paths, &rebuilt, true, Budget::Final, "rebuild")?;
             snapshot = rebuilt;
             backup_name = name;
         }
@@ -1845,57 +1842,53 @@ fn with_retry<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Re
 
 /// Publish a new `seals.v2.bin` without replacing anything: by hard link from a finished staging
 /// file, or, on a volume without hard links, by writing it with `create_new`.
-fn create_new_file(path: &Path, bytes: &[u8], generation: u64) -> Result<(), VaultError> {
+fn create_new_file(path: &Path, bytes: &[u8], generation: u64, op: &'static str) -> Result<(), VaultError> {
     match pdfcraft_platform::save_path::write_new_file(None, path, bytes) {
         Ok(()) => Ok(()),
-        Err(pdfcraft_platform::save_path::NewFileError::LinkUnavailable(_)) => create_new_plain(path, bytes, generation),
+        Err(pdfcraft_platform::save_path::NewFileError::LinkUnavailable(_)) => create_new_plain(path, bytes, generation, op),
         Err(_error) => {
-            #[cfg(test)]
-            {
-                let dir = path.parent().unwrap_or(path);
-                match &_error {
-                    pdfcraft_platform::save_path::NewFileError::Io(io) => {
-                        io_note::record_io("create_new", dir, path, generation, bytes.len() as u64, io);
-                    }
-                    other => io_note::record(
-                        match other {
-                            pdfcraft_platform::save_path::NewFileError::DestinationExists => "create_new_exists",
-                            pdfcraft_platform::save_path::NewFileError::SameAsOriginal => "create_new_same",
-                            pdfcraft_platform::save_path::NewFileError::Unresolved(_) => "create_new_unresolved",
-                            pdfcraft_platform::save_path::NewFileError::LinkUnavailable(_) => "create_new_link",
-                            pdfcraft_platform::save_path::NewFileError::Io(_) => "create_new",
-                        },
-                        dir,
-                        path,
-                        generation,
-                        bytes.len() as u64,
-                        None,
-                        None,
-                        None,
-                    ),
+            match &_error {
+                pdfcraft_platform::save_path::NewFileError::Io(io) => {
+                    io_note::record_io("create", "Io", op, generation, bytes.len() as u64, io);
                 }
+                other => io_note::record(
+                    match other {
+                        pdfcraft_platform::save_path::NewFileError::DestinationExists => "create",
+                        pdfcraft_platform::save_path::NewFileError::SameAsOriginal => "create",
+                        pdfcraft_platform::save_path::NewFileError::Unresolved(_) => "create",
+                        pdfcraft_platform::save_path::NewFileError::LinkUnavailable(_) => "create",
+                        pdfcraft_platform::save_path::NewFileError::Io(_) => "create",
+                    },
+                    "Io",
+                    op,
+                    generation,
+                    bytes.len() as u64,
+                    None,
+                    None,
+                ),
             }
-            let _ = generation;
             Err(VaultError::Io(WRITE_ERROR))
         }
     }
 }
 
-fn create_new_plain(path: &Path, bytes: &[u8], generation: u64) -> Result<(), VaultError> {
+fn create_new_plain(path: &Path, bytes: &[u8], generation: u64, op: &'static str) -> Result<(), VaultError> {
     let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
         Err(_error) => {
-            #[cfg(test)]
-            io_note::record_io("create_plain", path.parent().unwrap_or(path), path, generation, bytes.len() as u64, &_error);
-            let _ = generation;
+            io_note::record_io("create", "Io", op, generation, bytes.len() as u64, &_error);
             return Err(VaultError::Io(WRITE_ERROR));
         }
     };
-    if let Err(_error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        #[cfg(test)]
-        io_note::record_io("create_plain_write", path.parent().unwrap_or(path), path, generation, bytes.len() as u64, &_error);
+    if let Err(_error) = file.write_all(bytes) {
+        io_note::record_io("write", "Io", op, generation, bytes.len() as u64, &_error);
         drop(file);
-        // `create_new` made this file, so removing the partial write removes nothing else.
+        let _ = std::fs::remove_file(path);
+        return Err(VaultError::Io(WRITE_ERROR));
+    }
+    if let Err(_error) = file.sync_all() {
+        io_note::record_io("sync", "Io", op, generation, bytes.len() as u64, &_error);
+        drop(file);
         let _ = std::fs::remove_file(path);
         return Err(VaultError::Io(WRITE_ERROR));
     }

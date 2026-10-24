@@ -141,6 +141,7 @@ pub(crate) const MAX_AUTHOR_CHARS: usize = 200;
 #[cfg(not(target_arch = "wasm32"))]
 mod open_worker;
 mod organize_panel;
+pub mod data_store;
 pub mod portable;
 mod protect;
 mod recovery;
@@ -701,6 +702,10 @@ pub struct PdfCraftApp {
     pub host_dirty: Option<HostDirtyFn>,
     /// A pending "save changes?" question (closing a dirty tab or quitting).
     pub close_request: Option<CloseRequest>,
+    /// A pending "discard this uncommitted stamp?" question. Asked before [`Self::close_request`].
+    pub(crate) place_close_request: Option<CloseRequest>,
+    /// The folder this process is actually using for settings and seals. Read-only display.
+    pub data_store: Option<data_store::DataStoreInfo>,
     /// Close this after a view-only copy of uncommitted added text is written.
     /// Moved onto [`editing::SaveCopyRequest`] once a destination is chosen.
     pub(crate) close_after_copy: Option<CloseRequest>,
@@ -961,6 +966,8 @@ pub(crate) enum PromptLayer {
     Unlock,
     /// A chairman-seal store operation is running. It holds all input until the store answers.
     SealWork,
+    /// Discard-or-keep an uncommitted stamp placement.
+    PlaceClose,
 }
 
 /// An address a document asked to open, waiting for the user to allow or cancel it.
@@ -1097,6 +1104,8 @@ impl PdfCraftApp {
             host_save: None,
             host_dirty: None,
             close_request: None,
+            place_close_request: None,
+            data_store: None,
             close_after_copy: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_overwrite: None,
@@ -2077,6 +2086,9 @@ impl PdfCraftApp {
     pub(crate) fn front_prompt(&self) -> Option<PromptLayer> {
         if self.seals.blocking() {
             return Some(PromptLayer::SealWork);
+        }
+        if self.place_close_request.is_some() {
+            return Some(PromptLayer::PlaceClose);
         }
         if self.unlock_prompt.is_some() {
             return Some(PromptLayer::Unlock);
@@ -3284,6 +3296,7 @@ impl eframe::App for PdfCraftApp {
             && self.image_import.is_none()
             && self.dialog.is_none()
             && self.close_request.is_none()
+            && self.place_close_request.is_none()
             && self.pending_link.is_none()
             && self.pending_remote_link.is_none()
         {
@@ -3350,7 +3363,7 @@ impl eframe::App for PdfCraftApp {
         }
         // A field that refused its value this frame keeps the shortcut from saving or printing
         // behind the user's back; so does a save prompt opened since.
-        if self.process_pending_edits() && self.close_request.is_none() {
+        if self.process_pending_edits() && self.close_request.is_none() && self.place_close_request.is_none() {
             for (id, doc) in deferred {
                 // Only in the document the shortcut was pressed in.
                 if self.active_ids().map(|(_, active)| active) == doc {

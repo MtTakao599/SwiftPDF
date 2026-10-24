@@ -64,6 +64,51 @@ pub fn staging_suffixes() -> impl Iterator<Item = u64> {
     (0u64..).map(move |i| state.hash_one(i))
 }
 
+/// Which step of [`write_atomically_detailed`] failed. The target is left as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicWriteStage {
+    Create,
+    Write,
+    Sync,
+    Rename,
+}
+
+impl AtomicWriteStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Write => "write",
+            Self::Sync => "sync",
+            Self::Rename => "rename",
+        }
+    }
+}
+
+/// A failed atomic write, with the step that failed. Never includes the bytes that were written.
+#[derive(Debug)]
+pub struct AtomicWriteError {
+    pub stage: AtomicWriteStage,
+    pub source: std::io::Error,
+}
+
+impl AtomicWriteError {
+    fn new(stage: AtomicWriteStage, source: std::io::Error) -> Self {
+        Self { stage, source }
+    }
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage.as_str(), self.source)
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Write `bytes` to `path` through a staging file beside it (see [`create_staging`]; `form`
 /// names it as the caller always has), flushed to the disk and then renamed over the target: a
 /// crash, a full disk or a refused flush never leaves a half-written file where a good one was,
@@ -71,7 +116,13 @@ pub fn staging_suffixes() -> impl Iterator<Item = u64> {
 /// a folder at the target is refused by the rename. Flushing is the staging file's own
 /// (`sync_all`); parent-directory durability after a power loss is not promised.
 pub fn write_atomically(path: &Path, bytes: &[u8], form: StagingName) -> std::io::Result<()> {
-    write_atomically_with(path, bytes, form, staging_suffixes(), std::fs::File::sync_all)
+    write_atomically_detailed(path, bytes, form).map_err(|e| e.source)
+}
+
+/// [`write_atomically`] with the failed step named, so a caller can log create/write/sync/rename
+/// without changing the write itself.
+pub fn write_atomically_detailed(path: &Path, bytes: &[u8], form: StagingName) -> Result<(), AtomicWriteError> {
+    write_atomically_detailed_with(path, bytes, form, staging_suffixes(), std::fs::File::sync_all)
 }
 
 /// [`write_atomically`] with the staging-name suffixes and the flush given, so tests can plant
@@ -84,18 +135,28 @@ pub fn write_atomically_with(
     suffixes: impl IntoIterator<Item = u64>,
     sync_all: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    write_atomically_detailed_with(path, bytes, form, suffixes, sync_all).map_err(|e| e.source)
+}
+
+fn write_atomically_detailed_with(
+    path: &Path,
+    bytes: &[u8],
+    form: StagingName,
+    suffixes: impl IntoIterator<Item = u64>,
+    sync_all: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), AtomicWriteError> {
     use std::io::Write as _;
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("save");
-    let (tmp, file) = create_staging(dir, name, form, suffixes)?;
+    let (tmp, file) = create_staging(dir, name, form, suffixes).map_err(|e| AtomicWriteError::new(AtomicWriteStage::Create, e))?;
     let result = (|| {
         // Closed at the end of the block, before the rename (required on Windows).
         {
             let mut file = file;
-            file.write_all(bytes)?;
-            sync_staged(&file, sync_all)?;
+            file.write_all(bytes).map_err(|e| AtomicWriteError::new(AtomicWriteStage::Write, e))?;
+            sync_staged(&file, sync_all).map_err(|e| AtomicWriteError::new(AtomicWriteStage::Sync, e))?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path).map_err(|e| AtomicWriteError::new(AtomicWriteStage::Rename, e))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -213,6 +274,28 @@ mod tests {
         // A folder that does not exist: nothing is written anywhere.
         assert!(write_atomically(&dir.join("missing").join("out.pdf"), b"X", StagingName::SuffixThenTag).is_err());
         assert_eq!(names(&dir), ["out.pdf"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_atomic_write_names_the_failed_step() {
+        let dir = test_dir("stages");
+        let blocked = dir.join("as-file");
+        std::fs::write(&blocked, b"x").unwrap();
+        let create = write_atomically_detailed(&blocked.join("out.bin"), b"NEW", StagingName::TagThenSuffix).unwrap_err();
+        assert_eq!(create.stage, AtomicWriteStage::Create);
+
+        let target = dir.join("out.bin");
+        std::fs::write(&target, b"OLD").unwrap();
+        let sync = write_atomically_detailed_with(&target, b"NEWER", StagingName::TagThenSuffix, [8], |_| Err(std::io::Error::other("refused")))
+            .unwrap_err();
+        assert_eq!(sync.stage, AtomicWriteStage::Sync);
+        assert_eq!(std::fs::read(&target).unwrap(), b"OLD");
+
+        let folder = dir.join("folder-target");
+        std::fs::create_dir(&folder).unwrap();
+        let rename = write_atomically_detailed(&folder, b"NEW", StagingName::TagThenSuffix).unwrap_err();
+        assert_eq!(rename.stage, AtomicWriteStage::Rename);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

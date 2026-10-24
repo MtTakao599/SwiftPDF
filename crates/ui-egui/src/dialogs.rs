@@ -67,6 +67,7 @@ fn show_seal_effects_window(app: &mut PdfCraftApp, ctx: &egui::Context) {
 
 fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     password(app, ctx);
+    place_close_prompt(app, ctx);
     save_prompt(app, ctx);
     link_prompt(app, ctx);
     remote_link_prompt(app, ctx);
@@ -1298,14 +1299,9 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     2 => crate::credits::models_ui(ui),
                     _ => {
                         let view_only = app.session.view_only();
-                        ui.horizontal(|ui| {
-                            if !view_only {
-                                widgets::artcraft_mark(ui, 40.0);
-                            }
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(crate::identity::APP_NAME).font(theme::semibold(20.0)));
-                                ui.label(crate::i18n::fmt(tl!("Version {v}"), &[("v", &pdfcraft_engine::build_info::version())]));
-                            });
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(crate::identity::APP_NAME).font(theme::semibold(20.0)));
+                            ui.label(crate::i18n::fmt(tl!("Version {v}"), &[("v", &pdfcraft_engine::build_info::version())]));
                         });
                         ui.add_space(6.0);
                         ui.label(tl!("A clean-room, open-source PDF application written in Rust. MIT OR Apache-2.0."));
@@ -1317,16 +1313,33 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                             .small(),
                         );
                         ui.add_space(12.0);
-                        if view_only {
-                            ui.label(crate::identity::localized(
-                                "PdfCraft を基にしています。Copyright (c) the PdfCraft contributors.",
-                                "Based on PdfCraft. Copyright (c) the PdfCraft contributors.",
-                            ));
-                        } else {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(tl!("Part of")).color(t.text_muted));
-                                widgets::artcraft_logo(ui, 16.0);
-                            });
+                        // Plain-text provenance only. ArtCraft marks must not appear in a modified
+                        // product (docs/brand/LICENSE-brand.txt). The copyright line matches LICENSE-MIT.
+                        ui.label(crate::identity::localized(
+                            "PdfCraft を基にしています。Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.",
+                            "Based on PdfCraft. Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.",
+                        ));
+                        if let Some(info) = app.data_store.as_ref() {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(crate::identity::localized("データ保存先", "Data folder")).small().color(t.text_muted));
+                            ui.label(info.mode_label());
+                            ui.label(egui::RichText::new(info.path.display().to_string()).small().monospace());
+                            if info.mode == crate::data_store::DataStoreMode::PortableFallback {
+                                ui.label(
+                                    egui::RichText::new(crate::identity::localized(
+                                        "ポータブル用 Data には保存していません。保存先を確認してください。",
+                                        "Not using portable Data. Check this location.",
+                                    ))
+                                    .color(t.text_muted)
+                                    .small(),
+                                );
+                            }
+                        } else if let Some(path) = app.displayed_data_path() {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(crate::identity::localized("データ保存先", "Data folder")).small().color(t.text_muted));
+                            ui.label(egui::RichText::new(path.display().to_string()).small().monospace());
+                        }
+                        if !view_only {
                             ui.add_space(6.0);
                             if let Some(cmd) = widgets::community_links(ui) {
                                 link_command = Some(cmd);
@@ -1647,6 +1660,58 @@ pub(crate) fn save_prompt_key(ctx: &egui::Context) -> Option<Option<bool>> {
             None
         }
     })
+}
+
+/// Discard or keep an uncommitted stamp before the save prompt.
+fn place_close_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    let Some(req) = app.place_close_request else { return };
+    let index = match req {
+        crate::editing::CloseRequest::Tab(id) => app.views.iter().position(|v| v.id == id),
+        crate::editing::CloseRequest::Quit | crate::editing::CloseRequest::All => app.first_pending_place(),
+    };
+    if index.is_none_or(|i| !app.has_pending_place(i)) {
+        app.resolve_place_close(ctx, Some(true));
+        return;
+    }
+    let chairman = index.and_then(|i| app.views.get(i)).and_then(|v| v.stamp_place.as_ref()).is_some_and(|place| place.chairman);
+    let t = Tokens::get(ctx);
+    let mut choice: Option<Option<bool>> = None;
+    let modal = widgets::show_modal(ctx, "place_close_prompt", |ui| {
+        ui.set_width(420.0);
+        ui.label(
+            egui::RichText::new(if chairman {
+                crate::identity::localized("理事長印が仮置きのままです。", "A chairman seal is placed but not in the PDF yet.")
+            } else {
+                crate::identity::localized("スタンプが仮置きのままです。", "A stamp is placed but not in the PDF yet.")
+            })
+            .font(theme::semibold(16.0)),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(crate::identity::localized(
+                "まだ PDF には入っていません。閉じるとこの仮置きだけ破棄されます。保存済みの編集とは別です。",
+                "It is not in the PDF yet. Closing discards this placement only, not saved edits.",
+            ))
+            .color(t.text_muted),
+        );
+        ui.add_space(14.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if widgets::pill_button(ui, crate::identity::localized("編集に戻る", "Return to editing"), true).clicked() {
+                choice = Some(None);
+            }
+            if widgets::pill_button(ui, crate::identity::localized("仮置きを破棄して閉じる", "Discard placement and close"), false).clicked() {
+                choice = Some(Some(true));
+            }
+        });
+    });
+    if app.front_prompt() == Some(crate::PromptLayer::PlaceClose) && choice.is_none() && modal.should_close() {
+        choice = Some(None);
+    }
+    if app.front_prompt() == Some(crate::PromptLayer::PlaceClose)
+        && let Some(c) = choice
+    {
+        app.resolve_place_close(ctx, c);
+    }
 }
 
 /// "Save changes?" when closing a tab or quitting with unsaved edits.

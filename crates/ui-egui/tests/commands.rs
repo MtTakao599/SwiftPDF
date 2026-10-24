@@ -505,6 +505,30 @@ fn the_about_dialog_shows_the_running_version() {
 }
 
 #[test]
+fn the_about_dialog_shows_the_actual_data_folder() {
+    let dir = std::env::temp_dir().join(format!("swiftpdf-about-data-{}-{}", std::process::id(), "step122"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        assert!(!dir.starts_with(std::path::PathBuf::from(local).join("SwiftPDF")));
+    }
+    let shown = dir.clone();
+    let mut h = harness();
+    h.state_mut().set_data_store(pdfcraft_ui_egui::data_store::describe_with(
+        shown.clone(),
+        &pdfcraft_ui_egui::portable::Portable { dir: Some(shown.clone()), unwritable: None },
+    ));
+    h.state_mut().set_seal_dir(shown.clone());
+    assert_eq!(h.state().displayed_data_path(), Some(shown.as_path()));
+    h.state_mut().execute("help.about");
+    h.run_steps(3);
+    h.get_by_label_contains("Data folder");
+    h.get_by_label_contains("Portable");
+    h.get_by_label_contains(&shown.to_string_lossy());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn quit_shortcut_requires_exact_modifiers_and_preserves_unsaved_work() {
     for (os, modifiers) in [
         (OperatingSystem::Windows, Modifiers { ctrl: true, command: true, ..Default::default() }),

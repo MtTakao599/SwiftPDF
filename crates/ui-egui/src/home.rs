@@ -29,11 +29,15 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                 tl!("Welcome to PdfCraft").to_string()
             };
             ui.label(egui::RichText::new(welcome).font(theme::semibold(24.0)));
-            ui.label(
-                egui::RichText::new(tl!("An open-source PDF workbench — local, private, and scriptable."))
-                    .color(t.text_muted)
-                    .font(theme::regular(14.0)),
-            );
+            let subtitle = if view_only {
+                crate::identity::localized(
+                    "PDF の閲覧・編集・スタンプ・安全な別名保存ができます。",
+                    "View, edit, stamp, and save a safe copy of a PDF.",
+                )
+            } else {
+                tl!("An open-source PDF workbench — local, private, and scriptable.").to_string()
+            };
+            ui.label(egui::RichText::new(subtitle).color(t.text_muted).font(theme::regular(14.0)));
             ui.add_space(14.0);
             // A view-only app has nothing to promote and no editing tools to recommend. Both come
             // back with editing; Open file, folders and the recent list stay.
@@ -45,12 +49,9 @@ pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            widgets::artcraft_mark(ui, 28.0);
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(tl!("Join the ArtCraft community")).font(theme::semibold(15.0)));
-                                ui.label(egui::RichText::new(tl!("Get help, share feedback and follow development on Discord.")).color(t.text_muted));
-                            });
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(tl!("Join the ArtCraft community")).font(theme::semibold(15.0)));
+                            ui.label(egui::RichText::new(tl!("Get help, share feedback and follow development on Discord.")).color(t.text_muted));
                         });
                         ui.add_space(8.0);
                         if let Some(cmd) = widgets::community_links(ui) {

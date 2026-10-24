@@ -308,6 +308,11 @@ impl SealService {
         self.vault.as_deref()
     }
 
+    /// Folder the store was opened on. Same path `set_seal_dir` received.
+    pub fn store_dir(&self) -> Option<&std::path::Path> {
+        self.vault.as_ref().map(|vault| vault.dir())
+    }
+
     pub(crate) fn set_context(&mut self, ctx: &egui::Context) {
         if let Ok(mut slot) = self.ctx.lock()
             && slot.is_none()

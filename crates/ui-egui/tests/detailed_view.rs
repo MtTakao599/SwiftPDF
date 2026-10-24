@@ -109,6 +109,8 @@ fn a_view_only_detailed_window_keeps_reading_and_hides_editing() {
     assert!(h.query_by_label_contains("Recommended tools").is_none());
     assert!(h.query_by_label_contains("Welcome to SwiftPDF").is_some(), "the detailed home names SwiftPDF");
     assert!(h.query_by_label_contains("Welcome to PdfCraft").is_none(), "the detailed home does not name PdfCraft");
+    assert!(h.query_by_label_contains("View, edit, stamp, and save a safe copy").is_some(), "the subtitle matches what SwiftPDF can do");
+    assert!(h.query_by_label_contains("scriptable").is_none(), "scriptable is not offered");
     assert!(h.query_by_label("Open file").is_some());
     assert_eq!(h.state().views.len(), 2, "Home closes nothing");
 }
@@ -127,6 +129,8 @@ fn the_detailed_home_names_swiftpdf_in_japanese() {
     h.run_steps(4);
     assert!(h.query_by_label_contains("SwiftPDF へようこそ").is_some(), "Japanese detailed home names SwiftPDF");
     assert!(h.query_by_label_contains("PdfCraft へようこそ").is_none());
+    assert!(h.query_by_label_contains("安全な別名保存").is_some());
+    assert!(h.query_by_label_contains("scriptable").is_none());
 }
 
 #[test]

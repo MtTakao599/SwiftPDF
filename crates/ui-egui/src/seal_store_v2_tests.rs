@@ -1350,3 +1350,74 @@ fn a_lock_held_by_another_vault_is_busy_and_the_waiter_writes_nothing() {
     assert!(worker.join().expect("the holder thread").unwrap().changed);
     assert_eq!(ready(&SealVault::new(&path)).use_state(&waiting.op_id), UseState::Unknown);
 }
+
+fn notes_are_safe(notes: &str) {
+    assert!(!notes.contains("Users\\"), "{notes}");
+    assert!(!notes.contains("/Users/"), "{notes}");
+    assert!(!notes.contains("iVBORw0"), "{notes}");
+    assert!(!notes.contains("合成印"), "{notes}");
+    assert!(!notes.contains("password"), "{notes}");
+    assert!(notes.contains("file=seals.v2.bin") || notes == "no store I/O notes", "{notes}");
+}
+
+#[test]
+fn write_stage_failures_are_named_and_keep_the_history() {
+    let dir = TestDir::new("io-stages");
+    let vault = SealVault::new(dir.path());
+    let first = vault.register(new_seal("合成A", 1)).unwrap();
+    let events_before = first.snapshot.events.len();
+    let bytes_before = std::fs::read(dir.v2()).unwrap();
+    for stage in ["create", "write", "sync", "rename"] {
+        vault.fail_next_write_at(stage);
+        let refused = vault.register(new_seal("合成B", 2));
+        assert_eq!(refused, Err(VaultError::Io(WRITE_ERROR)), "{stage}");
+        let notes = last_store_io_notes();
+        assert!(notes.contains(&format!("stage={stage}")), "{stage}: {notes}");
+        assert!(notes.contains("class=Io"), "{notes}");
+        assert!(notes.contains("op=register"), "{notes}");
+        notes_are_safe(&notes);
+        assert_eq!(std::fs::read(dir.v2()).unwrap(), bytes_before, "{stage} must not replace the file");
+        assert_eq!(ready(&vault).events.len(), events_before, "{stage} keeps the audit log");
+    }
+}
+
+#[test]
+fn verify_and_reread_failures_are_named_and_refuse_the_stamp() {
+    let dir = TestDir::new("io-verify");
+    let vault = SealVault::new(dir.path());
+    let seal = registered(&vault, "合成A", 1);
+    let events_before = ready(&vault).events.len();
+    let v2 = dir.v2();
+    vault.set_hook(Some(Box::new(move |point| {
+        if point == Point::AfterWrite {
+            let mut bytes = std::fs::read(&v2).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x40;
+            std::fs::write(&v2, bytes).unwrap();
+        }
+        false
+    })));
+    let approval = ApprovalRef::new(&seal).unwrap();
+    assert_eq!(vault.record_approval(&approval), Err(VaultError::Verify));
+    let notes = last_store_io_notes();
+    assert!(notes.contains("stage=verify_bytes") && notes.contains("class=Verify"), "{notes}");
+    notes_are_safe(&notes);
+    vault.set_hook(None);
+
+    let dir = TestDir::new("io-reread");
+    let vault = SealVault::new(dir.path());
+    let seal = registered(&vault, "合成A", 1);
+    let v2 = dir.v2();
+    vault.set_hook(Some(Box::new(move |point| {
+        if point == Point::AfterWrite {
+            let _ = std::fs::remove_file(&v2);
+        }
+        false
+    })));
+    let approval = ApprovalRef::new(&seal).unwrap();
+    assert_eq!(vault.record_approval(&approval), Err(VaultError::Verify));
+    let notes = last_store_io_notes();
+    assert!(notes.contains("stage=reread") && notes.contains("class=Verify"), "{notes}");
+    notes_are_safe(&notes);
+    let _ = events_before;
+}

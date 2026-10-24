@@ -679,6 +679,60 @@ impl PdfCraftApp {
             || v.line_editor.as_ref().map_or_else(|| false, |ed| ed.has_unsaved_text())
     }
 
+    /// A stamp sitting on the page that has not been written into the PDF.
+    pub(crate) fn has_pending_place(&self, index: usize) -> bool {
+        self.views.get(index).is_some_and(|view| view.stamp_place.is_some())
+    }
+
+    pub(crate) fn first_pending_place(&self) -> Option<usize> {
+        (0..self.views.len()).find(|&i| self.has_pending_place(i))
+    }
+
+    fn discard_pending_place(&mut self, index: usize) {
+        let Some(view) = self.views.get_mut(index) else { return };
+        let doc = view.id;
+        view.stamp_place = None;
+        if self.seal_approval.as_ref().is_some_and(|approval| approval.doc == doc) {
+            self.seal_approval = None;
+        }
+        if self.dialog == Some(crate::Dialog::ConfirmSeal) {
+            self.dialog = None;
+        }
+    }
+
+    fn ask_place_close(&mut self, req: CloseRequest) {
+        if self.place_close_request.is_some() {
+            return;
+        }
+        self.place_close_request = Some(req);
+    }
+
+    /// `None` keeps the placement. `Some(true)` discards it and continues the close. `Some(false)` is the same as `None`.
+    pub fn resolve_place_close(&mut self, ctx: &egui::Context, discard: Option<bool>) {
+        let Some(req) = self.place_close_request.take() else { return };
+        if discard != Some(true) {
+            return;
+        }
+        let index = match req {
+            CloseRequest::Tab(id) => self.views.iter().position(|view| view.id == id),
+            CloseRequest::Quit | CloseRequest::All => self.first_pending_place(),
+        };
+        if let Some(index) = index {
+            self.discard_pending_place(index);
+        }
+        match req {
+            CloseRequest::Tab(id) => {
+                if let Some(index) = self.views.iter().position(|view| view.id == id) {
+                    self.request_close_tab(index);
+                }
+            }
+            CloseRequest::Quit => {
+                let _ = self.request_quit(ctx);
+            }
+            CloseRequest::All => self.close_all(),
+        }
+    }
+
     /// View-only close saves a new file when the tab has committed edits or typed added text.
     /// In-place save stays refused. A form or paragraph that is only typed, and not yet an edit,
     /// keeps the existing save path.
@@ -877,6 +931,19 @@ impl PdfCraftApp {
 
     /// Close a tab, asking first if it has unsaved changes.
     pub fn request_close_tab(&mut self, index: usize) {
+        if self.seals.blocking() {
+            self.notify("理事長印の処理が終わるまで終了できません。");
+            return;
+        }
+        if self.place_close_request.is_some() {
+            return;
+        }
+        if self.has_pending_place(index)
+            && let Some(id) = self.views.get(index).map(|v| v.id)
+        {
+            self.ask_place_close(CloseRequest::Tab(id));
+            return;
+        }
         // Text typed into a field counts as an unsaved change.
         if self.has_unsaved_work(index)
             && let Some(id) = self.views.get(index).map(|v| v.id)
@@ -889,10 +956,21 @@ impl PdfCraftApp {
 
     /// File ▸ Close all: clean documents close at once; each one with unsaved changes asks.
     pub fn close_all(&mut self) {
+        if self.seals.blocking() {
+            self.notify("理事長印の処理が終わるまで終了できません。");
+            return;
+        }
+        if self.place_close_request.is_some() {
+            return;
+        }
         for i in (0..self.views.len()).rev() {
-            if !self.has_unsaved_work(i) {
+            if !self.has_unsaved_work(i) && !self.has_pending_place(i) {
                 self.close_tab(i);
             }
+        }
+        if self.first_pending_place().is_some() {
+            self.ask_place_close(CloseRequest::All);
+            return;
         }
         if self.first_dirty().is_some() {
             self.close_request = Some(CloseRequest::All);
@@ -994,6 +1072,10 @@ impl PdfCraftApp {
         self.close_tab(index);
         // A newer prompt wins: the user may have started another close while a save was pending.
         if (req == CloseRequest::Quit || req == CloseRequest::All) && self.close_request.is_none() {
+            if self.first_pending_place().is_some() {
+                self.ask_place_close(req);
+                return;
+            }
             match self.first_dirty() {
                 Some(_) => self.close_request = Some(req),
                 None if req == CloseRequest::Quit => self.quit(ctx),
@@ -1007,6 +1089,15 @@ impl PdfCraftApp {
     pub fn request_quit(&mut self, ctx: &egui::Context) -> bool {
         if self.seals.blocking() {
             self.notify("理事長印の処理が終わるまで終了できません。");
+            return false;
+        }
+        if self.place_close_request.is_some() {
+            ctx.request_repaint();
+            return false;
+        }
+        if self.first_pending_place().is_some() {
+            self.ask_place_close(CloseRequest::Quit);
+            ctx.request_repaint();
             return false;
         }
         if self.first_dirty().is_some() {
@@ -1031,7 +1122,10 @@ impl PdfCraftApp {
 
     /// Publish whether any document has unsaved work, for the browser's reload warning (#812).
     pub(crate) fn sync_unsaved_flag(&self) {
-        self.unsaved_flag.store(self.first_dirty().is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.unsaved_flag.store(
+            self.first_dirty().is_some() || self.first_pending_place().is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Intercept window close while documents have unsaved changes.
@@ -1055,6 +1149,11 @@ impl PdfCraftApp {
         if self.seals.blocking() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.notify("理事長印の処理が終わるまで終了できません。");
+            return;
+        }
+        if !self.allow_quit && (self.first_pending_place().is_some() || self.place_close_request.is_some()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ask_place_close(CloseRequest::Quit);
             return;
         }
         // `first_dirty` counts text typed into a field as an unsaved change.
@@ -2791,5 +2890,109 @@ mod page_rotate_foundation_tests {
             )
             .unwrap();
         author.save_bytes(id).unwrap()
+    }
+
+    fn pending_stamp(chairman: bool) -> crate::stamps_ui::StampPlace {
+        crate::stamps_ui::StampPlace {
+            page: 0,
+            rect: [20.0, 40.0, 80.0, 100.0],
+            name: if chairman { "理事長".into() } else { "一般".into() },
+            file: "stamp.png".into(),
+            data: std::sync::Arc::new(b"PNG".to_vec()),
+            source_page: 0,
+            opacity: 1.0,
+            chairman,
+            pixels: None,
+            drag: None,
+            scale: 100.0,
+            nominal: (40.0, 40.0),
+            source: if chairman { crate::stamps_ui::PlaceSource::Chairman(0) } else { crate::stamps_ui::PlaceSource::Custom(0) },
+            circular: false,
+            date_overlay: None,
+            rotation: 0,
+            seal: None,
+            seal_ref: None,
+            preview_gen: 0,
+        }
+    }
+
+    #[test]
+    fn a_pending_stamp_asks_before_close_and_return_keeps_it() {
+        for chairman in [false, true] {
+            let mut app = open_blank(1);
+            app.grant_stamp();
+            app.views[0].stamp_place = Some(pending_stamp(chairman));
+            let id = app.views[0].id;
+            app.request_close_tab(0);
+            assert_eq!(app.place_close_request, Some(CloseRequest::Tab(id)));
+            assert_eq!(app.close_request, None, "the save prompt is not mixed with a placement");
+            assert_eq!(app.views.len(), 1);
+            let ctx = egui::Context::default();
+            app.resolve_place_close(&ctx, None);
+            assert!(app.place_close_request.is_none());
+            assert!(app.views[0].stamp_place.is_some(), "return keeps the placement");
+            assert_eq!(app.views.len(), 1);
+        }
+    }
+
+    #[test]
+    fn discarding_a_pending_stamp_closes_a_clean_tab() {
+        let mut app = open_blank(1);
+        app.grant_stamp();
+        app.views[0].stamp_place = Some(pending_stamp(false));
+        let ctx = egui::Context::default();
+        app.request_close_tab(0);
+        app.resolve_place_close(&ctx, Some(true));
+        assert!(app.views.is_empty(), "discarding the placement closes a document with no PDF edits");
+        assert!(app.place_close_request.is_none());
+        assert!(app.close_request.is_none());
+    }
+
+    #[test]
+    fn a_pending_stamp_and_unsaved_edits_are_asked_about_separately() {
+        let mut app = open_blank(1);
+        app.grant_stamp();
+        app.grant_edit_text();
+        let id = app.views[0].id;
+        assert!(app.apply_edit(text_edit("keep")));
+        app.views[0].stamp_place = Some(pending_stamp(false));
+        assert!(app.has_unsaved_work(0));
+        assert!(app.has_pending_place(0));
+        let ctx = egui::Context::default();
+        assert!(!app.request_quit(&ctx));
+        assert_eq!(app.place_close_request, Some(CloseRequest::Quit));
+        assert_eq!(app.close_request, None, "placement is asked first");
+        app.resolve_place_close(&ctx, Some(true));
+        assert!(app.views[0].stamp_place.is_none());
+        assert_eq!(app.close_request, Some(CloseRequest::Quit), "PDF edits still need a save answer");
+        assert_eq!(app.views.len(), 1);
+        app.resolve_close(&ctx, None);
+        assert_eq!(app.views.len(), 1);
+        assert!(app.session.get(id).unwrap().dirty);
+    }
+
+    #[test]
+    fn opening_another_pdf_keeps_a_pending_stamp_on_the_first_tab() {
+        let mut app = open_blank(1);
+        app.grant_stamp();
+        app.views[0].stamp_place = Some(pending_stamp(true));
+        app.open_bytes("other.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
+        assert_eq!(app.views.len(), 2);
+        assert!(app.views[0].stamp_place.is_some(), "switching documents does not drop the placement");
+        assert!(app.views[1].stamp_place.is_none());
+    }
+
+    #[test]
+    fn a_second_close_does_not_discard_a_pending_stamp() {
+        let mut app = open_blank(1);
+        app.grant_stamp();
+        app.views[0].stamp_place = Some(pending_stamp(false));
+        let id = app.views[0].id;
+        app.request_close_tab(0);
+        app.request_close_tab(0);
+        app.request_quit(&egui::Context::default());
+        assert_eq!(app.place_close_request, Some(CloseRequest::Tab(id)));
+        assert!(app.views[0].stamp_place.is_some());
+        assert_eq!(app.views.len(), 1);
     }
 }

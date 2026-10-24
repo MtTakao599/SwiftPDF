@@ -165,7 +165,7 @@ fn main() -> eframe::Result {
             log::error!("{report}");
         } else {
             // `eprintln!` panics on a broken stderr pipe, and a panic inside the panic hook aborts.
-            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("pdfcraft: {report}\n"));
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("SwiftPDF: {report}\n"));
         }
     }));
     let mut files = Vec::new();
@@ -177,7 +177,7 @@ fn main() -> eframe::Result {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
-                println!("pdfcraft {}", pdfcraft_engine::build_info::version());
+                println!("SwiftPDF {}", pdfcraft_engine::build_info::version());
                 return Ok(());
             }
             "--control" => control_file = args.next(),
@@ -198,7 +198,7 @@ fn main() -> eframe::Result {
     // no file behind). Records logged until now are written to it first.
     if let (Some(logger), Some(dir)) = (logger, pdfcraft_ui_egui::portable::data_dir().map(std::path::Path::to_path_buf).or_else(user_dir)) {
         match logger.attach_dir(&dir.join("logs")) {
-            Ok(path) => log::info!("PdfCraft {}, log file {}", pdfcraft_engine::build_info::version(), path.display()),
+            Ok(path) => log::info!("SwiftPDF {}, log file {}", pdfcraft_engine::build_info::version(), path.display()),
             // Standard error only by now (`attach_dir` gave up on the file); unlike `eprintln!`, never panics.
             Err(e) => log::warn!("no log file: {e}"),
         }
@@ -369,6 +369,7 @@ fn app_creator<'a>(
         // exe). They are DPAPI ciphertext, not an entry in app.ron. The store is only read here;
         // a format-1 file waits for the user to agree to migrate it.
         if let Some(dir) = settings_dir() {
+            app.set_data_store(pdfcraft_ui_egui::data_store::describe(dir.clone()));
             app.set_seal_dir(dir);
         }
         // First start (or settings from before Units existed): the region's unit.
