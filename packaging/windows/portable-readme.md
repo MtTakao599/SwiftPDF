@@ -1,25 +1,87 @@
-# SwiftPDF 0.1.0
+# SwiftPDF 1.0.0（ポータブル）
 
-SwiftPDF is a view-only PDF reader for Windows. This folder is the portable build.
+SwiftPDF は Windows 向けの閲覧中心 PDF アプリです。このフォルダーはポータブル構成です。
+
+**正式な一般公開はまだ承認していません。** この説明はコード上の動作です。実機での導入試験は別工程です。
 
 ## ポータブル版
 
-`SwiftPDF.exe` の隣にある `portable.txt` により、設定・ログ・クラッシュ復旧データは `%LOCALAPPDATA%` ではなく、実行ファイルの隣の `Data` フォルダに保存されます。フォルダを移すときは `Data` ごとコピーしてください。`portable.txt` を消すと、通常のユーザーフォルダ（`%LOCALAPPDATA%\SwiftPDF`）を使います。
+`SwiftPDF.exe` の隣にある `portable.txt`（または `SwiftPDF.portable`）により、設定・ログ・クラッシュ復旧・新規のデジタル ID・理事長印データは、`%LOCALAPPDATA%` ではなく、実行ファイルと同じフォルダーの `Data` に置きます。
 
-この ZIP はレジストリ、ファイルの関連付け、PDF の既定アプリを変更しません。`pdfcraft-cli.exe` は含まれません。更新の確認やサポート用のウェブサイトはありません。
+- 初回起動で `Data` が作れます。作れない場所（書き込み不可）ではポータブルを諦め、通常のユーザーフォルダーを使います。
+- 同時起動の受け渡し用ソケットだけは、共有フォルダーへの書き込みを避けるため、`%LOCALAPPDATA%\SwiftPDF` に残します（印影ではありません）。
+- フォルダーを移すときは、**exe と `portable.txt` と `Data` をセット**にしてください。exe だけ移すと、印影は新しい場所にありません。
+- `portable.txt` を消すと、次の起動から `%LOCALAPPDATA%\SwiftPDF` を使います。古い `Data` は自動では移しません。
+- この ZIP はレジストリ、ファイルの関連付け、PDF の既定アプリを変えません。
+- `pdfcraft-cli.exe` は含まれません。更新確認のウェブサイトはありません。
 
-## Portable mode
+## データ保存先（コード上）
 
-`portable.txt` next to `SwiftPDF.exe` stores settings, logs and crash recovery in a `Data` folder beside the executable, not in `%LOCALAPPDATA%`. Copy the whole folder, including `Data`, when you move it. Delete `portable.txt` to use `%LOCALAPPDATA%\SwiftPDF` instead.
+| ファイル | 用途 |
+|---|---|
+| `Data\seals.v2.bin` | SWSEAL2。登録済み印影と監査履歴（現在の Windows ユーザー向け DPAPI） |
+| `Data\seals.bin` | 旧形式（SWSEAL1）。移行前の原本、または移行後の目印 |
+| `Data\seals.bin.lock` | 同時書き込みを避けるロック。中身は空です |
+| `Data\seals.bin.swseal1-*.bak` | 移行時に残す旧暗号データの控え |
+| `Data\seals.bin.legacy-*` | 移行後に旧版が書き戻した内容の退避。自動では統合しません |
+| `Data\app.ron` など | アプリ設定（印影本体は入りません） |
+| `Data\logs\` | ログ（`pdfcraft.log`） |
+| `Data\recovery\` など | クラッシュ復旧。閲覧専用では復旧を有効にしない場合があります |
 
-This zip does not change the registry, file associations, or which application opens PDF files. It does not include `pdfcraft-cli.exe`. There is no update check and no support website.
+通常インストール（MSI）では、同じファイル名が `%LOCALAPPDATA%\SwiftPDF` にあります。MSI 向けは [install-notes.md](install-notes.md) を見てください。
 
-## Licence
+## Windows ユーザーと DPAPI
 
-SwiftPDF is based on PdfCraft.
+`seals.v2.bin` は、**今ログインしている Windows ユーザー**の DPAPI で暗号化します。
 
-Copyright (c) the PdfCraft contributors.
+- 同じ PC・同じユーザーで、ユーザープロファイルと DPAPI の鍵が残っていれば、再インストール後も読める**場合があります**。
+- **別の Windows ユーザー**では、そのまま復号できません。
+- **別の PC** へ `Data` をコピーしただけでは、通常はそのまま使えません。
+- ユーザープロファイルや DPAPI の鍵を失うと、復号できなくなる**可能性があります**。
 
-Licensed under MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE` in this folder. Those notices, including third-party licences, stay with the program.
+「コピーすれば別 PC へ移せる」「必ず復元できる」とは言えません。エクスポート／インポート機能はありません。
 
-Japanese interface text uses BIZ UDPGothic (OFL-1.1). Its licence is `OFL-biz-ud-pgothic.txt`, next to the licences of the other embedded faces. Noto Sans CJK is not included.
+## バックアップ
+
+推奨：
+
+1. SwiftPDF を終了する。
+2. `Data` フォルダー全体を、書き込みできない場所へコピーする（`seals.v2.bin`、`seals.bin`、`seals.bin.swseal1-*.bak`、`seals.bin.legacy-*` を含む）。
+3. ストアを手で編集しない。旧形式の控えを安易に消さない。
+
+限界：
+
+- 同じ環境への戻しと、別 PC・別ユーザーへの移行は別の問題です。
+- バックアップがあっても、鍵が無ければ読めません。
+- 復元できることは保証しません。
+
+## SWSEAL1 から SWSEAL2 へ
+
+- 移行は、画面で利用者が承認したあとだけ行います。
+- 延期しても、旧 `seals.bin` は変わりません。延期中は理事長印を使えません。
+- 移行時に旧暗号データをバックアップします。
+- 移行後に旧版が `seals.bin` へ書いた内容は退避します。自動では SWSEAL2 に混ぜません。
+- 壊れたストアを勝手に空の初期状態にはしません。
+
+## 監査履歴
+
+履歴は、このアプリで行った押印操作の記録です。保存した PDF の状態を保証する証明ではありません。印影を PDF に確定したことと、そのファイルをディスクへ保存したことは分けて考えてください。
+
+## 容量と待ち時間
+
+- 暗号化ストアの上限は 64MiB です。超える登録・準備は拒否します。
+- 48MiB を超えると警告します。
+- 履歴が 1 万件を超えると警告します。自動では消しません・短くしません。
+- 大きいストアでは、保存に数秒以上かかることがあります。
+- ほかの SwiftPDF が同じストアを使っていると、約 3 秒でBusyとして失敗します。入力は残します。利用者がやり直してください。
+- 不定期に書き込み検証が失敗することがあります。その回の押印は拒否します。失敗を成功扱いしません。
+
+## ライセンス
+
+SwiftPDF は PdfCraft を基にしています。
+
+Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.
+
+MIT OR Apache-2.0。同じフォルダーの `LICENSE-MIT`、`LICENSE-APACHE`、`NOTICE`、`ATTRIBUTION.md` を見てください。`LICENSE-brand.txt` は ArtCraft 商標の条件です。この配布に ArtCraft のロゴ画像は入っていません。
+
+日本語 UI は BIZ UDPGothic（OFL-1.1）です。`OFL-biz-ud-pgothic.txt` とその他の `OFL-*.txt`。Lucide は `LICENSE-lucide.txt`。Noto Sans CJK は含みません。

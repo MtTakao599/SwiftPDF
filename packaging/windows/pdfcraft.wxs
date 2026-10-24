@@ -143,6 +143,24 @@
       <Component Id="SwiftPdfNotice" Guid="AB05D169-73FE-440B-AC2E-302E176BC84C">
         <File Id="SwiftPdfNoticeFile" Source="$(var.BinDir)\NOTICE" KeyPath="yes" />
       </Component>
+      <Component Id="SwiftPdfAttribution" Guid="8F3C1A2E-6B47-4D91-9E2A-1C5D8F0A3B76">
+        <File Id="SwiftPdfAttributionFile" Source="$(var.BinDir)\ATTRIBUTION.md" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfLucideLicense" Guid="D3E5F7A9-6B82-4D03-CF40-5B9C1D3E7F24">
+        <File Id="SwiftPdfLucideLicenseFile" Source="$(var.BinDir)\LICENSE-lucide.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfBrandLicense" Guid="E4F6A8B0-7C93-4E14-D051-6C0D2E4F8A35">
+        <File Id="SwiftPdfBrandLicenseFile" Source="$(var.BinDir)\LICENSE-brand.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflInter" Guid="A7B2C4D1-3E5F-4A80-9C1D-2E6F8A0B4C91">
+        <File Id="SwiftPdfOflInterFile" Source="$(var.BinDir)\OFL-Inter.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflJetBrainsMono" Guid="B1C3D5E7-4F60-4B81-AD2E-3F7A9B1C5D02">
+        <File Id="SwiftPdfOflJetBrainsMonoFile" Source="$(var.BinDir)\OFL-JetBrainsMono.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="SwiftPdfOflDancingScript" Guid="C2D4E6F8-5A71-4C92-BE3F-4A8B0C2D6E13">
+        <File Id="SwiftPdfOflDancingScriptFile" Source="$(var.BinDir)\OFL-DancingScript.txt" KeyPath="yes" />
+      </Component>
       <!-- OFL-1.1 licences for the faces embedded in SwiftPDF.exe. Not PdfCraft component ids. -->
       <Component Id="SwiftPdfOflBizUdPgothic" Guid="2D4CED90-02E3-4205-ACCF-92E853E9EB5C">
         <File Id="SwiftPdfOflBizUdPgothicFile" Source="$(var.BinDir)\OFL-biz-ud-pgothic.txt" KeyPath="yes" />

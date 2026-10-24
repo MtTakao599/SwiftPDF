@@ -112,12 +112,17 @@ Copy-Item (Join-Path $Bin 'SwiftPDF.exe') $Stage
 foreach ($forbidden in @('pdfcraft.exe', 'pdfcraft-cli.exe')) {
   if (Test-Path (Join-Path $Stage $forbidden)) { throw "$forbidden must not be packaged" }
 }
-# The document icon embeds Lucide artwork: carry its ISC notice and the project licences
-# beside the binaries in both distributions.
-foreach ($f in 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE') {
+# Project licences and the per-file asset list NOTICE points at travel with both distributions.
+foreach ($f in 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ATTRIBUTION.md') {
   Copy-Item (Join-Path $Root $f) $Stage
 }
 Copy-Item (Join-Path $Root 'assets\app-icon\LICENSE-document.txt') $Stage
+Copy-Item (Join-Path $Root 'assets\icons\LICENSE-lucide.txt') $Stage
+Copy-Item (Join-Path $Root 'docs\brand\LICENSE-brand.txt') $Stage
+# OFL-1.1 faces committed in this repository and embedded by crates/fonts.
+foreach ($ofl in @('OFL-Inter.txt', 'OFL-JetBrainsMono.txt', 'OFL-DancingScript.txt')) {
+  Copy-Item (Join-Path $Root "assets\fonts\$ofl") (Join-Path $Stage $ofl)
+}
 # OFL-1.1 faces embedded by crates/fonts/build.rs. Noto Sans CJK SC is not one of them.
 $FontLicences = @(
   'biz-ud-pgothic',
@@ -154,6 +159,11 @@ if (-not [SwiftPdfBytes]::Has($exeBytes, $gothic)) {
 }
 $cjk = [Text.Encoding]::ASCII.GetBytes('Noto Sans CJK')
 if ([SwiftPdfBytes]::Has($exeBytes, $cjk)) { throw 'SwiftPDF.exe embeds Noto Sans CJK, which must not be shipped' }
+# ArtCraft marks are trademarks, not the MIT/Apache licence. A modified product must not embed them.
+foreach ($needle in @('bytes://artcraft-logo', 'bytes://artcraft-mark', 'M104.28,49.49L81.55')) {
+  $mark = [Text.Encoding]::ASCII.GetBytes($needle)
+  if ([SwiftPdfBytes]::Has($exeBytes, $mark)) { throw "SwiftPDF.exe embeds ArtCraft brand artwork ($needle)" }
+}
 
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'SwiftPDF.exe')
 
@@ -203,7 +213,16 @@ $Portable = Join-Path $TargetDir "windows-package\SwiftPDF-$Version-windows-$Arc
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage 'SwiftPDF.exe') $Portable
-foreach ($f in 'NOTICE', 'LICENSE-document.txt') {
+foreach ($f in @(
+    'NOTICE',
+    'ATTRIBUTION.md',
+    'LICENSE-document.txt',
+    'LICENSE-lucide.txt',
+    'LICENSE-brand.txt',
+    'OFL-Inter.txt',
+    'OFL-JetBrainsMono.txt',
+    'OFL-DancingScript.txt'
+  )) {
   Copy-Item (Join-Path $Stage $f) $Portable
 }
 Copy-Item -Recurse $Models (Join-Path $Portable 'models')

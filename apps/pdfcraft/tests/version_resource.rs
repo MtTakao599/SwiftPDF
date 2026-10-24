@@ -29,6 +29,8 @@ fn the_exe_names_swiftpdf_and_keeps_the_pdfcraft_copyright() {
     for (key, value) in [
         ("ProductName", "SwiftPDF"),
         ("FileDescription", "SwiftPDF"),
+        ("FileVersion", env!("CARGO_PKG_VERSION")),
+        ("ProductVersion", env!("CARGO_PKG_VERSION")),
         ("LegalCopyright", "Copyright (c) the PdfCraft contributors. MIT OR Apache-2.0."),
         ("OriginalFilename", "SwiftPDF.exe"),
         ("InternalName", "SwiftPDF"),

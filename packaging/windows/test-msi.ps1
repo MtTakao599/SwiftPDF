@@ -2,7 +2,7 @@
 .SYNOPSIS
   Check the compiled MSI's install scope, publisher, shortcuts, native UI and OCR models, without installing it.
 .EXAMPLE
-  pwsh packaging/windows/test-msi.ps1 dist/release/SwiftPDF-0.1.0-windows-x64.msi
+  pwsh packaging/windows/test-msi.ps1 dist/release/SwiftPDF-1.0.0-windows-x64.msi
 #>
 param([Parameter(Mandatory)] [string] $Path)
 $ErrorActionPreference = 'Stop'
@@ -264,6 +264,12 @@ $fontLicences = @{
   'OFL-shippori-mincho.txt' = $false
   'OFL-noto-sans-arabic.txt' = $false
   'OFL-noto-sans-thai.txt' = $false
+  'OFL-Inter.txt' = $false
+  'OFL-JetBrainsMono.txt' = $false
+  'OFL-DancingScript.txt' = $false
+  'ATTRIBUTION.md' = $false
+  'LICENSE-lucide.txt' = $false
+  'LICENSE-brand.txt' = $false
 }
 $fileView = $Database.OpenView('SELECT `FileName` FROM `File`')
 try {
