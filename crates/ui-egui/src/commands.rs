@@ -83,6 +83,9 @@ impl PdfCraftApp {
         if !self.command_allowed(spec.id) {
             return false;
         }
+        if self.active_held() && !crate::command_policy::allowed_in_view_only(spec.id) {
+            return false;
+        }
         // Added text is granted on its own. The command's usual "document can be modified" check
         // stays false while view-only, so it must not hide this one action.
         if spec.id == "edit.text" && self.active_ids().is_some_and(|(_, id)| self.session.allows_added_text(id)) {
@@ -149,8 +152,20 @@ impl PdfCraftApp {
     }
 
     fn execute_unguarded(&mut self, id: &str) -> bool {
+        // Saving, closing or editing while a seal record is being written could keep a stamp
+        // whose record then fails.
+        if self.seals.blocking() {
+            self.notify(crate::seal_service::BUSY_MESSAGE);
+            return false;
+        }
         if !self.command_allowed(id) {
             self.notify(crate::command_policy::REFUSED);
+            return false;
+        }
+        if !crate::command_policy::allowed_in_view_only(id)
+            && let Some((_, active)) = self.active_ids()
+            && self.refuse_held(active)
+        {
             return false;
         }
         let Some(spec) = commands::command(id) else { return false };

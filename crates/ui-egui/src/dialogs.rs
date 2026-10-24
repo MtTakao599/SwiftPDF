@@ -13,6 +13,24 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
     dialogs(app, ctx);
     // Last, so it sits above Document Properties when Security's Unlock… asked for it.
     unlock(app, ctx);
+    seal_work(app, ctx);
+}
+
+/// Over everything while a chairman-seal operation that changes the document or the seal list
+/// runs. It cannot be dismissed: the operation's answer decides what the document keeps.
+fn seal_work(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    if !app.seals.blocking() {
+        return;
+    }
+    let Some(caption) = app.seals.progress() else { return };
+    // The worker wakes the window when it answers, so nothing here schedules repaints.
+    let _ = widgets::show_modal(ctx, "seal_work", |ui| {
+        ui.set_width(420.0);
+        ui.label(egui::RichText::new(caption).font(theme::semibold(16.0)));
+        ui.add_space(6.0);
+        ui.label("完了するまで、文書の編集・保存・終了はできません。");
+        ui.label("ほかの SwiftPDF が理事長印のデータを使用中の場合は、しばらく待ってから中止されます。");
+    });
 }
 
 /// The chairman-seal effect editor. It is a window, not a centred modal, so it can be dragged
@@ -1050,6 +1068,16 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     app.delete_selected_seal();
                 }
                 close = save || cancel;
+                return;
+            }
+            Dialog::SealMigrate => {
+                let (migrate, later) = crate::stamps_ui::seal_migrate_body(ui, app);
+                if migrate {
+                    app.begin_seal_migration();
+                } else if later {
+                    app.defer_seal_migration();
+                }
+                close = migrate || later;
                 return;
             }
             Dialog::PdfA => {

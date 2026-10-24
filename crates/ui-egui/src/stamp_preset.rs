@@ -1320,7 +1320,7 @@ mod tests {
         assert_eq!(app.date_stamps[0].data, base, "the registered image stays the base");
         app.commit_stamp_place();
         assert!(app.dialog.is_none(), "a date stamp does not ask for chairman approval: {:?}", app.toast);
-        assert!(app.seal_store.library.history.is_empty());
+        assert!(!app.seals.running() && crate::seal_flow::testing::use_kinds(&app).is_empty());
         assert_eq!(stamp_count(&app), 1, "{:?}", app.toast);
         assert_eq!(app.date_stamps[0].data, base);
         let id = app.views[0].id;
@@ -1361,9 +1361,12 @@ mod tests {
         assert!(!json.contains("SWSEAL1"));
         #[cfg(windows)]
         {
-            app.set_seal_store(dir.join("seals.bin"));
+            let seals = crate::seal_flow::testing::SealDir::new("date-place");
+            crate::seal_flow::testing::connect(&mut app, &seals);
             app.start_chairman_seal("seal.png".into(), png);
             app.accept_stamp_registration();
+            app.seal_settle();
+            assert_eq!(app.seals.seals().len(), 1, "{:?}", app.toast);
             app.views[0].stamp_place = None;
             app.quick_tool = crate::QuickTool::ChairmanSeal(0);
             app.begin_stamp_place(0, 0, [30.0, 30.0], 0).unwrap();
@@ -1371,7 +1374,9 @@ mod tests {
             app.ask_stamp_confirm();
             assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
             assert_eq!(stamp_count(&app), before);
-            assert!(app.seal_store.library.history.is_empty());
+            assert!(!app.seals.running(), "asking for approval writes nothing");
+            assert!(crate::seal_flow::testing::use_kinds(&app).is_empty());
+            assert!(crate::seal_flow::testing::use_kinds_on_disk(&seals).is_empty());
             app.dialog = None;
         }
         assert_eq!(sha2::Sha256::digest(std::fs::read(&original_path).unwrap()), original_sha);
@@ -1432,7 +1437,7 @@ mod tests {
         signed_app.quick_tool = crate::QuickTool::DateStamp(1);
         assert!(signed_app.begin_stamp_place(0, 0, [40.0, 40.0], 0).is_err());
         assert_eq!(stamp_count(&signed_app), 0);
-        assert!(signed_app.seal_store.library.history.is_empty());
+        assert!(!signed_app.seals.running() && crate::seal_flow::testing::use_kinds(&signed_app).is_empty());
     }
 
     fn row_bytes(rgba: &[u8], side: u32, y0: f64, y1: f64) -> Vec<u8> {
@@ -1670,7 +1675,7 @@ mod tests {
         }
         app.commit_stamp_place();
         assert!(app.dialog.is_none());
-        assert!(app.seal_store.library.history.is_empty());
+        assert!(!app.seals.running() && crate::seal_flow::testing::use_kinds(&app).is_empty());
         assert_eq!(stamp_count(&app), 1, "{:?}", app.toast);
         let id = app.views[0].id;
         let baked = render_rgba(&app.session.get(id).unwrap().bytes);
@@ -1893,7 +1898,7 @@ mod tests {
         app.begin_stamp_place(0, 0, [100.0, 80.0], 0).unwrap();
         app.commit_stamp_place();
         assert_eq!(stamp_count(&app), 1, "{:?}", app.toast);
-        assert!(app.seal_store.library.history.is_empty(), "a date stamp is not a chairman approval");
+        assert!(!app.seals.running() && crate::seal_flow::testing::use_kinds(&app).is_empty(), "a date stamp is not a chairman approval");
         app.session.grant(pdfcraft_engine::Capability::PageRotate);
         app.session.grant(pdfcraft_engine::Capability::SaveAs);
         assert!(app.execute("page.rotate"), "{:?}", app.toast);
@@ -1902,7 +1907,7 @@ mod tests {
         assert_eq!(doc.info.pages[0].rotation, 90);
         assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
         assert!(page_has_ink(&doc.bytes, 0), "the date stamp is still drawn after rotation");
-        assert!(app.seal_store.library.history.is_empty());
+        assert!(!app.seals.running() && crate::seal_flow::testing::use_kinds(&app).is_empty());
         let saved = app.session.save_edited_copy_bytes(id).unwrap();
         assert_eq!(sha2::Sha256::digest(std::fs::read(&original_path).unwrap()), original_sha);
         let mut again = crate::PdfCraftApp::new();

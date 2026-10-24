@@ -1127,24 +1127,27 @@ mod transport_tests {
         let took = started.elapsed();
         assert!(took >= std::time::Duration::from_millis(250) && took < std::time::Duration::from_secs(3), "{took:?}");
         assert!(next_line(&mut r).is_none(), "then the connection is closed");
-        // Dripping: a byte every 50 ms for as long as the server keeps the connection.
+        // Dripping: a byte every 50 ms for the first half of a 1 s deadline. Counted from the
+        // last byte, the deadline would end after 1.45 s; counted from acceptance it ends at 1 s.
+        // The drip stops well before that: on Windows a byte reaching the closed connection
+        // resets it, and the reset throws away the reply the client has not read yet.
+        let (_control, client) = super::attach(&egui::Context::default());
+        let ep = super::serve_with(client, super::Limits { auth_deadline: std::time::Duration::from_secs(1), ..TEST_LIMITS }).unwrap();
         let started = std::time::Instant::now();
         let s = connect(ep.port);
         let mut w = s.try_clone().unwrap();
         let drip = std::thread::spawn(move || {
-            while w.write_all(b"x").is_ok() {
+            while started.elapsed() < std::time::Duration::from_millis(500) {
+                w.write_all(b"x").unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if started.elapsed() > std::time::Duration::from_secs(3) {
-                    break;
-                }
             }
         });
         let mut r = BufReader::new(s);
         let reply = next_line(&mut r).expect("the server says why before closing");
         assert_eq!(reply["error"]["code"], -32004, "{reply}");
         let took = started.elapsed();
-        assert!(took < std::time::Duration::from_secs(2), "the deadline is absolute: {took:?}");
-        drop(r);
+        assert!(took < std::time::Duration::from_millis(1400), "the deadline is absolute: {took:?}");
+        assert!(next_line(&mut r).is_none(), "then the connection is closed");
         drip.join().unwrap();
     }
 

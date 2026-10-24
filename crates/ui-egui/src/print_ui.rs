@@ -318,6 +318,9 @@ impl PdfCraftApp {
             return;
         }
         let Some((i, id)) = self.active_ids() else { return };
+        if self.refuse_held(id) {
+            return;
+        }
         if self.session.get(id).is_some_and(|doc| !doc.allows_printing()) {
             self.notify(crate::identity::localized(
                 "このPDFは印刷が許可されていないため、印刷できません。",
@@ -526,6 +529,11 @@ impl PdfCraftApp {
         // A view-only session must not apply a form edit on the way to the printer.
         // Confirmed text is already in the working file; text still being typed is copied
         // below and is not committed, so undo stays as it was.
+        if let Some((_, id)) = self.active_ids()
+            && self.refuse_held(id)
+        {
+            return false;
+        }
         if !self.session.view_only() && !self.commit_form_typing() {
             return false;
         }

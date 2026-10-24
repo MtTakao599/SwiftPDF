@@ -63,7 +63,10 @@ mod ocr_ui;
 mod optimize_ui;
 pub mod output_policy;
 mod seal_effect;
+mod seal_flow;
+mod seal_service;
 mod seal_store;
+pub mod seal_store_v2;
 mod search_ui;
 mod sign_ui;
 mod stamp_preset;
@@ -405,6 +408,8 @@ pub enum Dialog {
     SealEffects,
     /// Confirm deletion of a chairman seal from the encrypted store.
     DeleteSeal,
+    /// Explain moving the format-1 chairman seals to `seals.v2.bin`. Nothing moves without 移行する.
+    SealMigrate,
     /// Register or edit a date stamp. It is stored with ordinary stamps, not chairman seals.
     DateStamp,
     /// Shared font window. Confirming stores an id; it does not change text or stamps.
@@ -802,9 +807,14 @@ pub struct PdfCraftApp {
     pub(crate) text_font: bool,
     /// The registration dialog's 試し置き asked to explain the next click.
     pub stamp_try: bool,
-    /// Chairman seals. Not part of [`Self::persist`].
-    pub seal_store: seal_store::SealStore,
-    pub seal_uses: Vec<seal_store::SealUse>,
+    /// Chairman seals (`seals.v2.bin`), read and written off the UI thread. Not part of [`Self::persist`].
+    pub seals: seal_service::SealService,
+    pub seal_uses: Vec<seal_service::SealUse>,
+    /// Chairman stamps taken out of a document because their committed line could not be
+    /// written. They stay on the redo stack, and redo is refused for them.
+    pub(crate) seal_orphans: Vec<(DocId, pdfcraft_cos::ObjRef)>,
+    /// The seal the delete dialog asks about, as it was when the dialog opened.
+    pub(crate) seal_delete: Option<seal_service::SealRef>,
     /// The chairman-seal approval for the image, rectangle and document that were just confirmed.
     /// A checkbox that is merely ticked is not enough: commit checks this snapshot.
     pub(crate) seal_approval: Option<stamps_ui::SealApproval>,
@@ -949,6 +959,8 @@ pub(crate) enum PromptLayer {
     Updates,
     Dialog,
     Unlock,
+    /// A chairman-seal store operation is running. It holds all input until the store answers.
+    SealWork,
 }
 
 /// An address a document asked to open, waiting for the user to allow or cancel it.
@@ -1145,8 +1157,10 @@ impl PdfCraftApp {
             font_hold: false,
             text_font: false,
             stamp_try: false,
-            seal_store: seal_store::SealStore::empty(),
+            seals: seal_service::SealService::default(),
             seal_uses: Vec::new(),
+            seal_orphans: Vec::new(),
+            seal_delete: None,
             seal_approval: None,
             optimize_draft: OptimizeDraft::default(),
             optimize_run: None,
@@ -2061,6 +2075,9 @@ impl PdfCraftApp {
     /// The prompt drawn last. Only that one may take Enter, Escape, or a save shortcut.
     /// Earlier prompts stay open, but they do not see those keys.
     pub(crate) fn front_prompt(&self) -> Option<PromptLayer> {
+        if self.seals.blocking() {
+            return Some(PromptLayer::SealWork);
+        }
         if self.unlock_prompt.is_some() {
             return Some(PromptLayer::Unlock);
         }
@@ -3297,6 +3314,8 @@ impl eframe::App for PdfCraftApp {
             let out = self.session.take_js_output(id);
             self.handle_js(id, out);
         }
+        self.seals.set_context(ctx);
+        self.poll_seals();
         if let Some(mut control) = self.control.take() {
             control.tick(ctx, self);
             self.control = Some(control);

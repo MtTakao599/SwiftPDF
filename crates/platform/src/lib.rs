@@ -5,5 +5,6 @@
 
 pub mod desktop_theme;
 pub mod dpapi;
+pub mod lock;
 pub mod save_path;
 pub mod staging;

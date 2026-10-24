@@ -6,9 +6,14 @@
 //! it. Another user, or another PC, cannot. An administrator who can act as this user often can.
 //! The original image the user picked, and any operating-system backup of this file, are outside
 //! this encryption.
+//!
+//! This is format 1 (`SWSEAL1`). The app only reads it, as the source of a migration the user
+//! agreed to ([`crate::seal_store_v2`]). Its writer, [`SealStore`], exists only in tests, which
+//! use it to build format-1 files the way the older SwiftPDF wrote them.
 
 #[cfg(test)]
 use std::cell::Cell;
+#[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -158,7 +163,8 @@ pub struct SealLibrary {
     pub history: Vec<SealEvent>,
 }
 
-/// A session's view of the encrypted file.
+/// A session's view of the encrypted file, as the older SwiftPDF kept it.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct SealStore {
     pub path: Option<PathBuf>,
@@ -211,6 +217,7 @@ struct StoredEvent {
     rotation_mode: String,
 }
 
+#[cfg(test)]
 impl SealStore {
     pub fn empty() -> Self {
         Self { path: None, library: SealLibrary::default(), error: None }
@@ -329,18 +336,6 @@ impl SealStore {
         self.persist(previous)
     }
 
-    /// Drop the last history line and write the file again. Used when the stamp itself did not
-    /// stay applied.
-    pub fn pop_event(&mut self) -> Result<(), String> {
-        self.ensure_open()?;
-        if self.library.history.is_empty() {
-            return Ok(());
-        }
-        let previous = self.library.clone();
-        self.library.history.pop();
-        self.persist(previous)
-    }
-
     fn ensure_open(&self) -> Result<(), String> {
         if let Some(error) = &self.error {
             return Err(error.clone());
@@ -381,7 +376,7 @@ impl SealStore {
     }
 }
 
-fn validate_seal(seal: &SealImage) -> Result<(), String> {
+pub(crate) fn validate_seal(seal: &SealImage) -> Result<(), String> {
     let name = seal.name.trim();
     if name.is_empty() || name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
         return Err("印影の名前を確認してください".into());
@@ -420,6 +415,7 @@ fn checked_effects(effects: SealEffects) -> Option<SealEffects> {
     }
 }
 
+#[cfg(test)]
 fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
     let body = FileBody {
         seals: library
@@ -460,7 +456,7 @@ fn encode_library(library: &SealLibrary) -> Result<Vec<u8>, String> {
     Ok(plain)
 }
 
-fn decode_file(bytes: &[u8]) -> Result<SealLibrary, &'static str> {
+pub(crate) fn decode_file(bytes: &[u8]) -> Result<SealLibrary, &'static str> {
     let Some(blob) = bytes.strip_prefix(MAGIC) else {
         return Err("印影ファイルを復号できませんでした。ファイルはそのままにしてあります。");
     };
@@ -547,24 +543,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-/// A placement of a chairman seal in this session, so undo can name the same seal.
-#[derive(Clone, Debug)]
-pub struct SealUse {
-    pub num: u32,
-    pub generation: u16,
-    pub name: String,
-    pub page: u32,
-    pub file_name: String,
-    pub active: bool,
-    /// Copied onto later undo and redo lines. The PNG is not kept here.
-    pub processed: bool,
-    pub angle_deg: f64,
-    pub fade: f64,
-    pub seed: u64,
-    pub image_sha256: String,
-    pub rotation_mode: String,
-}
-
+#[cfg(test)]
 impl SealEvent {
     /// A history line without processing details. Older callers, and events that predate them, use this.
     pub fn line(at: impl Into<String>, file: impl Into<String>, page: u32, seal: impl Into<String>, event: impl Into<String>) -> Self {
@@ -582,26 +561,9 @@ impl SealEvent {
             rotation_mode: String::new(),
         }
     }
-
-    /// The same processing note as the placement, for undo, redo and removal.
-    pub fn from_use(at: impl Into<String>, event: impl Into<String>, use_: &SealUse) -> Self {
-        Self {
-            at: at.into(),
-            file: use_.file_name.clone(),
-            page: use_.page,
-            seal: use_.name.clone(),
-            event: event.into(),
-            processed: use_.processed,
-            angle_deg: use_.angle_deg,
-            fade: use_.fade,
-            seed: use_.seed,
-            image_sha256: use_.image_sha256.clone(),
-            rotation_mode: use_.rotation_mode.clone(),
-        }
-    }
 }
 
-fn event_mark_ok(event: &SealEvent) -> bool {
+pub(crate) fn event_mark_ok(event: &SealEvent) -> bool {
     let sha_ok = event.image_sha256.is_empty() || (event.image_sha256.len() == 64 && event.image_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let mode_ok = matches!(event.rotation_mode.as_str(), "" | "manual" | "random");
     sha_ok
@@ -610,13 +572,6 @@ fn event_mark_ok(event: &SealEvent) -> bool {
         && event.angle_deg.abs() <= 30.0 + 1.0e-6
         && event.fade.is_finite()
         && (0.0..=30.0).contains(&event.fade)
-}
-
-impl crate::PdfCraftApp {
-    /// Use `path` for chairman seals and load it. A decrypt failure is kept on the store.
-    pub fn set_seal_store(&mut self, path: PathBuf) {
-        self.seal_store = SealStore::load(path);
-    }
 }
 
 /// Read PNG or JPEG dimensions and straight RGBA for a preview. `None` when the bytes are not
@@ -679,6 +634,8 @@ mod tests {
         assert!(!event_mark_ok(&event));
     }
 
+    use crate::seal_flow::testing::{COMMITTED, SealDir, connect, fail_writes_after, settle_frames, use_kinds, use_kinds_on_disk};
+
     #[test]
     fn unix_epoch_formats_as_utc() {
         assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
@@ -738,19 +695,17 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn settings_do_not_store_chairman_seals() {
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-settings", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = SealDir::new("settings");
         let mut app = crate::PdfCraftApp::new();
         app.set_view_only(true);
         app.grant_stamp();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.start_chairman_seal("seal.png".into(), png());
         app.save_custom_stamp();
+        app.seal_settle();
         assert!(app.custom_stamps.is_empty());
-        assert_eq!(app.seal_store.library.seals.len(), 1);
+        assert_eq!(app.seals.seals().len(), 1, "{:?}", app.toast);
         assert!(!app.persist().contains("iVBORw0KGgo"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn one_page() -> Vec<u8> {
@@ -816,31 +771,14 @@ startxref
         app.set_view_only(true);
         app.grant_stamp();
         app.grant_edit_text();
-        app.start_chairman_seal("test-seal.png".into(), png());
-        app.accept_stamp_registration();
-        assert_eq!(app.seal_store.library.seals.len(), 1, "{:?}", app.toast);
-        let seal = app.seal_store.library.seals[0].clone();
+        if app.seals.seals().is_empty() {
+            app.start_chairman_seal("test-seal.png".into(), png());
+            app.accept_stamp_registration();
+            app.seal_settle();
+        }
+        assert_eq!(app.seals.seals().len(), 1, "{:?}", app.toast);
         app.quick_tool = crate::QuickTool::ChairmanSeal(0);
-        app.views[0].stamp_place = Some(crate::stamps_ui::StampPlace {
-            page: 0,
-            rect: [20.0, 200.0, 80.0, 260.0],
-            name: seal.name.clone(),
-            file: seal.file.clone(),
-            data: std::sync::Arc::new(seal.data.clone()),
-            source_page: 0,
-            opacity: 1.0,
-            chairman: true,
-            pixels: preview_rgba(&seal.data),
-            drag: None,
-            scale: 100.0,
-            nominal: (60.0, 60.0),
-            source: crate::stamps_ui::PlaceSource::Chairman(0),
-            circular: false,
-            date_overlay: None,
-            rotation: 0,
-            seal: None,
-            preview_gen: 0,
-        });
+        app.views[0].stamp_place = Some(crate::seal_flow::testing::chairman_place(app, 0, [20.0, 200.0, 80.0, 260.0]));
         app.seal_approval = None;
         app.ask_stamp_confirm();
         assert!(matches!(app.dialog, Some(crate::Dialog::ConfirmSeal)));
@@ -848,6 +786,7 @@ startxref
         assert!(crate::stamps_ui::approve_current_seal(app).is_ok(), "{:?}", app.toast);
         app.commit_stamp_place();
         app.dialog = None;
+        app.seal_settle();
     }
 
     /// The approval checkbox is not part of redo: the stamp comes back from the history step,
@@ -856,59 +795,40 @@ startxref
     #[cfg(windows)]
     fn chairman_seal_comes_back_on_redo_without_another_approval() {
         let _policy = policy();
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-redo", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let original_path = dir.join("opened.pdf");
+        let dir = SealDir::new("redo");
+        let original_path = dir.path().join("opened.pdf");
         let original = one_page();
         std::fs::write(&original_path, &original).unwrap();
         use sha2::Digest;
         let original_sha = sha2::Sha256::digest(&original);
         let mut app = crate::PdfCraftApp::new();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.open_bytes("opened.pdf", Some(original_path.to_string_lossy().into_owned()), original.clone()).unwrap();
         place_chairman(&mut app);
         assert_eq!(stamp_count(&app), 1, "confirm places the seal: {:?}", app.toast);
-        assert_eq!(app.seal_store.library.history.last().map(|event| event.event.as_str()), Some("confirmed"));
+        assert_eq!(use_kinds(&app), COMMITTED);
         assert!(app.views[0].stamp_place.is_none());
         let undo = pdfcraft_engine::commands::command("edit.undo").unwrap();
         let redo = pdfcraft_engine::commands::command("edit.redo").unwrap();
         assert!(app.command_enabled(undo));
         assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        app.seal_settle();
         assert_eq!(stamp_count(&app), 0, "undo removes the seal: {:?}", app.toast);
-        assert_eq!(app.seal_store.library.history.last().map(|event| event.event.as_str()), Some("undone"), "{:?}", app.seal_store.library.history);
+        assert_eq!(use_kinds(&app).last().map(String::as_str), Some("use_undone"), "{:?}", use_kinds(&app));
         app.process_pending_edits();
         assert!(app.command_enabled(redo), "a later frame must not drop redo: {:?}", app.toast);
         assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        app.seal_settle();
         assert_eq!(stamp_count(&app), 1, "redo restores the seal without a new approval: {:?}", app.toast);
-        assert_eq!(app.seal_store.library.history.iter().map(|event| event.event.as_str()).collect::<Vec<_>>(), ["confirmed", "undone", "redone"]);
+        assert_eq!(use_kinds(&app), [&COMMITTED[..], &["use_undone", "use_redone"]].concat());
+        assert_eq!(use_kinds_on_disk(&dir), use_kinds(&app), "the file holds what the window shows");
         let id = app.views[0].id;
         let doc = app.session.get(id).unwrap();
         assert!(page_has_colour(&doc.bytes), "redo draws the seal image, not an empty stamp");
         assert!(page_has_colour(&doc.display), "the bytes on screen keep the seal image");
         assert!(app.dialog.is_none(), "redo does not open the approval dialog");
         assert!(app.views[0].stamp_place.is_none(), "redo does not arm a new placement");
-        let seal = app.seal_store.library.seals[0].clone();
-        app.views[0].stamp_place = Some(crate::stamps_ui::StampPlace {
-            page: 0,
-            rect: [20.0, 40.0, 80.0, 100.0],
-            name: seal.name.clone(),
-            file: seal.file,
-            data: std::sync::Arc::new(seal.data.clone()),
-            source_page: 0,
-            opacity: 1.0,
-            chairman: true,
-            pixels: preview_rgba(&seal.data),
-            drag: None,
-            scale: 100.0,
-            nominal: (60.0, 60.0),
-            source: crate::stamps_ui::PlaceSource::Chairman(0),
-            circular: false,
-            date_overlay: None,
-            rotation: 0,
-            seal: None,
-            preview_gen: 0,
-        });
+        app.views[0].stamp_place = Some(crate::seal_flow::testing::chairman_place(&app, 0, [20.0, 40.0, 80.0, 100.0]));
         assert!(crate::stamps_ui::approve_current_seal(&mut app).is_ok(), "{:?}", app.toast);
         app.ask_stamp_confirm();
         assert!(app.seal_approval.is_none(), "redo must not leave the checkbox able to stamp again");
@@ -929,7 +849,6 @@ startxref
         app.request_close_tab(0);
         assert!(app.close_request.is_none() && app.views.is_empty(), "closing after save does not ask again");
         assert_eq!(sha2::Sha256::digest(std::fs::read(&original_path).unwrap()), original_sha);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A history write that fails puts the document back. The notice says so, and redo does not
@@ -938,43 +857,42 @@ startxref
     #[cfg(windows)]
     fn chairman_seal_redo_stops_safely_when_history_cannot_be_written() {
         let _policy = policy();
-        let _reset = ResetSealWrite;
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-fail", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = SealDir::new("fail");
         let mut app = crate::PdfCraftApp::new();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.open_bytes("sample.pdf", None, one_page()).unwrap();
         place_chairman(&mut app);
         assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        app.seal_settle();
         assert_eq!(stamp_count(&app), 0);
-        FAIL_SEAL_WRITE.store(true, Ordering::SeqCst);
+        fail_writes_after(&app, Some(0));
         assert!(app.execute("edit.redo"));
+        app.seal_settle();
         assert_eq!(stamp_count(&app), 0, "a failed history write puts the seal back to undone: {:?}", app.toast);
         let toast = app.toast.as_ref().map(|toast| toast.0.as_str()).unwrap_or("");
         assert!(toast.contains("使用履歴を記録できない"), "{toast}");
         assert!(!toast.contains("やり直しました"), "a rolled-back redo must not be announced as done: {toast}");
         assert!(app.views[0].stamp_place.is_none());
         assert!(app.dialog.is_none());
-        assert_eq!(app.seal_store.library.history.last().map(|event| event.event.as_str()), Some("undone"));
-        FAIL_SEAL_WRITE.store(false, Ordering::SeqCst);
+        assert_eq!(use_kinds(&app).last().map(String::as_str), Some("use_undone"));
+        assert_eq!(use_kinds_on_disk(&dir).last().map(String::as_str), Some("use_undone"));
+        fail_writes_after(&app, None);
         assert!(app.execute("edit.redo"), "{:?}", app.toast);
+        app.seal_settle();
         assert_eq!(stamp_count(&app), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(use_kinds_on_disk(&dir).last().map(String::as_str), Some("use_redone"));
     }
 
     #[test]
     #[cfg(windows)]
     fn chairman_seal_does_not_block_text_or_general_stamps() {
         let _policy = policy();
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seals-{}-other", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = SealDir::new("other");
         let mut app = crate::PdfCraftApp::new();
         app.set_view_only(true);
         app.grant_stamp();
         app.grant_edit_text();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.open_bytes("sample.pdf", None, one_page()).unwrap();
         let id = app.views[0].id;
         let file = pdfcraft_engine::MarkFile { name: "mark.png".into(), bytes: std::sync::Arc::new(png()), page: 0 };
@@ -991,7 +909,8 @@ startxref
         assert_eq!(stamp_count(&app), 0);
         assert!(app.execute("edit.redo"), "{:?}", app.toast);
         assert_eq!(stamp_count(&app), 1, "a general stamp still redoes");
-        assert!(app.seal_store.library.history.is_empty(), "a general stamp is not a chairman-seal event");
+        assert!(!app.seals.running(), "a general stamp starts no seal operation");
+        assert!(use_kinds(&app).is_empty(), "a general stamp is not a chairman-seal event");
         let text = if pdfcraft_fonts::document_japanese_font().is_some() { "日本語" } else { "Note" };
         assert!(
             app.apply_edit(pdfcraft_engine::Edit::AddText {
@@ -1031,7 +950,6 @@ startxref
         assert_eq!(app.session.get(app.views[banned].id).unwrap().name, "banned.pdf");
         assert!(app.stamp_refusal(banned).is_some());
         assert!(!app.session.allows_stamp(app.views[banned].id));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn click_at(h: &mut egui_kittest::Harness<'static, crate::PdfCraftApp>, at: egui::Pos2) {
@@ -1056,15 +974,13 @@ startxref
         use egui_kittest::kittest::Queryable;
         let _policy = policy();
         for mode in [crate::UiMode::Simple, crate::UiMode::Detailed] {
-            let dir = std::env::temp_dir().join(format!("swiftpdf-seal-ui-{}-{}", std::process::id(), mode.as_str()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let original_path = dir.join("opened.pdf");
+            let dir = SealDir::new(mode.as_str());
+            let original_path = dir.path().join("opened.pdf");
             let original = one_page();
             std::fs::write(&original_path, &original).unwrap();
             use sha2::Digest;
             let original_sha = sha2::Sha256::digest(&original);
-            let seal_path = dir.join("seals.bin");
+            let seal_path = dir.path().to_path_buf();
             let path_s = original_path.to_string_lossy().into_owned();
             let bytes = original.clone();
             let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
@@ -1074,18 +990,20 @@ startxref
                 app.grant_stamp();
                 app.grant_edit_text();
                 app.set_ui_mode(mode);
-                app.set_seal_store(seal_path);
+                app.set_seal_dir(seal_path);
                 app.open_bytes("opened.pdf", Some(path_s), bytes).unwrap();
                 app.set_option("zoom", "100").unwrap();
                 app
             });
             h.run_steps(8);
+            settle_frames(&mut h);
+            assert!(h.state().seals.usable(), "{mode:?} {:?}", h.state().seals.state);
             assert!(h.state_mut().execute("comment.stamp"), "{mode:?}");
             h.run_steps(3);
             h.state_mut().start_chairman_seal("test-seal.png".into(), png());
             h.run_steps(2);
             h.get_by_label("OK").click();
-            h.run_steps(3);
+            settle_frames(&mut h);
             assert!(matches!(h.state().quick_tool, crate::QuickTool::ChairmanSeal(0)), "{mode:?} {:?}", h.state().toast);
             let at = {
                 let r = h.state().views[0].page_screen_rect(0).expect("page");
@@ -1099,10 +1017,10 @@ startxref
             h.run_steps(1);
             assert!(h.state().seal_approval.is_some(), "{mode:?}");
             h.get_all_by_label("確定").nth(1).expect("dialog confirm").click();
-            h.run_steps(4);
+            settle_frames(&mut h);
             assert_eq!(ui_stamp_count(&h), 1, "{mode:?} place {:?}", h.state().toast);
             assert!(h.state().dialog.is_none(), "{mode:?}");
-            assert_eq!(h.state().seal_store.library.history.last().map(|event| event.event.as_str()), Some("confirmed"));
+            assert_eq!(use_kinds(h.state()), COMMITTED);
             if mode == crate::UiMode::Detailed {
                 h.get_by_label("メニュー").click();
                 h.run_steps(2);
@@ -1113,6 +1031,7 @@ startxref
                 h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
             }
             h.run_steps(6);
+            settle_frames(&mut h);
             assert_eq!(ui_stamp_count(&h), 0, "{mode:?} undo {:?}", h.state().toast);
             assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().can_redo(), Some("Add stamp"), "{mode:?}");
             if mode == crate::UiMode::Detailed {
@@ -1125,19 +1044,19 @@ startxref
                 h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z);
             }
             h.run_steps(6);
+            settle_frames(&mut h);
             assert_eq!(ui_stamp_count(&h), 1, "{mode:?} redo {:?}", h.state().toast);
-            assert_eq!(
-                h.state().seal_store.library.history.iter().map(|event| event.event.as_str()).collect::<Vec<_>>(),
-                ["confirmed", "undone", "redone"]
-            );
+            assert_eq!(use_kinds(h.state()), [&COMMITTED[..], &["use_undone", "use_redone"]].concat());
             h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
             h.run_steps(4);
+            settle_frames(&mut h);
             assert_eq!(ui_stamp_count(&h), 0, "{mode:?} second undo {:?}", h.state().toast);
             h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
             h.run_steps(4);
+            settle_frames(&mut h);
             assert_eq!(ui_stamp_count(&h), 1, "{mode:?}: Ctrl+Y redoes the seal {:?}", h.state().toast);
+            assert_eq!(use_kinds_on_disk(&dir), [&COMMITTED[..], &["use_undone", "use_redone", "use_undone", "use_redone"]].concat());
             assert_eq!(sha2::Sha256::digest(std::fs::read(&original_path).unwrap()), original_sha);
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -1290,15 +1209,13 @@ startxref
     #[cfg(windows)]
     fn rotating_the_page_does_not_move_a_chairman_approval() {
         let _policy = policy();
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seal-rotate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = SealDir::new("rotate");
         let mut app = crate::PdfCraftApp::new();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.open_bytes("opened.pdf", None, one_page()).unwrap();
         place_chairman(&mut app);
-        let approved = app.seal_store.library.history.clone();
-        assert_eq!(approved.last().map(|event| (event.page, event.event.as_str())), Some((1, "confirmed")));
+        let approved = app.seals.snapshot.clone().unwrap().events;
+        assert_eq!(approved.last().map(|event| (event.page, event.kind.as_str())), Some((1, "use_committed")));
         let uses = app.seal_uses.clone();
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].page, 1);
@@ -1310,14 +1227,16 @@ startxref
         let doc = app.session.get(id).unwrap();
         assert_eq!(doc.info.pages[0].rotation, 90);
         assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
-        assert_eq!(app.seal_store.library.history.len(), approved.len(), "rotation must not write another approval");
-        assert_eq!(app.seal_store.library.history.last().map(|event| event.page), Some(1));
+        assert!(!app.seals.running(), "rotation starts no seal operation");
+        assert_eq!(app.seals.snapshot.as_ref().unwrap().events.len(), approved.len(), "rotation must not write another approval");
+        assert_eq!(app.seals.snapshot.as_ref().unwrap().events.last().map(|event| event.page), Some(1));
         assert_eq!(app.seal_uses.iter().map(|use_| use_.page).collect::<Vec<_>>(), vec![1]);
         assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        assert!(!app.seals.running());
         assert_eq!(app.session.get(id).unwrap().info.pages[0].rotation, 0);
         assert_eq!(stamp_count(&app), 1);
         assert_eq!(app.seal_uses[0].page, 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(use_kinds_on_disk(&dir), COMMITTED);
     }
 
     /// `SealUse.page` is 1-based. The colour has to be on that same page after rotation, and not on the other page.
@@ -1325,15 +1244,14 @@ startxref
     #[cfg(windows)]
     fn chairman_colour_stays_on_the_approved_page_after_rotation() {
         let _policy = policy();
-        let dir = std::env::temp_dir().join(format!("swiftpdf-seal-rotate-page-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = SealDir::new("rotate-page");
         let mut app = crate::PdfCraftApp::new();
         let bytes = app.session.create_blank(200.0, 300.0, 2).unwrap();
-        app.set_seal_store(dir.join("seals.bin"));
+        connect(&mut app, &dir);
         app.open_bytes("opened.pdf", None, bytes.to_vec()).unwrap();
         place_chairman(&mut app);
-        let approved = app.seal_store.library.history.len();
+        let approved = use_kinds(&app).len();
+        assert_eq!(use_kinds(&app), COMMITTED);
         assert_eq!(app.seal_uses.len(), 1);
         assert_eq!(app.seal_uses[0].page, 1, "the approval names the first page");
         app.session.grant(pdfcraft_engine::Capability::PageRotate);
@@ -1345,15 +1263,16 @@ startxref
         assert_eq!(doc.info.annotations.iter().filter(|a| a.subtype == "Stamp").map(|a| a.page).collect::<Vec<_>>(), [0]);
         assert!(page_has_colour_at(&doc.bytes, 0), "the seal is drawn on the approved page");
         assert!(!page_has_colour_at(&doc.bytes, 1), "the seal is not drawn on the other page");
-        assert_eq!(app.seal_store.library.history.len(), approved, "rotation must not write another approval");
+        assert_eq!(use_kinds(&app).len(), approved, "rotation must not write another approval");
         assert_eq!(app.seal_uses[0].page, 1);
         assert!(app.execute("edit.undo"), "{:?}", app.toast);
+        app.seal_settle();
         let doc = app.session.get(id).unwrap();
         assert_eq!(doc.info.pages[0].rotation, 0);
         assert!(page_has_colour_at(&doc.bytes, 0));
         assert!(!page_has_colour_at(&doc.bytes, 1));
         assert_eq!(app.seal_uses.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(use_kinds_on_disk(&dir).len(), approved);
     }
 
     fn page_has_colour_at(bytes: &[u8], page: usize) -> bool {

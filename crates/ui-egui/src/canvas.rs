@@ -3013,14 +3013,14 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     } else {
                         let (vx, vy) = xf.screen_to_view(p);
                         let u = info.pages[i].view_to_user(vx, vy);
-                        let seal_locked = app.seal_store.locked();
+                        let seal_unusable = (!app.seals.usable()).then(|| app.seals.unusable_reason());
                         match crate::stamps_ui::build_stamp_place(
                             crate::stamps_ui::ArmedInputs {
                                 tool: app.quick_tool,
                                 custom_stamps: &app.custom_stamps,
-                                seals: &app.seal_store.library.seals,
+                                seals: app.seals.seals(),
                                 date_stamps: &app.date_stamps,
-                                seal_locked,
+                                seal_unusable,
                             },
                             i,
                             [f64::from(u[0]), f64::from(u[1])],
@@ -4358,6 +4358,12 @@ fn notices(
 ) -> Option<Notice> {
     let info = &doc.info;
     let xfa = doc.xfa.as_ref();
+    // A seal change whose record failed is still in the document: say why nothing may leave it,
+    // ahead of every other notice and without a way to dismiss it.
+    if let Some(reason) = doc.output_hold() {
+        notice_bar(ui, t, "triangle-alert", t.accent_text, reason.to_owned(), |_| {});
+        return None;
+    }
     // The file changed on disk while this document has unsaved changes (#431): ask before
     // replacing it, ahead of every other notice.
     if view.disk_changed {

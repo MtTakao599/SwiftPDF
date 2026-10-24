@@ -54,20 +54,25 @@ impl PdfCraftApp {
     /// Apply an edit to the active document. Returns `true` on success; failures are shown.
     pub fn apply_edit(&mut self, edit: Edit) -> bool {
         let Some((i, id)) = self.active_ids() else { return false };
+        if self.seals.blocking() {
+            self.notify(crate::seal_service::BUSY_MESSAGE);
+            return false;
+        }
         let label = edit.label();
+        self.retire_unreachable_seal_uses(id);
         let removed_seal = if let Edit::DeleteAnnotation { page, index } = &edit {
-            self.session
-                .owned_stamp_ref(id, *page, *index)
-                .and_then(|refer| self.seal_uses.iter().position(|use_| use_.active && use_.num == refer.num && use_.generation == refer.generation))
+            self.session.owned_stamp_ref(id, *page, *index).and_then(|refer| {
+                self.seal_uses
+                    .iter()
+                    .find(|use_| use_.doc == id && use_.active && use_.num == refer.num && use_.generation == refer.generation)
+                    .map(|use_| use_.op_id.clone())
+            })
         } else {
             None
         };
-        if let Some(use_index) = removed_seal {
-            let event = crate::seal_store::SealEvent::from_use(crate::seal_store::utc_now(), "removed", &self.seal_uses[use_index]);
-            if let Err(error) = self.seal_store.append_event(event) {
-                self.notify(format!("使用履歴を記録できないため、印影は削除しませんでした。{error}"));
-                return false;
-            }
+        if removed_seal.is_some() && self.seals.running() {
+            self.notify(crate::seal_service::BUSY_MESSAGE);
+            return false;
         }
         let (form_before, page_count_before, had_xfa) = if let Some(d) = self.session.get(id) {
             (Some(std::sync::Arc::clone(&d.form)), d.info.pages.len(), d.xfa.is_some())
@@ -76,6 +81,7 @@ impl PdfCraftApp {
         };
         match self.session.apply(id, edit.clone()) {
             Ok(()) => {
+                self.retire_unreachable_seal_uses(id);
                 let Some(doc) = self.session.get(id) else { return true };
                 let info = &doc.info;
                 let view = &mut self.views[i];
@@ -193,20 +199,13 @@ impl PdfCraftApp {
                 }
                 let out = self.session.take_js_output(id);
                 self.handle_js(id, out);
-                if let Some(use_index) = removed_seal
-                    && let Some(use_) = self.seal_uses.get_mut(use_index)
-                {
-                    use_.active = false;
+                // The deletion is put back if its `use_removed` line cannot be written.
+                if let Some(op_id) = removed_seal {
+                    return self.note_seal_removal(id, op_id) == crate::seal_flow::StepOutcome::Pending;
                 }
                 true
             }
             Err(e) => {
-                if removed_seal.is_some()
-                    && let Err(error) = self.seal_store.pop_event()
-                {
-                    self.notify(format!("印影は削除されていません。使用履歴の取り消しに失敗しました。{error}"));
-                    return false;
-                }
                 let message = if matches!(e, pdfcraft_engine::EditError::NotPermitted("stamps on a signed document")) {
                     "電子署名がある PDF にはスタンプを押せません".into()
                 } else if rotation_refused_for_signature(&e) {
@@ -248,28 +247,31 @@ impl PdfCraftApp {
 
     fn history_step(&mut self, undo: bool) {
         let Some((i, id)) = self.active_ids() else { return };
+        // A step that may need a seal line waits for any seal operation, including a reading.
+        let next = self.session.get(id).and_then(|doc| if undo { doc.can_undo() } else { doc.can_redo() });
+        if self.seals.blocking() || (self.seals.running() && matches!(next, Some("Add stamp" | "Delete comment"))) {
+            self.notify(crate::seal_service::BUSY_MESSAGE);
+            return;
+        }
+        self.retire_unreachable_seal_uses(id);
         let result = if undo { self.session.undo(id) } else { self.session.redo(id) };
         match result {
             Ok(label) => {
-                let kept = if matches!(label.as_str(), "Add stamp" | "Delete comment") {
-                    self.note_seal_history_step(id, undo, label.as_str())
+                let shown = crate::i18n::edit_label(&label);
+                let message = if undo {
+                    crate::i18n::fmt(tl!("Undid {label}"), &[("label", &shown)])
                 } else {
-                    true
+                    crate::i18n::fmt(tl!("Redid {label}"), &[("label", &shown)])
                 };
+                // A chairman stamp's step is announced once its line is written. A step whose
+                // line failed has been put back and said so already.
+                let outcome = self.note_seal_history_step(id, undo, label.as_str(), Some(message.clone()));
                 if let Some(doc) = self.session.get(id) {
                     self.views[i].document_changed(&doc.info);
                 }
                 self.views[i].comments.selected = None;
-                // A failed seal-log write has already put the document back and said so.
-                // Announcing the undo or redo here would hide that.
-                if !kept {
-                    return;
-                }
-                let label = crate::i18n::edit_label(&label);
-                if undo {
-                    self.notify_fmt("Undid {label}", &[("label", &label)]);
-                } else {
-                    self.notify_fmt("Redid {label}", &[("label", &label)]);
+                if outcome == crate::seal_flow::StepOutcome::Kept {
+                    self.notify(message);
                 }
             }
             Err(e) => self.notify_error(e),
@@ -707,6 +709,11 @@ impl PdfCraftApp {
     /// [`Self::save_view`], then `after` once the document is written: now, or on a later frame
     /// when the user had to choose where. `after` never runs when the save fails or is cancelled.
     pub(crate) fn save_then(&mut self, index: usize, target: SaveTarget, after: impl FnOnce(&mut Self) + Send + 'static) -> bool {
+        if let Some(id) = self.views.get(index).map(|view| view.id)
+            && self.refuse_held(id)
+        {
+            return false;
+        }
         if self.refuse_output() {
             return false;
         }
@@ -998,6 +1005,10 @@ impl PdfCraftApp {
     /// Request a normal application exit, preserving every unsaved document until answered.
     /// Returns false while the existing save/discard/cancel prompt needs a decision.
     pub fn request_quit(&mut self, ctx: &egui::Context) -> bool {
+        if self.seals.blocking() {
+            self.notify("理事長印の処理が終わるまで終了できません。");
+            return false;
+        }
         if self.first_dirty().is_some() {
             self.close_request = Some(CloseRequest::Quit);
             ctx.request_repaint();
@@ -1010,6 +1021,10 @@ impl PdfCraftApp {
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
+        if self.seals.blocking() {
+            self.notify("理事長印の処理が終わるまで終了できません。");
+            return;
+        }
         self.allow_quit = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -1036,6 +1051,12 @@ impl PdfCraftApp {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
+        // A seal operation in flight would leave its stamp or its record half done.
+        if self.seals.blocking() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.notify("理事長印の処理が終わるまで終了できません。");
+            return;
+        }
         // `first_dirty` counts text typed into a field as an unsaved change.
         if !self.allow_quit && self.first_dirty().is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1057,6 +1078,9 @@ impl PdfCraftApp {
             self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
             return false;
         };
+        if self.refuse_held(id) {
+            return false;
+        }
         let Some(doc) = self.session.get(id) else {
             self.notify(crate::identity::localized("保存するPDFが開いていません。", "No PDF is open to save."));
             return false;
@@ -1280,6 +1304,9 @@ impl PdfCraftApp {
     fn write_save_copy(&mut self, request: SaveCopyRequest) -> bool {
         if !self.save_copy_permitted() {
             self.notify(crate::identity::localized("名前を付けて保存は許可されていません。", "Saving a copy is not allowed."));
+            return false;
+        }
+        if self.refuse_held(request.id) {
             return false;
         }
         let Some(doc) = self.session.get(request.id) else {

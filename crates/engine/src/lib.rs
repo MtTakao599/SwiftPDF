@@ -434,6 +434,9 @@ pub struct Document {
     generation: u64,
     /// The generation last handed out by `autosave_snapshots`.
     snapshot_generation: u64,
+    /// Why the working document may not leave the app ([`Session::hold_output`]). Set for good:
+    /// only closing the document ends it.
+    output_hold: Option<String>,
     /// Why the document cannot be edited (e.g. encryption), if so.
     pub read_only_reason: Option<String>,
     /// Interactive form fields of the current state (empty without a form).
@@ -915,6 +918,11 @@ impl Document {
     /// to. This stays that file when undo has restored an older snapshot.
     pub fn saved_bytes(&self) -> Arc<Vec<u8>> {
         self.editor.as_ref().map_or_else(|| self.bytes.clone(), |e| e.saved.clone())
+    }
+
+    /// Why this document is held from saving, printing, exporting and further edits, if it is.
+    pub fn output_hold(&self) -> Option<&str> {
+        self.output_hold.as_deref()
     }
 
     /// Notes about damage repaired while opening (Document Properties ▸ Advanced, notices).
@@ -3798,6 +3806,7 @@ impl Session {
             saved_copy: None,
             generation: 0,
             snapshot_generation: 0,
+            output_hold: None,
             read_only_reason,
             form: Arc::new(form),
             marker_scan: OnceLock::new(),
@@ -4087,6 +4096,7 @@ impl Session {
     /// [`Capability::PageRotate`] is granted. The document's own permissions still apply. A
     /// signed document refuses the stamp, and refuses page rotation, before the view-only error.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
+        self.check_held(id)?;
         self.allow_page_rotate(id, &edit)?;
         if !matches!(edit, Edit::RotatePages { .. }) && !self.view_only_text_edit(id, &edit) {
             self.allow_view_only_stamp(id, &edit)?;
@@ -4299,6 +4309,7 @@ impl Session {
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<Label, EditError> {
+        self.check_held(id)?;
         self.allow_history_step(id, false)?;
         let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
@@ -4321,6 +4332,7 @@ impl Session {
     }
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {
+        self.check_held(id)?;
         self.allow_history_step(id, true)?;
         let view_only = self.view_only;
         let doc = self.doc_mut(id)?;
@@ -4574,6 +4586,7 @@ impl Session {
     /// The bytes to write for Save: an incremental update of the file as opened/last saved,
     /// with `/ModDate` stamped. Call `mark_saved` after writing them successfully.
     pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(id)?;
         self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         self.working_bytes(doc)
@@ -4591,6 +4604,7 @@ impl Session {
     /// again. Rotation is an incremental update of the opened bytes: the previous revision stays
     /// in the file, and the new `/Rotate` is what a reader opens.
     pub fn save_edited_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(id)?;
         let text = self.allows(Capability::EditText);
         let stamp = self.allows(Capability::Stamp);
         let rotate = self.allows(Capability::PageRotate);
@@ -4667,6 +4681,7 @@ impl Session {
     /// produced by another method and written by the same new-file publisher; it must not go
     /// through this one.
     pub fn save_copy_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(id)?;
         if !self.allows(Capability::SaveAs) {
             return Err(EditError::ViewOnly);
         }
@@ -4684,6 +4699,7 @@ impl Session {
 
     /// A compact, garbage-collected rewrite (Save As ▸ "Optimized" / Reduce File Size groundwork).
     pub fn save_full_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(id)?;
         self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         if doc.is_signed() {
@@ -4893,6 +4909,7 @@ impl Session {
     /// Export comments and/or form data: XFDF and FDF carry either or both; XML, CSV and text
     /// are form data only.
     pub fn export_data(&self, id: DocId, format: DataFormat, comments: bool, fields: bool) -> Result<Vec<u8>, EditError> {
+        self.check_held(id)?;
         self.check_not_view_only()?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let cos = match doc.editor.as_ref() {
@@ -4938,6 +4955,7 @@ impl Session {
         settings: &print::Settings,
         pending: Option<&PendingPrintText>,
     ) -> Result<Vec<u8>, EditError> {
+        self.check_held(id)?;
         if self.view_only && !self.allows(Capability::Print) {
             return Err(EditError::ViewOnly);
         }
@@ -5292,7 +5310,24 @@ impl Session {
         Ok(id)
     }
 
+    /// Keep document `id` from leaving the app: every save, copy, print, export, extraction,
+    /// edit, undo and redo of it is refused with `reason`, and autosave skips it, until it is
+    /// closed. For a working document whose contents the app can no longer vouch for.
+    pub fn hold_output(&mut self, id: DocId, reason: String) -> Result<(), EditError> {
+        let doc = self.doc_mut(id)?;
+        doc.output_hold = Some(reason);
+        Ok(())
+    }
+
+    pub(crate) fn check_held(&self, id: DocId) -> Result<(), EditError> {
+        match self.get(id).and_then(|doc| doc.output_hold.as_ref()) {
+            Some(reason) => Err(EditError::Invalid(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
     fn cos(&self, id: DocId) -> Result<&pdfcraft_cos::Document, EditError> {
+        self.check_held(id)?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         doc.editor.as_ref().map(|e| &e.cos).ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))
     }
@@ -5319,7 +5354,7 @@ impl Session {
     pub fn autosave_snapshots(&mut self) -> Vec<RecoverySnapshot> {
         let mut out = Vec::new();
         for d in &mut self.docs {
-            if d.dirty && d.generation != d.snapshot_generation {
+            if d.dirty && d.generation != d.snapshot_generation && d.output_hold.is_none() {
                 d.snapshot_generation = d.generation;
                 out.push(RecoverySnapshot {
                     doc: d.id,
@@ -5409,6 +5444,7 @@ impl Session {
     /// Acrobat's Summarize Comments ("Comments only" layout): a new PDF listing every comment
     /// with its number, author, type, date, text and replies, grouped by page.
     pub fn summarize_comments(&self, id: DocId, sort: SummarySort) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(id)?;
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let text = comment_summary(&doc.name, &doc.info.annotations, sort);
         self.create_report(&format!("Summary of Comments on {}", doc.name), &text)
@@ -5452,6 +5488,7 @@ impl Session {
     /// the signed file; the caller saves it and then calls [`Session::mark_signed`]. An empty
     /// `opts.date` takes the session clock.
     pub fn sign(&self, doc: DocId, id: &pdfcraft_sign::DigitalId, mut opts: SignOptions) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(doc)?;
         self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         // Encrypted documents are signed under their permissions (the signer checks them).
@@ -5486,6 +5523,7 @@ impl Session {
     /// Append a standalone document timestamp (RFC 3161, `/ETSI.RFC3161`) covering the file's
     /// current state. An empty `date` takes the session clock; the transport is the caller's.
     pub fn timestamp_document(&self, doc: DocId, tsa: &dyn pdfcraft_sign::TimestampAuthority, date: String) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(doc)?;
         self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
@@ -5498,6 +5536,7 @@ impl Session {
     /// Embed revocation evidence into the catalog's `/DSS` with `/VRI` entries per signature
     /// (PAdES B-LT): an incremental update that never rewrites signed bytes.
     pub fn embed_ltv(&self, doc: DocId, evidence: &pdfcraft_sign::dss::Evidence) -> Result<Arc<Vec<u8>>, EditError> {
+        self.check_held(doc)?;
         self.check_not_view_only()?;
         let d = self.get(doc).ok_or(EditError::NoDocument)?;
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;

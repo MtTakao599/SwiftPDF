@@ -366,9 +366,10 @@ fn app_creator<'a>(
         // guard still runs when the command is shown and again when it is applied.
         app.grant_page_rotate();
         // Chairman seals live in this folder (LOCALAPPDATA\SwiftPDF, or Data beside a portable
-        // exe). They are DPAPI ciphertext, not an entry in app.ron.
+        // exe). They are DPAPI ciphertext, not an entry in app.ron. The store is only read here;
+        // a format-1 file waits for the user to agree to migrate it.
         if let Some(dir) = settings_dir() {
-            app.set_seal_store(dir.join("seals.bin"));
+            app.set_seal_dir(dir);
         }
         // First start (or settings from before Units existed): the region's unit.
         app.units = pdfcraft_ui_egui::units::Unit::system();
