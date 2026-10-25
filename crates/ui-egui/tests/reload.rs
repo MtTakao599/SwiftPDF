@@ -247,7 +247,17 @@ fn unsaved_changes_are_kept_until_reload_is_chosen() {
     h.run_steps(3);
     assert_eq!((pages(&h), dirty(&h)), (2, true), "not replaced behind the user's back");
     h.get_by_label_contains("This file changed on disk");
+    // Reload asks about the unsaved changes first, as closing does; Cancel keeps them.
     h.get_by_label("Reload").click();
+    h.run_steps(3);
+    h.get_by_label_contains("before reloading?");
+    assert_eq!((pages(&h), dirty(&h)), (2, true), "not replaced before the answer");
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert_eq!((pages(&h), dirty(&h)), (2, true), "Cancel keeps the changes");
+    h.get_by_label("Reload").click();
+    h.run_steps(3);
+    h.get_by_label("Don't save").click();
     h.run_steps(3);
     assert_eq!((pages(&h), dirty(&h)), (4, false), "replaced when asked");
     assert!(h.query_by_label_contains("This file changed on disk").is_none());

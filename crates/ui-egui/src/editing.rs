@@ -16,6 +16,9 @@ pub enum CloseRequest {
     Quit,
     /// File ▸ Close all: like Quit, but the application stays open.
     All,
+    /// The notice bar's Reload: replace this document with its file on disk, once its placed
+    /// stamp and unsaved changes are answered. The tab stays open.
+    Reload(pdfcraft_engine::DocId),
 }
 
 /// A save held back by [`Dialog::OverwriteChanged`](crate::Dialog::OverwriteChanged): the file
@@ -695,7 +698,8 @@ impl PdfCraftApp {
         if self.seal_approval.as_ref().is_some_and(|approval| approval.doc == doc) {
             self.seal_approval = None;
         }
-        if self.dialog == Some(crate::Dialog::ConfirmSeal) {
+        // The approval dialog is about the active tab's placement; another tab's stays open.
+        if self.dialog == Some(crate::Dialog::ConfirmSeal) && self.active == Some(index) {
             self.dialog = None;
         }
     }
@@ -714,7 +718,7 @@ impl PdfCraftApp {
             return;
         }
         let index = match req {
-            CloseRequest::Tab(id) => self.views.iter().position(|view| view.id == id),
+            CloseRequest::Tab(id) | CloseRequest::Reload(id) => self.views.iter().position(|view| view.id == id),
             CloseRequest::Quit | CloseRequest::All => self.first_pending_place(),
         };
         if let Some(index) = index {
@@ -724,6 +728,11 @@ impl PdfCraftApp {
             CloseRequest::Tab(id) => {
                 if let Some(index) = self.views.iter().position(|view| view.id == id) {
                     self.request_close_tab(index);
+                }
+            }
+            CloseRequest::Reload(id) => {
+                if let Some(index) = self.views.iter().position(|view| view.id == id) {
+                    self.request_reload(index);
                 }
             }
             CloseRequest::Quit => {
@@ -954,6 +963,33 @@ impl PdfCraftApp {
         }
     }
 
+    /// The notice bar's Reload. The new version replaces the document object, so this asks the
+    /// same questions as closing it: a placed stamp first, then unsaved changes (Save, Don't save
+    /// or Cancel; a cancelled or failed save does not reload). Refused while seal work runs and
+    /// for a held document, whose hold a reload would otherwise drop.
+    pub(crate) fn request_reload(&mut self, index: usize) {
+        let Some(id) = self.views.get(index).map(|v| v.id) else { return };
+        if self.seals.blocking() {
+            self.notify("理事長印の処理が終わるまで再読込できません。");
+            return;
+        }
+        if self.refuse_held(id) {
+            return;
+        }
+        if self.place_close_request.is_some() || self.close_request.is_some() {
+            return;
+        }
+        if self.has_pending_place(index) {
+            self.ask_place_close(CloseRequest::Reload(id));
+            return;
+        }
+        if self.has_unsaved_work(index) {
+            self.close_request = Some(CloseRequest::Reload(id));
+            return;
+        }
+        self.reload_from_disk(id);
+    }
+
     /// File ▸ Close all: clean documents close at once; each one with unsaved changes asks.
     pub fn close_all(&mut self) {
         if self.seals.blocking() {
@@ -1009,7 +1045,7 @@ impl PdfCraftApp {
     pub fn resolve_close(&mut self, ctx: &egui::Context, choice: Option<bool>) {
         let Some(req) = self.close_request.take() else { return };
         let index = match req {
-            CloseRequest::Tab(id) => match self.views.iter().position(|v| v.id == id) {
+            CloseRequest::Tab(id) | CloseRequest::Reload(id) => match self.views.iter().position(|v| v.id == id) {
                 Some(i) => i,
                 None => return, // already closed
             },
@@ -1069,6 +1105,11 @@ impl PdfCraftApp {
 
     /// Close tab `index` for a close request, then ask about the next dirty document, or quit.
     fn close_and_continue(&mut self, ctx: &egui::Context, index: usize, req: CloseRequest) {
+        // Reached only after Don't save, or after the save was written.
+        if let CloseRequest::Reload(id) = req {
+            self.reload_from_disk(id);
+            return;
+        }
         self.close_tab(index);
         // A newer prompt wins: the user may have started another close while a save was pending.
         if (req == CloseRequest::Quit || req == CloseRequest::All) && self.close_request.is_none() {
@@ -1122,10 +1163,7 @@ impl PdfCraftApp {
 
     /// Publish whether any document has unsaved work, for the browser's reload warning (#812).
     pub(crate) fn sync_unsaved_flag(&self) {
-        self.unsaved_flag.store(
-            self.first_dirty().is_some() || self.first_pending_place().is_some(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.unsaved_flag.store(self.first_dirty().is_some() || self.first_pending_place().is_some(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Intercept window close while documents have unsaved changes.
@@ -2980,6 +3018,25 @@ mod page_rotate_foundation_tests {
         assert_eq!(app.views.len(), 2);
         assert!(app.views[0].stamp_place.is_some(), "switching documents does not drop the placement");
         assert!(app.views[1].stamp_place.is_none());
+    }
+
+    /// The notice bar's Close (a signed-version snapshot) goes through the same questions as any
+    /// close: it used to close the tab directly when nothing was unsaved, dropping the placement.
+    #[test]
+    fn the_notice_bar_close_asks_about_a_pending_stamp() {
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 900.0)).build_eframe(|_cc| {
+            let mut app = open_blank(1);
+            app.grant_stamp();
+            app.views[0].stamp_place = Some(pending_stamp(false));
+            app
+        });
+        h.run_steps(2);
+        let id = h.state().views[0].id;
+        h.state_mut().views[0].close_requested = true;
+        h.run_steps(2);
+        assert_eq!(h.state().views.len(), 1, "the tab stays until the user answers");
+        assert_eq!(h.state().place_close_request, Some(CloseRequest::Tab(id)));
+        assert!(h.state().views[0].stamp_place.is_some());
     }
 
     #[test]

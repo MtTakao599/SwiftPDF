@@ -2325,11 +2325,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     let pending = app.views.get(index).filter(|v| v.close_requested).map(|v| v.id).and_then(|id| app.views.iter().position(|v| v.id == id));
     if let Some(i) = pending {
         app.views[i].close_requested = false;
-        if app.has_unsaved_work(i) {
-            app.close_request = Some(crate::CloseRequest::Tab(app.views[i].id));
-        } else {
-            app.close_tab(i);
-        }
+        // The same questions as any other close: an uncommitted stamp, then unsaved changes.
+        app.request_close_tab(i);
         return;
     }
     let place_text = app.session.allows_added_text(app.views[index].id);

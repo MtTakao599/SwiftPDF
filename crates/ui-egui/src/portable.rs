@@ -165,6 +165,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&exe);
     }
 
+    /// `Data` exists but a file cannot be written in it (here the probe name is taken by a
+    /// folder; a read-only share fails at the same write): portable mode is off and says why.
+    #[test]
+    fn a_data_folder_that_refuses_files_turns_portable_mode_off() {
+        let exe = temp("refuses");
+        std::fs::write(exe.join("portable.txt"), b"").unwrap();
+        std::fs::create_dir_all(exe.join(DATA_DIR).join(".write-test")).unwrap();
+        let p = resolve(Some(&exe));
+        assert_eq!(p.dir, None);
+        let unwritable = p.unwritable.expect("the failed write is reported");
+        assert_eq!(unwritable.folder, exe.join(DATA_DIR));
+        assert!(!unwritable.error.is_empty());
+        assert!(exe.join(DATA_DIR).join(".write-test").is_dir(), "the folder in the way is left alone");
+        let _ = std::fs::remove_dir_all(&exe);
+    }
+
     #[test]
     fn no_exe_dir_leaves_portable_mode_off() {
         assert_eq!(resolve(None), Portable::default());

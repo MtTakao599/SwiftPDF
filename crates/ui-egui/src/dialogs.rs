@@ -1666,13 +1666,31 @@ pub(crate) fn save_prompt_key(ctx: &egui::Context) -> Option<Option<bool>> {
 fn place_close_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let Some(req) = app.place_close_request else { return };
     let index = match req {
-        crate::editing::CloseRequest::Tab(id) => app.views.iter().position(|v| v.id == id),
+        crate::editing::CloseRequest::Tab(id) | crate::editing::CloseRequest::Reload(id) => app.views.iter().position(|v| v.id == id),
         crate::editing::CloseRequest::Quit | crate::editing::CloseRequest::All => app.first_pending_place(),
     };
     if index.is_none_or(|i| !app.has_pending_place(i)) {
         app.resolve_place_close(ctx, Some(true));
         return;
     }
+    let reload = matches!(req, crate::editing::CloseRequest::Reload(_));
+    let (detail, discard) = if reload {
+        (
+            crate::identity::localized(
+                "まだ PDF には入っていません。再読込するとこの仮置きは破棄されます。未保存の編集があれば、続けて確認します。",
+                "It is not in the PDF yet. Reloading discards this placement. Unsaved edits are asked about next.",
+            ),
+            crate::identity::localized("仮置きを破棄して再読込", "Discard placement and reload"),
+        )
+    } else {
+        (
+            crate::identity::localized(
+                "まだ PDF には入っていません。閉じるとこの仮置きだけ破棄されます。保存済みの編集とは別です。",
+                "It is not in the PDF yet. Closing discards this placement only, not saved edits.",
+            ),
+            crate::identity::localized("仮置きを破棄して閉じる", "Discard placement and close"),
+        )
+    };
     let chairman = index.and_then(|i| app.views.get(i)).and_then(|v| v.stamp_place.as_ref()).is_some_and(|place| place.chairman);
     let t = Tokens::get(ctx);
     let mut choice: Option<Option<bool>> = None;
@@ -1687,19 +1705,13 @@ fn place_close_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             .font(theme::semibold(16.0)),
         );
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(crate::identity::localized(
-                "まだ PDF には入っていません。閉じるとこの仮置きだけ破棄されます。保存済みの編集とは別です。",
-                "It is not in the PDF yet. Closing discards this placement only, not saved edits.",
-            ))
-            .color(t.text_muted),
-        );
+        ui.label(egui::RichText::new(&detail).color(t.text_muted));
         ui.add_space(14.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::pill_button(ui, crate::identity::localized("編集に戻る", "Return to editing"), true).clicked() {
+            if widgets::pill_button(ui, &crate::identity::localized("編集に戻る", "Return to editing"), true).clicked() {
                 choice = Some(None);
             }
-            if widgets::pill_button(ui, crate::identity::localized("仮置きを破棄して閉じる", "Discard placement and close"), false).clicked() {
+            if widgets::pill_button(ui, &discard, false).clicked() {
                 choice = Some(Some(true));
             }
         });
@@ -1718,7 +1730,7 @@ fn place_close_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
 fn save_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let Some(req) = app.close_request else { return };
     let index = match req {
-        CloseRequest::Tab(id) => app.views.iter().position(|v| v.id == id),
+        CloseRequest::Tab(id) | CloseRequest::Reload(id) => app.views.iter().position(|v| v.id == id),
         CloseRequest::Quit | CloseRequest::All => app.first_dirty(),
     };
     let Some(name) = index.and_then(|i| app.views.get(i)).and_then(|v| app.session.get(v.id)).map(|d| d.name.clone()) else {
@@ -1737,8 +1749,15 @@ fn save_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
             ui.add(crate::icons::image("save", 22.0, t.accent));
             let title = ui.add(
                 egui::Label::new(
-                    egui::RichText::new(crate::i18n::fmt(tl!("Save changes to “{name}” before closing?"), &[("name", &shown)]))
-                        .font(theme::semibold(16.0)),
+                    egui::RichText::new(if matches!(req, CloseRequest::Reload(_)) {
+                        crate::identity::localized(
+                            &format!("再読込する前に「{shown}」の変更を保存しますか？"),
+                            &format!("Save changes to “{shown}” before reloading?"),
+                        )
+                    } else {
+                        crate::i18n::fmt(tl!("Save changes to “{name}” before closing?"), &[("name", &shown)])
+                    })
+                    .font(theme::semibold(16.0)),
                 )
                 .wrap(),
             );

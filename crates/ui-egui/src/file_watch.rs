@@ -308,8 +308,10 @@ impl PdfCraftApp {
     /// Every frame: tell the watcher about files opened, closed or saved (without allocating
     /// when nothing changed), and reload what changed on disk.
     pub(crate) fn watch_files(&mut self) {
-        if let Some(id) = self.watch.reload_request.take() {
-            self.reload_from_disk(id);
+        if let Some(id) = self.watch.reload_request.take()
+            && let Some(i) = self.views.iter().position(|v| v.id == id)
+        {
+            self.request_reload(i);
         }
         let mut sent = self.watch.sent.iter();
         let unchanged = self
@@ -379,7 +381,8 @@ impl PdfCraftApp {
             return;
         }
         self.watch.known.insert(c.doc, c.stamp);
-        if self.has_unsaved_work(i) {
+        // A stamp placed but not yet in the PDF would be dropped by the reload, as unsaved work would.
+        if self.has_unsaved_work(i) || self.has_pending_place(i) {
             if let Some(view) = self.views.get_mut(i) {
                 view.disk_changed = true;
             }
@@ -388,9 +391,9 @@ impl PdfCraftApp {
         self.reload_view(i, c.bytes);
     }
 
-    /// The notice bar's Reload: read the file now and replace the document, unsaved changes and
-    /// all.
-    fn reload_from_disk(&mut self, doc: DocId) {
+    /// Read the file now and replace the document, unsaved changes and all. The notice bar's
+    /// Reload reaches this through [`Self::request_reload`], which asks first.
+    pub(crate) fn reload_from_disk(&mut self, doc: DocId) {
         let Some(i) = self.views.iter().position(|v| v.id == doc) else { return };
         let Some(path) = self.session.get(doc).and_then(|d| d.path.clone()) else { return };
         let stamp = Stamp::at(&path);
@@ -410,6 +413,14 @@ impl PdfCraftApp {
     /// version that can't be opened leaves the document as it was, and says so.
     fn reload_view(&mut self, i: usize, bytes: Arc<Vec<u8>>) {
         let Some(id) = self.views.get(i).map(|v| v.id) else { return };
+        // Seal work may be writing into this document, and a hold lives on the document object a
+        // reload replaces: neither is reloaded. The notice bar stays so it can be done later.
+        if self.seals.blocking() || self.session.get(id).is_some_and(|doc| doc.output_hold().is_some()) {
+            if let Some(view) = self.views.get_mut(i) {
+                view.disk_changed = true;
+            }
+            return;
+        }
         match self.session.reload(id, bytes) {
             Ok(()) => {
                 // Whatever was unsaved is gone, so there is nothing left to recover.
@@ -436,7 +447,7 @@ mod tests {
     use egui_kittest::Harness;
 
     use super::*;
-    use crate::SaveTarget;
+    use crate::{CloseRequest, SaveTarget};
 
     /// An `n`-page PDF with a proper xref table.
     fn fixture(n: usize) -> Vec<u8> {
@@ -561,5 +572,202 @@ mod tests {
         assert_eq!(d.path.as_deref(), Some(new_path.as_str()));
         assert_eq!(d.info.pages.len(), 2, "the old file's version was not applied to the new one");
         assert!(d.can_undo().is_some() && !d.dirty, "the saved document and its history stay");
+    }
+
+    /// A stamp on the page, not yet in the PDF.
+    fn placed(chairman: bool) -> crate::stamps_ui::StampPlace {
+        crate::stamps_ui::StampPlace {
+            page: 0,
+            rect: [20.0, 40.0, 80.0, 100.0],
+            name: "合成".into(),
+            file: "stamp.png".into(),
+            data: Arc::new(b"PNG".to_vec()),
+            source_page: 0,
+            opacity: 1.0,
+            chairman,
+            pixels: None,
+            drag: None,
+            scale: 100.0,
+            nominal: (40.0, 40.0),
+            source: if chairman { crate::stamps_ui::PlaceSource::Chairman(0) } else { crate::stamps_ui::PlaceSource::Custom(0) },
+            circular: false,
+            date_overlay: None,
+            rotation: 0,
+            seal: None,
+            seal_ref: None,
+            preview_gen: 0,
+        }
+    }
+
+    /// Version B on disk while the document shows A, with the notice bar up. The automatic reload
+    /// is off, so only the Reload under test can replace the document.
+    fn changed_on_disk(h: &mut Harness<'static, PdfCraftApp>, path: &str) {
+        h.state_mut().reload_changed_files = false;
+        h.run_steps(1);
+        rebuild(path, &fixture(3));
+        h.state_mut().views[0].disk_changed = true;
+    }
+
+    /// The notice bar's Reload, as a click queues it, then the frames that act on it.
+    fn press_reload(h: &mut Harness<'static, PdfCraftApp>) {
+        let id = h.state().views[0].id;
+        h.state_mut().watch.reload_request = Some(id);
+        h.run_steps(2);
+    }
+
+    fn pages(h: &Harness<'static, PdfCraftApp>) -> usize {
+        doc(h).info.pages.len()
+    }
+
+    fn rotate_first_page(h: &mut Harness<'static, PdfCraftApp>) {
+        let app = h.state_mut();
+        app.views[0].select_pages(&[0]);
+        assert!(app.apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: 90 }));
+        assert!(doc(h).dirty);
+    }
+
+    /// Reload with a placed stamp, general or chairman: the placement question comes first, and
+    /// 編集に戻る keeps the placement and the document as they were. Pressing Reload again while
+    /// it is up asks nothing new.
+    #[test]
+    fn reload_asks_about_a_placed_stamp_and_return_keeps_it() {
+        for chairman in [false, true] {
+            let (_dir, path) = TempDir::new(&format!("reload-place-{chairman}"), &fixture(2));
+            let mut h = harness(&path);
+            h.state_mut().views[0].stamp_place = Some(placed(chairman));
+            changed_on_disk(&mut h, &path);
+            let id = h.state().views[0].id;
+            press_reload(&mut h);
+            assert_eq!(h.state().place_close_request, Some(CloseRequest::Reload(id)), "chairman={chairman}");
+            assert_eq!(h.state().front_prompt(), Some(crate::PromptLayer::PlaceClose));
+            assert_eq!(pages(&h), 2, "not reloaded before the answer");
+            press_reload(&mut h);
+            assert_eq!(h.state().place_close_request, Some(CloseRequest::Reload(id)));
+            assert!(h.state().close_request.is_none(), "a second press asks nothing new");
+            let ctx = h.ctx.clone();
+            h.state_mut().resolve_place_close(&ctx, None);
+            h.run_steps(2);
+            assert_eq!(pages(&h), 2, "編集に戻る does not reload");
+            assert!(h.state().views[0].stamp_place.is_some(), "and keeps the placement");
+            assert!(h.state().views[0].disk_changed, "the notice bar stays");
+        }
+    }
+
+    /// Discarding the placement on a document with nothing unsaved reloads it.
+    #[test]
+    fn discarding_the_placement_reloads_a_clean_document() {
+        let (_dir, path) = TempDir::new("reload-discard", &fixture(2));
+        let mut h = harness(&path);
+        h.state_mut().views[0].stamp_place = Some(placed(true));
+        changed_on_disk(&mut h, &path);
+        press_reload(&mut h);
+        let ctx = h.ctx.clone();
+        h.state_mut().resolve_place_close(&ctx, Some(true));
+        h.run_steps(2);
+        assert_eq!(pages(&h), 3, "reloaded");
+        assert!(h.state().views[0].stamp_place.is_none());
+        assert!(h.state().close_request.is_none() && h.state().place_close_request.is_none());
+    }
+
+    /// Nothing placed and nothing unsaved: Reload reloads at once, with no question.
+    #[test]
+    fn reload_without_a_placement_or_changes_does_not_ask() {
+        let (_dir, path) = TempDir::new("reload-plain", &fixture(2));
+        let mut h = harness(&path);
+        changed_on_disk(&mut h, &path);
+        press_reload(&mut h);
+        assert_eq!(pages(&h), 3);
+        assert!(h.state().close_request.is_none() && h.state().place_close_request.is_none());
+    }
+
+    /// A placed stamp and unsaved PDF edits: discarding the placement does not drop the edits.
+    /// The save question follows; Cancel keeps everything, Don't save reloads.
+    #[test]
+    fn unsaved_edits_are_asked_about_after_the_placement() {
+        let (_dir, path) = TempDir::new("reload-place-edits", &fixture(2));
+        let mut h = harness(&path);
+        rotate_first_page(&mut h);
+        h.state_mut().views[0].stamp_place = Some(placed(false));
+        changed_on_disk(&mut h, &path);
+        let id = h.state().views[0].id;
+        press_reload(&mut h);
+        let ctx = h.ctx.clone();
+        h.state_mut().resolve_place_close(&ctx, Some(true));
+        h.run_steps(2);
+        assert!(h.state().views[0].stamp_place.is_none(), "the placement is gone");
+        assert_eq!(h.state().close_request, Some(CloseRequest::Reload(id)), "the edits are asked about");
+        assert_eq!(h.state().front_prompt(), Some(crate::PromptLayer::Save));
+        assert_eq!(pages(&h), 2);
+        assert!(doc(&h).dirty, "the edits are still there");
+
+        h.state_mut().resolve_close(&ctx, None);
+        h.run_steps(2);
+        assert_eq!(pages(&h), 2, "Cancel does not reload");
+        assert!(doc(&h).dirty && doc(&h).can_undo().is_some(), "Cancel keeps the edits and their history");
+
+        press_reload(&mut h);
+        assert_eq!(h.state().close_request, Some(CloseRequest::Reload(id)), "asked again, placement already gone");
+        h.state_mut().resolve_close(&ctx, Some(false));
+        h.run_steps(2);
+        assert_eq!(pages(&h), 3, "Don't save reloads");
+        assert!(!doc(&h).dirty);
+    }
+
+    /// Save chosen before reloading, and the save fails: nothing is reloaded and the edits stay.
+    #[test]
+    fn a_failed_save_does_not_reload() {
+        let (dir, path) = TempDir::new("reload-save-fails", &fixture(2));
+        let mut h = harness(&path);
+        rotate_first_page(&mut h);
+        changed_on_disk(&mut h, &path);
+        press_reload(&mut h);
+        let id = h.state().views[0].id;
+        assert_eq!(h.state().close_request, Some(CloseRequest::Reload(id)));
+        let unwritable = dir.0.join("no-such-folder").join("copy.pdf").to_string_lossy().into_owned();
+        h.state_mut().save_override = Some(unwritable);
+        let ctx = h.ctx.clone();
+        h.state_mut().resolve_close(&ctx, Some(true));
+        h.run_steps(3);
+        assert_eq!(pages(&h), 2, "not reloaded after a failed save");
+        assert!(doc(&h).dirty && doc(&h).can_undo().is_some(), "the edits stay");
+    }
+
+    /// A held document keeps its hold: neither Reload nor a new version on disk replaces it,
+    /// which would open a fresh document object without the hold.
+    #[test]
+    fn a_held_document_is_not_reloaded() {
+        let (_dir, path) = TempDir::new("reload-held", &fixture(2));
+        let mut h = harness(&path);
+        let id = h.state().views[0].id;
+        h.state_mut().session.hold_output(id, "合成の要復旧".into()).unwrap();
+        changed_on_disk(&mut h, &path);
+        press_reload(&mut h);
+        assert_eq!(pages(&h), 2);
+        assert_eq!(doc(&h).output_hold(), Some("合成の要復旧"), "the hold stays");
+        let toast = h.state().toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        assert!(toast.contains("合成の要復旧"), "says why: {toast}");
+        // The watcher finding the new version on a clean held document does not reload it either.
+        h.state_mut().views[0].disk_changed = false;
+        h.state_mut().reload_changed_files = true;
+        h.run_steps(6);
+        assert_eq!(pages(&h), 2);
+        assert_eq!(doc(&h).output_hold(), Some("合成の要復旧"));
+        assert!(h.state().views[0].disk_changed, "the notice bar says the file changed");
+    }
+
+    /// A stamp placed but not yet in the PDF is unfinished work: a new version on disk raises the
+    /// notice bar instead of reloading the document from under it.
+    #[test]
+    fn a_new_version_does_not_drop_a_pending_stamp() {
+        let (_dir, path) = TempDir::new("pending-stamp", &fixture(2));
+        let mut h = harness(&path);
+        h.state_mut().views[0].stamp_place = Some(placed(true));
+        let found = find_new_version(h.state_mut(), &path, &fixture(3));
+        h.state_mut().watch.found.lock().unwrap().extend(found);
+        h.run_steps(3);
+        assert_eq!(doc(&h).info.pages.len(), 2, "not reloaded under the placement");
+        let view = &h.state().views[0];
+        assert!(view.stamp_place.is_some(), "the placement stays");
+        assert!(view.disk_changed, "the notice bar says the file changed");
     }
 }

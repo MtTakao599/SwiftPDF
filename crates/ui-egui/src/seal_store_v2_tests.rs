@@ -1360,25 +1360,49 @@ fn notes_are_safe(notes: &str) {
     assert!(notes.contains("file=seals.v2.bin") || notes == "no store I/O notes", "{notes}");
 }
 
+/// Not retried by `with_retry`, so one injected failure is one attempt.
+#[cfg(windows)]
+const NOT_RETRIED_OS: [(pdfcraft_platform::staging::AtomicWriteStage, i32); 4] = {
+    use pdfcraft_platform::staging::AtomicWriteStage::*;
+    // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_WRITE_FAULT, ERROR_NOT_SAME_DEVICE
+    [(Create, 112), (Write, 39), (Sync, 29), (Rename, 17)]
+};
+#[cfg(not(windows))]
+const NOT_RETRIED_OS: [(pdfcraft_platform::staging::AtomicWriteStage, i32); 4] = {
+    use pdfcraft_platform::staging::AtomicWriteStage::*;
+    // ENOSPC, EIO, EIO, EXDEV
+    [(Create, 28), (Write, 5), (Sync, 5), (Rename, 18)]
+};
+
+/// A replacement that fails at create, write, sync or rename is logged with that step, its OS
+/// code and the operation; the file, the audit log and the refusal are as before.
 #[test]
 fn write_stage_failures_are_named_and_keep_the_history() {
     let dir = TestDir::new("io-stages");
     let vault = SealVault::new(dir.path());
-    let first = vault.register(new_seal("合成A", 1)).unwrap();
-    let events_before = first.snapshot.events.len();
+    let seal = registered(&vault, "合成A", 1);
+    let events_before = ready(&vault).events.len();
     let bytes_before = std::fs::read(dir.v2()).unwrap();
-    for stage in ["create", "write", "sync", "rename"] {
-        vault.fail_next_write_at(stage);
-        let refused = vault.register(new_seal("合成B", 2));
-        assert_eq!(refused, Err(VaultError::Io(WRITE_ERROR)), "{stage}");
+    for (stage, os) in NOT_RETRIED_OS {
+        vault.fail_next_write_at(stage, Some(os));
+        let approval = ApprovalRef::new(&seal).unwrap();
+        assert_eq!(vault.record_approval(&approval), Err(VaultError::Io(WRITE_ERROR)), "{stage:?}");
         let notes = last_store_io_notes();
-        assert!(notes.contains(&format!("stage={stage}")), "{stage}: {notes}");
-        assert!(notes.contains("class=Io"), "{notes}");
-        assert!(notes.contains("op=register"), "{notes}");
+        let line = format!("stage={} class=Io op=record_approval", stage.as_str());
+        assert!(notes.contains(&line), "{stage:?}: {notes}");
+        assert!(notes.contains(&format!("os=Some({os})")), "{stage:?}: {notes}");
         notes_are_safe(&notes);
-        assert_eq!(std::fs::read(dir.v2()).unwrap(), bytes_before, "{stage} must not replace the file");
-        assert_eq!(ready(&vault).events.len(), events_before, "{stage} keeps the audit log");
+        assert_eq!(std::fs::read(dir.v2()).unwrap(), bytes_before, "{stage:?} must not replace the file");
+        let after = ready(&vault);
+        assert_eq!(after.events.len(), events_before, "{stage:?} keeps the audit log as it was");
+        assert_eq!(after.use_state(&approval.op_id), UseState::Unknown, "{stage:?}: the approval was not recorded");
+        // The stamp that approval was for is refused: its preparation has no approval to follow.
+        assert_eq!(conflict(vault.prepare_use(&approval, &details())).0, Conflict::NotApproved, "{stage:?}");
+        assert_eq!(std::fs::read(dir.v2()).unwrap(), bytes_before, "{stage:?}: the refusal writes nothing");
     }
+    // Nothing planted: the next write goes through as before.
+    let approval = ApprovalRef::new(&seal).unwrap();
+    assert!(vault.record_approval(&approval).unwrap().changed);
 }
 
 #[test]
@@ -1400,9 +1424,13 @@ fn verify_and_reread_failures_are_named_and_refuse_the_stamp() {
     let approval = ApprovalRef::new(&seal).unwrap();
     assert_eq!(vault.record_approval(&approval), Err(VaultError::Verify));
     let notes = last_store_io_notes();
-    assert!(notes.contains("stage=verify_bytes") && notes.contains("class=Verify"), "{notes}");
+    assert!(notes.contains("stage=verify_bytes class=Verify op=record_approval"), "{notes}");
     notes_are_safe(&notes);
     vault.set_hook(None);
+    // The mismatched file is not taken as written: the store no longer reads, and nothing stamps.
+    assert!(vault.state().is_err() || ready(&vault).use_state(&approval.op_id) == UseState::Unknown);
+    assert!(vault.prepare_use(&approval, &details()).is_err(), "no stamp after a failed verify");
+    let _ = events_before;
 
     let dir = TestDir::new("io-reread");
     let vault = SealVault::new(dir.path());
@@ -1417,7 +1445,69 @@ fn verify_and_reread_failures_are_named_and_refuse_the_stamp() {
     let approval = ApprovalRef::new(&seal).unwrap();
     assert_eq!(vault.record_approval(&approval), Err(VaultError::Verify));
     let notes = last_store_io_notes();
-    assert!(notes.contains("stage=reread") && notes.contains("class=Verify"), "{notes}");
+    assert!(notes.contains("stage=reread class=Verify op=record_approval"), "{notes}");
     notes_are_safe(&notes);
-    let _ = events_before;
+}
+
+/// A reread that fails with an I/O error is logged as `Io` with its OS code, not as a mismatch.
+#[test]
+fn a_reread_io_error_is_logged_as_io() {
+    let dir = TestDir::new("io-reread-io");
+    let vault = SealVault::new(dir.path());
+    let seal = registered(&vault, "合成A", 1);
+    let v2 = dir.v2();
+    // A folder where the file was: metadata says "not a file", so the reread refuses it.
+    vault.set_hook(Some(Box::new(move |point| {
+        if point == Point::AfterWrite {
+            let _ = std::fs::remove_file(&v2);
+            std::fs::create_dir(&v2).unwrap();
+        }
+        false
+    })));
+    let approval = ApprovalRef::new(&seal).unwrap();
+    assert!(matches!(vault.record_approval(&approval), Err(VaultError::Unreadable(_))));
+    let notes = last_store_io_notes();
+    assert!(notes.contains("stage=reread class=Unreadable op=record_approval"), "{notes}");
+    notes_are_safe(&notes);
+    vault.set_hook(None);
+    let _ = std::fs::remove_dir(dir.v2());
+}
+
+/// Each failure goes to the log as one line with only the allowed fields.
+#[test]
+fn the_log_line_names_the_store_file_only() {
+    struct Capture(std::sync::Mutex<Vec<String>>);
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let line = record.args().to_string();
+            if line.starts_with("swseal2_io")
+                && let Ok(mut lines) = self.0.lock()
+            {
+                lines.push(line);
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+    // No other test in this binary installs a logger; if one ever does, fail loudly here.
+    log::set_logger(&CAPTURE).expect("the only logger in this test binary");
+    log::set_max_level(log::LevelFilter::Warn);
+    let dir = TestDir::new("io-log-line");
+    let vault = SealVault::new(dir.path());
+    let seal = registered(&vault, "合成印", 1);
+    vault.fail_next_write_at(pdfcraft_platform::staging::AtomicWriteStage::Rename, Some(NOT_RETRIED_OS[3].1));
+    assert_eq!(vault.record_approval(&ApprovalRef::new(&seal).unwrap()), Err(VaultError::Io(WRITE_ERROR)));
+    let lines = CAPTURE.0.lock().unwrap().clone();
+    let line = lines.iter().find(|line| line.contains("op=record_approval") && line.contains("stage=rename")).expect("logged");
+    assert!(line.starts_with("swseal2_io stage=rename class=Io op=record_approval gen="), "{line}");
+    assert!(line.contains("file=seals.v2.bin") && line.contains(" ms="), "{line}");
+    let folder = dir.path().to_string_lossy();
+    assert!(!line.contains(folder.as_ref()), "no folder path: {line}");
+    for secret in ["合成印", "iVBORw0", "SWSEAL2", "seal_id", "sha256"] {
+        assert!(!line.contains(secret), "{secret} in {line}");
+    }
+    assert!(!line.contains(&seal.id) && !line.contains(&seal.sha256), "{line}");
 }

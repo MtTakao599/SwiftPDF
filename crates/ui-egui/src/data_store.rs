@@ -36,11 +36,7 @@ impl DataStoreInfo {
             return Self { path: settings, mode: DataStoreMode::Portable, fallback_reason: None };
         }
         if let Some(unwritable) = &portable.unwritable {
-            return Self {
-                path: settings,
-                mode: DataStoreMode::PortableFallback,
-                fallback_reason: Some(unwritable.error.clone()),
-            };
+            return Self { path: settings, mode: DataStoreMode::PortableFallback, fallback_reason: Some(unwritable.error.clone()) };
         }
         Self { path: settings, mode: DataStoreMode::Regular, fallback_reason: None }
     }
@@ -50,9 +46,10 @@ impl DataStoreInfo {
         match self.mode {
             DataStoreMode::Regular => crate::identity::localized("通常（この Windows ユーザーのフォルダー）", "Regular (this Windows user's folder)"),
             DataStoreMode::Portable => crate::identity::localized("ポータブル（実行ファイル隣の Data）", "Portable (Data beside the executable)"),
-            DataStoreMode::PortableFallback => {
-                crate::identity::localized("ポータブルの Data が使えず、通常のフォルダーを使用中", "Portable Data was not writable; using the regular folder")
-            }
+            DataStoreMode::PortableFallback => crate::identity::localized(
+                "ポータブルの Data が使えず、通常のフォルダーを使用中",
+                "Portable Data was not writable; using the regular folder",
+            ),
         }
     }
 
@@ -146,5 +143,29 @@ mod tests {
         let notice = info.fallback_notice().expect("fallback is explained");
         assert!(notice.contains("C:\\Users\\example\\AppData\\Local\\SwiftPDF"), "{notice}");
         assert!(notice.contains("os error 5"), "{notice}");
+    }
+
+    /// From the real probe: `Data` blocked by a file, so the folder the caller fell back to is
+    /// shown as a fallback with the probe's own error, and set on the app with a warning.
+    #[test]
+    fn a_probe_failure_is_shown_as_a_fallback() {
+        let exe = std::env::temp_dir().join(format!("swiftpdf-datastore-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe);
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::write(exe.join("portable.txt"), b"").unwrap();
+        std::fs::write(exe.join(DATA_DIR), b"in the way").unwrap();
+        let portable = portable::resolve(Some(&exe));
+        let regular = exe.join("regular-stand-in");
+        let info = describe_with(regular.clone(), &portable);
+        assert_eq!(info.mode, DataStoreMode::PortableFallback);
+        assert_eq!(info.path, regular);
+        let reason = portable.unwritable.as_ref().unwrap().error.clone();
+        assert_eq!(info.fallback_reason.as_deref(), Some(reason.as_str()));
+        let mut app = crate::PdfCraftApp::new();
+        app.set_data_store(info);
+        let toast = app.toast.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
+        assert!(toast.contains(&regular.display().to_string()) && toast.contains(&reason), "{toast}");
+        assert_eq!(app.displayed_data_path(), Some(regular.as_path()));
+        let _ = std::fs::remove_dir_all(&exe);
     }
 }

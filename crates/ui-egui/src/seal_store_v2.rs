@@ -485,12 +485,14 @@ impl std::fmt::Display for VaultError {
 
 impl std::error::Error for VaultError {}
 
-/// Last store I/O failures seen in this process. Stage, class, sizes and OS code only.
-/// Never the ciphertext, the plaintext, a seal image, an approval, or a user path.
+/// Store I/O failures, written to the log as one `swseal2_io` line each. Stage, class, operation,
+/// generation, sizes, elapsed time and OS code only. Never the ciphertext, the plaintext, a seal
+/// image, an approval, or a user path. Recording never changes the outcome of the write.
 mod io_note {
-    use std::sync::Mutex;
+    use std::cell::Cell;
     use std::time::Instant;
 
+    #[cfg(test)]
     #[derive(Clone, Debug)]
     pub struct Note {
         pub stage: &'static str,
@@ -504,8 +506,18 @@ mod io_note {
         pub elapsed_ms: u128,
     }
 
-    static LAST: Mutex<Vec<Note>> = Mutex::new(Vec::new());
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    static LAST: std::sync::Mutex<Vec<Note>> = std::sync::Mutex::new(Vec::new());
+
+    thread_local! {
+        /// When the current `store` began on this thread; a store runs on one thread start to end.
+        static OP_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Start timing a store write on this thread.
+    pub fn begin() {
+        OP_START.with(|start| start.set(Some(Instant::now())));
+    }
 
     pub fn record(
         stage: &'static str,
@@ -518,19 +530,19 @@ mod io_note {
     ) {
         let io_kind = error.map(|e| format!("{:?}", e.kind()));
         let raw_os = error.and_then(std::io::Error::raw_os_error);
-        let elapsed_ms = START.get_or_init(Instant::now).elapsed().as_millis();
+        let elapsed_ms = OP_START.with(Cell::get).map_or(0, |start| start.elapsed().as_millis());
         log::warn!(
-            "swseal2_io stage={stage} class={class} op={op} gen={generation} wrote={wrote_len} back={} file=seals.v2.bin kind={} os={}",
+            "swseal2_io stage={stage} class={class} op={op} gen={generation} wrote={wrote_len} back={} file=seals.v2.bin kind={} os={} ms={elapsed_ms}",
             back_len.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
             io_kind.as_deref().unwrap_or("-"),
             raw_os.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
         );
-        let note = Note { stage, class, op, io_kind, raw_os, generation, wrote_len, back_len, elapsed_ms };
+        #[cfg(test)]
         if let Ok(mut slot) = LAST.lock() {
             if slot.len() >= 16 {
                 slot.remove(0);
             }
-            slot.push(note);
+            slot.push(Note { stage, class, op, io_kind, raw_os, generation, wrote_len, back_len, elapsed_ms });
         }
     }
 
@@ -538,6 +550,7 @@ mod io_note {
         record(stage, class, op, generation, wrote_len, None, Some(error));
     }
 
+    #[cfg(test)]
     pub fn summary() -> String {
         match LAST.lock() {
             Ok(slot) if slot.is_empty() => "no store I/O notes".into(),
@@ -556,6 +569,7 @@ mod io_note {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn last_store_io_notes() -> String {
     io_note::summary()
 }
@@ -672,13 +686,32 @@ pub(crate) enum Point {
 #[cfg(test)]
 type Hook = Box<dyn FnMut(Point) -> bool + Send>;
 
+/// A failure planted for the next replacement of `seals.v2.bin` (see `SealVault::fail_next_write_at`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct InjectedWriteFault {
+    stage: pdfcraft_platform::staging::AtomicWriteStage,
+    os: Option<i32>,
+}
+
+#[cfg(test)]
+impl InjectedWriteFault {
+    fn error(self) -> pdfcraft_platform::staging::AtomicWriteError {
+        let source = match self.os {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::other("injected"),
+        };
+        pdfcraft_platform::staging::AtomicWriteError { stage: self.stage, source }
+    }
+}
+
 pub struct SealVault {
     dir: PathBuf,
     limits: Limits,
     #[cfg(test)]
     hook: std::sync::Mutex<Option<Hook>>,
     #[cfg(test)]
-    fail_stage: std::sync::Mutex<Option<&'static str>>,
+    fail_stage: std::sync::Mutex<Option<InjectedWriteFault>>,
 }
 
 impl std::fmt::Debug for SealVault {
@@ -763,16 +796,18 @@ impl SealVault {
         }
     }
 
-    /// Next `seals.v2.bin` write fails at `stage` before touching the file. Production never sets this.
+    /// The next replacement of `seals.v2.bin` fails at `stage` with OS error `os` (or a plain
+    /// error), before touching the file, as [`pdfcraft_platform::staging::write_atomically_detailed`]
+    /// would report it. Production never sets this.
     #[cfg(test)]
-    pub(crate) fn fail_next_write_at(&self, stage: &'static str) {
+    pub(crate) fn fail_next_write_at(&self, stage: pdfcraft_platform::staging::AtomicWriteStage, os: Option<i32>) {
         if let Ok(mut slot) = self.fail_stage.lock() {
-            *slot = Some(stage);
+            *slot = Some(InjectedWriteFault { stage, os });
         }
     }
 
     #[cfg(test)]
-    fn take_fail_stage(&self) -> Option<&'static str> {
+    fn take_fail_stage(&self) -> Option<InjectedWriteFault> {
         self.fail_stage.lock().ok().and_then(|mut slot| slot.take())
     }
 
@@ -1199,19 +1234,25 @@ impl SealVault {
             return Err(VaultError::Full { limit: self.limits.max_file_bytes });
         }
         self.at(Point::BeforeWrite)?;
+        io_note::begin();
         #[cfg(test)]
-        if let Some(stage) = self.take_fail_stage() {
-            io_note::record(stage, "Io", op, snapshot.generation, size, None, None);
-            return Err(VaultError::Io(WRITE_ERROR));
-        }
+        let injected = self.take_fail_stage();
         if existed {
             let mut last_stage = pdfcraft_platform::staging::AtomicWriteStage::Create;
-            if let Err(_error) = with_retry(|| {
-                match pdfcraft_platform::staging::write_atomically_detailed(
-                    &paths.v2,
-                    &bytes,
-                    pdfcraft_platform::staging::StagingName::TagThenSuffix,
-                ) {
+            if let Err(error) = with_retry(|| {
+                #[cfg(test)]
+                let written = match injected {
+                    Some(fault) => Err(fault.error()),
+                    None => pdfcraft_platform::staging::write_atomically_detailed(
+                        &paths.v2,
+                        &bytes,
+                        pdfcraft_platform::staging::StagingName::TagThenSuffix,
+                    ),
+                };
+                #[cfg(not(test))]
+                let written =
+                    pdfcraft_platform::staging::write_atomically_detailed(&paths.v2, &bytes, pdfcraft_platform::staging::StagingName::TagThenSuffix);
+                match written {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         last_stage = error.stage;
@@ -1219,21 +1260,26 @@ impl SealVault {
                     }
                 }
             }) {
-                io_note::record_io(last_stage.as_str(), "Io", op, snapshot.generation, size, &_error);
+                io_note::record_io(last_stage.as_str(), "Io", op, snapshot.generation, size, &error);
                 return Err(VaultError::Io(WRITE_ERROR));
             }
-        } else if let Err(error) = create_new_file(&paths.v2, &bytes, snapshot.generation, op) {
-            return Err(error);
+        } else {
+            create_new_file(&paths.v2, &bytes, snapshot.generation, op)?;
         }
         self.at(Point::AfterWrite)?;
-        let back = match read_opt(&paths.v2) {
+        let back = match read_opt_io(&paths.v2) {
             Ok(Some(back)) => back,
             Ok(None) => {
                 io_note::record("reread", "Verify", op, snapshot.generation, size, None, None);
                 return Err(VaultError::Verify);
             }
-            Err(error) => {
-                io_note::record("reread", "Verify", op, snapshot.generation, size, None, None);
+            Err((error, io)) => {
+                let class = match error {
+                    VaultError::Io(_) => "Io",
+                    VaultError::Unreadable(_) => "Unreadable",
+                    _ => "Verify",
+                };
+                io_note::record("reread", class, op, snapshot.generation, size, None, io.as_ref());
                 return Err(error);
             }
         };
@@ -1392,7 +1438,8 @@ impl SealVault {
         if paths.legacy.symlink_metadata().is_ok() {
             return;
         }
-        if create_new_plain(&paths.legacy, TOMBSTONE, 0).is_err() && paths.legacy.symlink_metadata().is_err() {
+        io_note::begin();
+        if create_new_plain(&paths.legacy, TOMBSTONE, 0, "migrate").is_err() && paths.legacy.symlink_metadata().is_err() {
             notices.push(Notice::TombstoneMissing);
         }
     }
@@ -1783,18 +1830,23 @@ fn unique_backup(dir: &Path, base: &str) -> Result<PathBuf, VaultError> {
 /// Read a file of at most [`HARD_READ_CAP`] bytes. `None` when it does not exist. A link or a
 /// folder in its place is an error, not followed.
 fn read_opt(path: &Path) -> Result<Option<Vec<u8>>, VaultError> {
+    read_opt_io(path).map_err(|(error, _)| error)
+}
+
+/// [`read_opt`], with the operating-system error behind an `Io` failure kept for the I/O note.
+fn read_opt_io(path: &Path) -> Result<Option<Vec<u8>>, (VaultError, Option<std::io::Error>)> {
     let meta = match path.symlink_metadata() {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(VaultError::Io(READ_ERROR)),
+        Err(error) => return Err((VaultError::Io(READ_ERROR), Some(error))),
     };
     if !meta.is_file() || meta.len() > HARD_READ_CAP {
-        return Err(VaultError::Unreadable(READ_ERROR));
+        return Err((VaultError::Unreadable(READ_ERROR), None));
     }
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(VaultError::Io(READ_ERROR)),
+        Err(error) => Err((VaultError::Io(READ_ERROR), Some(error))),
     }
 }
 

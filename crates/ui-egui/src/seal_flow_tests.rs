@@ -1297,6 +1297,103 @@ fn a_late_format_1_write_is_set_aside_recorded_and_announced() {
     assert_eq!(std::fs::read(dir.path().join(v2::LEGACY_FILE)).unwrap(), v2::TOMBSTONE);
 }
 
+/// A chairman seal placed and approved in the dialog, but not confirmed: quitting asks about the
+/// placement first. 編集に戻る keeps the placement, its approval and the dialog; discarding drops
+/// them and closes. Neither writes to the store, and 確定 cannot run behind the question.
+#[test]
+fn quitting_with_an_unconfirmed_chairman_seal_asks_and_writes_nothing() {
+    let dir = SealDir::new("place-close");
+    let mut app = app_on(&dir, 1);
+    register(&mut app, "合成印", 1);
+    place_and_approve(&mut app, 0, 0);
+    let on_disk = std::fs::read(dir.path().join(v2::V2_FILE)).unwrap();
+    let ctx = egui::Context::default();
+
+    assert!(!app.request_quit(&ctx));
+    assert_eq!(app.place_close_request, Some(crate::CloseRequest::Quit));
+    assert!(app.close_request.is_none(), "not the save prompt");
+    assert_eq!(app.front_prompt(), Some(crate::PromptLayer::PlaceClose));
+    app.commit_stamp_place();
+    assert!(!app.seals.running(), "確定 waits while the placement question is up");
+
+    app.resolve_place_close(&ctx, None);
+    assert!(app.views[0].stamp_place.is_some(), "編集に戻る keeps the placement");
+    assert!(app.seal_approval.is_some(), "and its approval");
+    assert!(matches!(app.dialog, Some(Dialog::ConfirmSeal)), "and the approval dialog");
+    assert!(!app.allow_quit);
+
+    assert!(!app.request_quit(&ctx));
+    app.resolve_place_close(&ctx, Some(true));
+    assert!(app.views[0].stamp_place.is_none());
+    assert!(app.seal_approval.is_none(), "a discarded placement leaves no approval to use");
+    assert!(app.dialog.is_none());
+    assert!(app.allow_quit, "nothing else was unsaved, so the app quits");
+    assert!(!app.seals.running());
+    assert_eq!(std::fs::read(dir.path().join(v2::V2_FILE)).unwrap(), on_disk, "discarding writes nothing to the store");
+    assert!(use_kinds_on_disk(&dir).is_empty(), "no approval or use line was written");
+}
+
+/// While the approval and preparation are being written, the placement is still on the page.
+/// Closing is refused for the seal work, not turned into a placement question that could
+/// discard it; once the store answers, the stamp is committed as usual.
+#[test]
+fn seal_work_refuses_close_before_the_placement_question() {
+    let dir = SealDir::new("place-close-busy");
+    let mut app = app_on(&dir, 1);
+    register(&mut app, "合成印", 1);
+    let held = pdfcraft_platform::lock::lock_with_timeout(&dir.path().join(v2::LOCK_FILE), Duration::from_secs(1), Duration::from_millis(5)).unwrap();
+    place_and_approve(&mut app, 0, 0);
+    confirm(&mut app);
+    assert!(app.seals.blocking());
+    assert!(app.views[0].stamp_place.is_some());
+    let ctx = egui::Context::default();
+    for close in [0, 1, 2] {
+        app.toast = None;
+        match close {
+            0 => assert!(!app.request_quit(&ctx)),
+            1 => app.request_close_tab(0),
+            _ => app.close_all(),
+        }
+        assert!(toast(&app).contains("終了できません"), "{close}: {}", toast(&app));
+        assert!(app.place_close_request.is_none(), "{close}: no placement question while the store works");
+        assert!(app.close_request.is_none());
+        assert_eq!(app.views.len(), 1);
+    }
+    // Reload is refused the same way: no placement question, no save question, no reload.
+    app.toast = None;
+    app.request_reload(0);
+    assert!(toast(&app).contains("再読込できません"), "{}", toast(&app));
+    assert!(app.place_close_request.is_none() && app.close_request.is_none());
+    assert!(app.views[0].stamp_place.is_some());
+    drop(held);
+    app.seal_settle();
+    assert_eq!(stamps(&app, 0), 1, "{}", toast(&app));
+    assert_eq!(use_kinds_on_disk(&dir), COMMITTED);
+}
+
+/// Portable start in a synthetic executable folder: About shows `Data` beside it as portable,
+/// and that is the folder the chairman seal is actually written to.
+#[test]
+fn the_displayed_data_folder_is_where_the_seals_are_written() {
+    let exe = SealDir::new("portable-exe");
+    std::fs::write(exe.path().join("portable.txt"), b"").unwrap();
+    let portable = crate::portable::resolve(Some(exe.path()));
+    let data = portable.dir.clone().expect("portable Data is writable");
+    assert_eq!(data, exe.path().join(crate::portable::DATA_DIR));
+    let mut app = new_app();
+    app.set_data_store(crate::data_store::describe_with(data.clone(), &portable));
+    app.set_seal_dir(data.clone());
+    app.seal_settle();
+    assert!(app.toast.is_none(), "no fallback warning on a normal portable start: {}", toast(&app));
+    register(&mut app, "合成印", 1);
+    assert_eq!(app.seals.seals().len(), 1, "{}", toast(&app));
+    let info = app.data_store.as_ref().unwrap();
+    assert_eq!(info.mode, crate::data_store::DataStoreMode::Portable);
+    assert_eq!(app.displayed_data_path(), Some(data.as_path()));
+    assert_eq!(app.seals.store_dir(), Some(data.as_path()), "the store and the display agree");
+    assert!(data.join(v2::V2_FILE).is_file(), "the seal went to the displayed folder");
+}
+
 /// A PDF whose pages each show one line of Helvetica text. `rotate` is the page's `/Rotate`.
 fn acceptance_pdf(pages: &[(&str, i32)]) -> Vec<u8> {
     let n = pages.len();

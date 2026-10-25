@@ -138,10 +138,10 @@ pub(crate) fn date_text_for_pdf(session: &Session) -> Result<String, String> {
 /// The longest author name kept (Preferences ▸ Identity, restored settings).
 pub(crate) const MAX_AUTHOR_CHARS: usize = 200;
 
+pub mod data_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod open_worker;
 mod organize_panel;
-pub mod data_store;
 pub mod portable;
 mod protect;
 mod recovery;
