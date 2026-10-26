@@ -1,0 +1,28 @@
+Where the licence files in this folder came from. This note is not a licence and does not change the files beside it.
+
+Ubuntu-Light-UFL.txt
+  The licence body is fonts/UFL.txt from the crate epaint_default_fonts 0.36.2, copied unchanged.
+  The two lines above that body are name-table entries in fonts/Ubuntu-Light.ttf from the same crate:
+  name ID 0, "Copyright 2011 Canonical Ltd. Licensed under the Ubuntu Font Licence 1.0";
+  name ID 7, "Ubuntu and Canonical are registered trademarks of Canonical Ltd."
+  SwiftPDF embeds that font through egui. The font file itself is not a separate file in this zip.
+
+Hack-Regular-LICENSE.txt
+  fonts/Hack-Regular.txt from epaint_default_fonts 0.36.2, copied unchanged.
+  It is the MIT notice for Hack and the Bitstream Vera licence for Bitstream Vera Sans Mono.
+  SwiftPDF embeds Hack through egui.
+
+OFL-NotoEmoji.txt
+  The licence body is fonts/OFL.txt from epaint_default_fonts 0.36.2, copied unchanged.
+  The copyright line above it is name ID 0 of fonts/NotoEmoji-Regular.ttf from the same crate:
+  "Copyright 2013 Google Inc. All Rights Reserved."
+  SwiftPDF embeds that font through egui.
+
+LICENSE-FOXIT.txt
+  vendor/hayro-interpret/assets/LICENSE_FOXIT in this repository, copied unchanged.
+  It covers the Foxit standard-14 fonts bundled by hayro-interpret.
+
+LICENSE-CMAP.txt
+  assets/LICENSE.txt from the crate hayro-cmap 0.1.0, copied unchanged.
+  It is the BSD licence for the Adobe CMap resources bundled by that crate.
+  NOTICE in this zip names the same copyright line.

@@ -192,6 +192,16 @@ $ExpectedSorted = @($ExpectedModels | Sort-Object)
 if (($ActualModels -join '|') -ne ($ExpectedSorted -join '|')) {
   throw "models folder is $ActualModels; pdfcraft.wxs lists $ExpectedSorted"
 }
+# The first sentence of models\ATTRIBUTION.txt is this package's description. The author, source
+# and licence lines under it come from ATTRIBUTION.toml and are left unchanged.
+$ModelAttribution = Join-Path $Models 'ATTRIBUTION.txt'
+$AttributionText = [IO.File]::ReadAllText($ModelAttribution)
+$OldLead = "PdfCraft's text recognition (Scan & OCR) uses these models, unmodified.`n"
+$NewLead = "SwiftPDF's text recognition (Scan & OCR) uses these models, unmodified.`n"
+if (-not $AttributionText.StartsWith($OldLead)) {
+  throw 'models\ATTRIBUTION.txt did not start with the expected PdfCraft description'
+}
+[IO.File]::WriteAllText($ModelAttribution, ($NewLead + $AttributionText.Substring($OldLead.Length)))
 
 # ---- MSI ---------------------------------------------------------------------------------------
 $Msi = Join-Path $Dist "SwiftPDF-$Version-windows-$Arch.msi"
@@ -234,10 +244,20 @@ foreach ($f in 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
 foreach ($family in $FontLicences) {
   Copy-Item (Join-Path $Stage "OFL-$family.txt") $Portable
 }
-# portable.txt beside SwiftPDF.exe switches on portable mode: settings, logs, recovery files and new
-# digital IDs go to Data\ next to the exe instead of %LOCALAPPDATA% (see crates/ui-egui/src/portable.rs).
-# The marker is not a registry change. Data is created on first launch and moves with the folder.
+# portable.txt beside SwiftPDF.exe switches on portable mode. Settings and seals go to Data\ next
+# to the exe. The single-instance socket still uses %LOCALAPPDATA%\SwiftPDF. See portable.rs.
 Copy-Item (Join-Path $PSScriptRoot 'portable.txt') $Portable
+$ThirdParty = @(
+  'Ubuntu-Light-UFL.txt',
+  'Hack-Regular-LICENSE.txt',
+  'OFL-NotoEmoji.txt',
+  'LICENSE-FOXIT.txt',
+  'LICENSE-CMAP.txt',
+  'THIRD-PARTY-SOURCES.txt'
+)
+foreach ($f in $ThirdParty) {
+  Copy-Item (Join-Path $PSScriptRoot "third-party\$f") $Portable
+}
 foreach ($forbidden in @('pdfcraft.exe', 'pdfcraft-cli.exe')) {
   if (Test-Path (Join-Path $Portable $forbidden)) { throw "$forbidden must not be in the portable folder" }
 }
@@ -254,8 +274,14 @@ try {
   foreach ($forbidden in @('pdfcraft.exe', 'pdfcraft-cli.exe')) {
     if ($names -contains $forbidden) { throw "$forbidden must not be in the portable zip" }
   }
-  if ($names -notcontains 'SwiftPDF.exe' -or $names -notcontains 'portable.txt') {
-    throw 'the portable zip must contain SwiftPDF.exe and portable.txt'
+  foreach ($required in @('SwiftPDF.exe', 'portable.txt') + $ThirdParty) {
+    if ($names -notcontains $required) { throw "the portable zip must contain $required" }
+  }
+  foreach ($entry in $names) {
+    $lower = $entry.ToLowerInvariant()
+    foreach ($banned in @('seals.v2.bin', 'seals.bin', '.pdf', '.pfx', 'id_rsa', '.git')) {
+      if ($lower.EndsWith($banned) -or $lower -eq $banned.TrimStart('.')) { throw "the portable zip must not contain $entry" }
+    }
   }
 } finally { $zipFile.Dispose() }
 Get-Item $Msi, $Zip | Format-Table Name, Length

@@ -1,8 +1,22 @@
 SwiftPDF portable mode
 
-While this file sits next to SwiftPDF.exe, SwiftPDF keeps its settings, log files, crash-recovery
-autosaves and new digital IDs in the Data folder beside it, and writes nothing to
-%APPDATA% or %LOCALAPPDATA%. Copy the whole folder, including Data, to move SwiftPDF with its settings.
+While this file sits next to SwiftPDF.exe, SwiftPDF keeps settings, logs, crash-recovery
+autosaves, new digital IDs and chairman-seal data in the Data folder beside the executable.
 
-Delete this file to use the normal per-user folder (%LOCALAPPDATA%\SwiftPDF) instead. If Data
-can't be written (for example on a read-only drive), SwiftPDF says so and uses the per-user folder instead.
+Data is created on first launch. If Data cannot be written, portable mode stays off and
+SwiftPDF uses the per-user folder (%LOCALAPPDATA%\SwiftPDF) instead. About shows the folder
+actually in use, and says so when portable Data is not being used.
+
+The single-instance socket is still created under %LOCALAPPDATA%\SwiftPDF, including for a
+portable copy. It is not a seal and it is not inside Data. A portable copy does write that
+socket to %LOCALAPPDATA%.
+
+Chairman seals in Data\seals.v2.bin are encrypted with the current Windows user's DPAPI.
+The same user on the same PC can usually open them again. Copying Data to another PC or
+another Windows user does not move the seals: decryption can fail, and the file is left
+as it is. Register each approved seal on that PC. A folder copy is not a way to move seals.
+
+Each PC keeps its own seal store and its own audit history. SwiftPDF does not sync or merge them.
+
+Delete this file to use the per-user folder on the next launch. An existing Data folder is
+not moved automatically.

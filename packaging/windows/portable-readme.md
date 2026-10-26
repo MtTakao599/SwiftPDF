@@ -6,11 +6,11 @@ SwiftPDF は Windows 向けの閲覧中心 PDF アプリです。このフォル
 
 ## ポータブル版
 
-`SwiftPDF.exe` の隣にある `portable.txt`（または `SwiftPDF.portable`）により、設定・ログ・クラッシュ復旧・新規のデジタル ID・理事長印データは、`%LOCALAPPDATA%` ではなく、実行ファイルと同じフォルダーの `Data` に置きます。
+`SwiftPDF.exe` の隣にある `portable.txt`（または `SwiftPDF.portable`）があるとき、設定・ログ・クラッシュ復旧・新規のデジタル ID・理事長印データは、実行ファイルと同じフォルダーの `Data` に置きます。
 
-- 初回起動で `Data` が作れます。作れない場所（書き込み不可）ではポータブルを諦め、通常のユーザーフォルダーを使います。
-- 同時起動の受け渡し用ソケットだけは、共有フォルダーへの書き込みを避けるため、`%LOCALAPPDATA%\SwiftPDF` に残します（印影ではありません）。
-- フォルダーを移すときは、**exe と `portable.txt` と `Data` をセット**にしてください。exe だけ移すと、印影は新しい場所にありません。
+- 初回起動で `Data` が作れます。作れない場所（書き込み不可）ではポータブルをやめ、通常のユーザーフォルダー（`%LOCALAPPDATA%\SwiftPDF`）を使います。About の「データ保存先」が、実際に使っているフォルダーです。ポータブルの `Data` を使っていないときは、その旨を表示します。
+- 同時起動の受け渡し用ソケットは、ポータブル版でも `%LOCALAPPDATA%\SwiftPDF` に作ります。印影ではありません。ポータブル版が `%LOCALAPPDATA%` に何も書かない、ということはありません。
+- 設定ファイルを別の場所へ持っていくときは、exe と `portable.txt` と `Data` をセットにしてください。exe だけ移すと、設定も印影も新しい場所にはありません。`Data` のコピーは、印影を別 PC へ移す方法ではありません。詳しくは下の DPAPI を見てください。
 - `portable.txt` を消すと、次の起動から `%LOCALAPPDATA%\SwiftPDF` を使います。古い `Data` は自動では移しません。
 - この ZIP はレジストリ、ファイルの関連付け、PDF の既定アプリを変えません。
 - `pdfcraft-cli.exe` は含まれません。更新確認のウェブサイトはありません。
@@ -28,7 +28,7 @@ SwiftPDF は Windows 向けの閲覧中心 PDF アプリです。このフォル
 | `Data\logs\` | ログ（`pdfcraft.log`） |
 | `Data\recovery\` など | クラッシュ復旧。閲覧専用では復旧を有効にしない場合があります |
 
-通常インストール（MSI）では、同じファイル名が `%LOCALAPPDATA%\SwiftPDF` にあります。MSI 向けは [install-notes.md](install-notes.md) を見てください。
+この ZIP は MSI ではありません。MSI を使う場合の同じファイル名は `%LOCALAPPDATA%\SwiftPDF` にあります。今回の2人用の配布は、このポータブル版だけです。
 
 ## Windows ユーザーと DPAPI
 
@@ -39,7 +39,18 @@ SwiftPDF は Windows 向けの閲覧中心 PDF アプリです。このフォル
 - **別の PC** へ `Data` をコピーしただけでは、通常はそのまま使えません。
 - ユーザープロファイルや DPAPI の鍵を失うと、復号できなくなる**可能性があります**。
 
-「コピーすれば別 PC へ移せる」「必ず復元できる」とは言えません。エクスポート／インポート機能はありません。
+「コピーすれば別 PC へ移せる」「必ず復元できる」とは言えません。フォルダーのコピーを印影の移行手順にはしません。別の PC では、承認された印影をその PC で登録します。エクスポート／インポート機能はありません。
+
+## 2台で使うとき
+
+この配布は、同じ管理業務の2台の Windows PC のためのものです。一般公開や販売のための説明ではありません。
+
+- SwiftPDF は印影データを PC の間で同期しません。
+- 各 Windows ユーザーのストアは独立しています。
+- 監査履歴は各 PC に残り、自動では1つにまとまりません。
+- `Data` のバックアップを戻せるのは、同じ Windows ユーザーの DPAPI の鍵が残っている環境に限られます。
+- 理事長印を登録するのは、管理側がその PC への登録を承認したあとです。
+- 印影画像、`seals.v2.bin`、監査の記録を不用意に渡さないでください。ライセンス文書を渡すことは、印影を渡してよいという意味ではありません。
 
 ## バックアップ
 
@@ -65,7 +76,7 @@ SwiftPDF は Windows 向けの閲覧中心 PDF アプリです。このフォル
 
 ## 監査履歴
 
-履歴は、このアプリで行った押印操作の記録です。保存した PDF の状態を保証する証明ではありません。印影を PDF に確定したことと、そのファイルをディスクへ保存したことは分けて考えてください。
+履歴は、その PC のストアに残る、このアプリで行った押印操作の記録です。もう一方の PC の履歴はここには出ません。保存した PDF の状態を保証する証明ではありません。印影を PDF に確定したことと、そのファイルをディスクへ保存したことは分けて考えてください。
 
 ## 容量と待ち時間
 
@@ -85,3 +96,5 @@ Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.
 MIT OR Apache-2.0。同じフォルダーの `LICENSE-MIT`、`LICENSE-APACHE`、`NOTICE`、`ATTRIBUTION.md` を見てください。`LICENSE-brand.txt` は ArtCraft 商標の条件です。この配布に ArtCraft のロゴ画像は入っていません。
 
 日本語 UI は BIZ UDPGothic（OFL-1.1）です。`OFL-biz-ud-pgothic.txt` とその他の `OFL-*.txt`。Lucide は `LICENSE-lucide.txt`。Noto Sans CJK は含みません。
+
+egui が内包する書体と、hayro が内包するデータの許諾文も同じフォルダーにあります。`Ubuntu-Light-UFL.txt`、`Hack-Regular-LICENSE.txt`、`OFL-NotoEmoji.txt`、`LICENSE-FOXIT.txt`、`LICENSE-CMAP.txt`。出所は `THIRD-PARTY-SOURCES.txt` です。
