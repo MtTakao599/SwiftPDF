@@ -219,6 +219,29 @@ fn system_fallback_covers_sinhala_and_tamil() {
     }
 }
 
+/// The families that draw the interface: proportional, monospace, and the medium and semibold
+/// text styles. The per-face families (`added-*` and one family per bundled face) are the rest.
+fn interface_family(family: &FontFamily) -> bool {
+    match family {
+        FontFamily::Proportional | FontFamily::Monospace => true,
+        FontFamily::Name(name) => name.as_ref() == "medium" || name.as_ref() == "semibold",
+    }
+}
+
+/// The one bundled face a per-face family is built around.
+fn per_face_primary(family: &FontFamily) -> String {
+    let FontFamily::Name(name) = family else {
+        panic!("not a per-face family: {family:?}");
+    };
+    match name.as_ref() {
+        "added-inter" => "Inter".to_owned(),
+        "added-inter-medium" => "Inter-Medium".to_owned(),
+        "added-inter-semibold" => "Inter-SemiBold".to_owned(),
+        "added-jetbrains" => "JetBrainsMono".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// The Han characters of a catalog's translations.
 fn catalog_han(catalog: &str) -> String {
     let mut han: Vec<char> = catalog
@@ -254,10 +277,33 @@ fn chinese_ui_uses_an_installed_chinese_face() {
         for (family, stack) in &defs.families {
             let system = stack.iter().position(|n| n == theme::SYSTEM_FALLBACK).expect("in every family");
             assert_eq!(stack.iter().filter(|n| *n == theme::SYSTEM_FALLBACK).count(), 1, "{family:?}");
-            let own = stack.iter().position(|n| n.starts_with("Inter") || n == "JetBrainsMono").expect("the app's own font");
-            assert!(own < system, "{family:?}: {stack:?}");
-            if let Some(first_ja) = stack.iter().position(|n| n.starts_with("BIZ UDPGothic")) {
-                assert!(system < first_ja, "{family:?}: {stack:?}");
+            let is_own = |n: &str| n.starts_with("Inter") || n == "JetBrainsMono";
+            if interface_family(family) {
+                // The interface families are the ones that draw the UI with the app's own fonts.
+                let own = stack.iter().position(|n| is_own(n)).expect("the app's own font");
+                assert!(own < system, "{family:?}: {stack:?}");
+                if let Some(first_ja) = stack.iter().position(|n| n.starts_with("BIZ UDPGothic")) {
+                    assert!(system < first_ja, "{family:?}: {stack:?}");
+                }
+            } else {
+                // A per-face family previews one bundled face and then the installed fallbacks.
+                // It does not include the interface fonts. In a Chinese UI the installed face is
+                // also inserted before a Japanese face of every family, including these, so this
+                // test does not require a Japanese face to come first. That order is the open
+                // display issue; the face is still present once, on its own.
+                let primary = per_face_primary(family);
+                assert_eq!(stack.iter().filter(|n| n.as_str() == primary).count(), 1, "{family:?}: {stack:?}");
+                if is_own(&primary) {
+                    assert_eq!(stack.iter().filter(|n| is_own(n)).count(), 1, "{family:?}: {stack:?}");
+                    assert_eq!(stack.first().map(String::as_str), Some(primary.as_str()), "{family:?}: {stack:?}");
+                } else {
+                    assert!(stack.iter().all(|n| !is_own(n)), "{family:?}: {stack:?}");
+                    let japanese = primary.starts_with("BIZ ") || primary.starts_with("Shippori ");
+                    if !japanese {
+                        let at = stack.iter().position(|n| n.as_str() == primary).expect("just counted");
+                        assert!(at < system, "{family:?}: {stack:?}");
+                    }
+                }
             }
         }
         let han = catalog_han(catalog);

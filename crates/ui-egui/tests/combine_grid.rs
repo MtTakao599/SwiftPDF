@@ -342,8 +342,11 @@ fn a_drop_that_changes_nothing_or_lands_outside_the_grid_leaves_no_undo_step() {
 fn arrow_keys_move_by_card_and_by_row_and_shift_extends() {
     let files: Vec<(String, usize)> = (0..9).map(|i| (format!("f{i}.pdf"), 1)).collect();
     let named: Vec<(&str, usize)> = files.iter().map(|(n, p)| (n.as_str(), *p)).collect();
-    // Narrow enough for several rows.
-    let mut h = grid_of(named.iter().map(|(n, p)| (*n, fixture(*p))).collect(), vec2(760.0, 1200.0));
+    // Narrow enough for several rows. 1400 tall, not 1200: SwiftPDF's mode bar wraps (it adds
+    // 文字入力), so the grid is shorter, and the grid builds only the rows in view. At 1200 the
+    // last card is not built, so counting it fails before any key is pressed. The height only
+    // makes every card exist; the assertions below are the arrow, row and Shift behaviour.
+    let mut h = grid_of(named.iter().map(|(n, p)| (*n, fixture(*p))).collect(), vec2(760.0, 1400.0));
     let top = card(&h, "f0.pdf").top();
     let cols = (0..9).filter(|i| (card(&h, &format!("f{i}.pdf")).top() - top).abs() < 1.0).count();
     assert!((2..9).contains(&cols), "several cards per row and several rows ({cols} per row)");

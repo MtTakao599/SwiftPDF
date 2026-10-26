@@ -7,6 +7,10 @@ made without approval. Sections that depend on them say so.
 
 Revision history:
 - 2026-10-26 — first version, written before the STEP 123 commit.
+- 2026-10-26 — STEP 124: appended the post-commit results (section "Post-commit results"). The
+  earlier sections are unchanged.
+- 2026-10-26 — STEP 125: B1–B8, run by a person on the clean-clone EXE, are recorded in that
+  section.
 
 ## 1. 作業開始時の Git 状態
 
@@ -144,3 +148,45 @@ failure.
 Before the commit: the 11 modified files, the 3 untracked docs, and the untracked
 `docs/images/SwiftPDFiconORG.png`. After the commit, only `SwiftPDFiconORG.png` should remain
 untracked. The actual result is reported in the chat.
+
+## Post-commit results (appended in STEP 124)
+
+These are the results that §5–§11 left to the chat. They are recorded here without changing the
+sections above.
+
+- **Commit:** `7db6ef69530a7e5b5e87d3b61b704ead04b95a08`
+  (`fix(release): finalize STEP 122 UX safety and reload guards`). It contains 14 files, staged by
+  name. `git diff HEAD^ HEAD --check` was clean.
+- **Push:** `git push origin feature/seal-data-safety-v1.0.0` succeeded (`5279fa96..7db6ef69`),
+  with no force push. After `git fetch`, the local HEAD and
+  `origin/feature/seal-data-safety-v1.0.0` were the same commit.
+- **Clean clone:** `D:\dev\SwiftPDF-repro-step123`, a fresh `git clone` of the pushed branch, with
+  HEAD at `7db6ef69`.
+  - The Cursor sandbox sets `CARGO_TARGET_DIR` to a shared cache. The first `check` there
+    therefore reused that cache and is not counted.
+  - Every counted build used the new, empty folder
+    `D:\dev\SwiftPDF-repro-step123\target-clean`.
+- **Checks:**
+
+  | Check | Result |
+  |---|---|
+  | `cargo fmt --check` | Passed |
+  | `cargo check -p pdfcraft -j 1` | Passed: 23 min 13 s, 545 crates compiled from empty |
+  | clippy `-D warnings` (platform, engine, ui-egui, all targets) | Passed: 5 min 27 s, no warnings |
+
+- **Release build:** `cargo build -p pdfcraft --release -j 1` succeeded in 38 min 48 s.
+  `--version` prints `SwiftPDF 1.0.0`.
+- **SHA-256:** `551D6DE1DFF75FFB525CDCC21C61D45200B8955399727D01B2404C4E1452E318`
+  (97,062,912 bytes), for `target-clean\release\SwiftPDF.exe`.
+- **Bit-for-bit reproducibility: not achieved.**
+  - The STEP 122A EXE (`F9B3E2DD…`) is the same size, but its bytes differ.
+  - Both EXEs embed their own build folder paths, so two builds from different folders never
+    match byte for byte. Their production source is the same; only tests and docs differ.
+- **GUI acceptance:** the A1–A10 check in STEP 122A was done on the **STEP 122A EXE**
+  (`F9B3E2DD…`). B1–B8 were later run by a person on this clean-clone EXE (`551D6DE1…`), and
+  every item passed. See the readiness report §12 and §13.
+- **Toolchain:** no rustc or link.exe crash occurred during these builds.
+  - On 2026-10-26 the machine itself stopped twice with bug check 0x1A (MEMORY_MANAGEMENT): first
+    during the STEP 124 test build, then again after a restart, with no build running.
+  - The user reports that the memory has since been checked.
+  - See `SWIFTPDF_V1_INTEGRATION_TEST_AND_RELEASE_READINESS.md` §8.
